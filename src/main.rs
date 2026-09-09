@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(generic_const_exprs)]
 
 use core::panic::PanicInfo;
 
@@ -25,29 +26,33 @@ pub extern "C" fn kernel_main() -> ! {
     // 1. Architecture-specific early init (GDT, IDT)
     arch::init();
 
-    // 2. Display — needed for all subsequent debug output
+    // 2. Serial port — early debug output visible in QEMU -serial stdio
+    drivers::char::serial::init();
+    drivers::char::serial::write(b"FastROS v0.1.0\n");
+
+    // 3. VGA display
     drivers::display::vga::init();
     drivers::display::vga::print(b"FastROS v0.1.0", 0x0a); // green
 
-    // 3. Physical memory manager
+    // 4. Physical memory manager
     kernel::memory::pmm::init();
 
-    // 4. Virtual memory / paging
+    // 5. Virtual memory / paging
     kernel::memory::vmm::init();
 
-    // 5. Kernel heap
+    // 6. Kernel heap
     kernel::memory::heap::init();
 
-    // 6. Interrupts + timer
+    // 7. Interrupts + timer
     kernel::sync::init();
 
-    // 7. Drivers
+    // 8. Drivers
     drivers::init();
 
-    // 8. File systems
+    // 9. File systems
     fs::init();
 
-    // 9. Process manager + scheduler
+    // 10. Process manager + scheduler
     kernel::process::init();
 
     // 10. Hand off to init process (userspace PID 1)

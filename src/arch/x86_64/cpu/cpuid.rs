@@ -13,10 +13,14 @@ pub struct CpuidResult {
 pub fn cpuid(leaf: u32) -> CpuidResult {
     let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
     unsafe {
+        // rbx is reserved by LLVM — save/restore it manually via edi
         core::arch::asm!(
+            "push rbx",
             "cpuid",
+            "mov edi, ebx",
+            "pop rbx",
             inout("eax") leaf => eax,
-            out("ebx") ebx,
+            lateout("edi") ebx,
             out("ecx") ecx,
             out("edx") edx,
         );

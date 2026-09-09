@@ -2,8 +2,11 @@
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
-linker = "ld"
+linker = "rust-lld"
 rustflags = [
+    "-C", "linker-flavor=ld.lld",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-static",
     "-C", "link-arg=-n",
     "-C", "link-arg=-Tlinker.ld",
 ]

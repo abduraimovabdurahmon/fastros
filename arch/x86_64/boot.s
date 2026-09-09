@@ -2,13 +2,15 @@
 ; FastROS — arch/x86_64/boot.s
 ; LAYER 0: Hardware entry point
 ;
-; Loaded by Multiboot2 bootloader (or QEMU -kernel).
-; Runs in 32-bit protected mode, sets up 64-bit long mode,
-; identity-maps first 1 GB, then calls kernel_main (Rust).
+; Two boot paths:
+;   - QEMU -kernel: uses PVH ELF note → _pvh_start (32-bit PM)
+;   - GRUB/Multiboot2: uses multiboot2 header → _start (32-bit PM)
+; Both paths set up long mode and call kernel_main (Rust).
 ; =============================================================
 
-; ---- Multiboot2 Header ----
+; ---- Multiboot2 Header (for GRUB / Multiboot2 bootloaders) ----
 section .multiboot_header
+align 8
 header_start:
     dd 0xe85250d6                               ; Multiboot2 magic
     dd 0                                        ; Architecture: i386 protected mode
@@ -19,6 +21,17 @@ header_start:
     dw 0
     dd 8
 header_end:
+
+; ---- PVH ELF Note (for QEMU -kernel direct ELF boot) ----
+; QEMU scans 64-bit ELFs for this note instead of using multiboot.
+; Name: "Xen", Type: 18 (XEN_ELFNOTE_PHYS32_ENTRY), Value: entry addr
+section .note.Xen
+align 4
+    dd 4                    ; namesz: length of "Xen\0"
+    dd 4                    ; descsz: 4-byte entry point address
+    dd 18                   ; type: XEN_ELFNOTE_PHYS32_ENTRY
+    db "Xen", 0             ; name (4 bytes, null-terminated)
+    dd _pvh_start           ; 32-bit physical address of PVH entry
 
 ; ---- BSS: page tables + kernel stack ----
 section .bss
@@ -45,26 +58,36 @@ gdt64_ptr:
     dw $ - gdt64 - 1    ; Limit
     dq gdt64            ; Base
 
-; ---- 32-bit entry (GRUB / QEMU -kernel loads here) ----
+; ---- 32-bit code ----
 section .text
 bits 32
-global _start
 
-_start:
+; PVH entry: called by QEMU -kernel for 64-bit ELF.
+; ebx = pointer to hvm_start_info (ignored for now).
+; CPU: 32-bit protected mode, flat segments, paging disabled.
+global _pvh_start
+_pvh_start:
     mov esp, stack_top
-
-    ; Verify Multiboot2 magic in eax
-    cmp eax, 0x36d76289
-    jne .no_multiboot
-
     call check_cpuid
     call check_long_mode
     call setup_page_tables
     call enable_paging
-
     lgdt [gdt64_ptr]
     jmp gdt64.code:long_mode_start
 
+; Multiboot2 entry: called by GRUB / Multiboot2 loaders.
+; eax = 0x36d76289 (multiboot2 magic), ebx = multiboot2 info pointer.
+global _start
+_start:
+    mov esp, stack_top
+    cmp eax, 0x36d76289
+    jne .no_multiboot
+    call check_cpuid
+    call check_long_mode
+    call setup_page_tables
+    call enable_paging
+    lgdt [gdt64_ptr]
+    jmp gdt64.code:long_mode_start
 .no_multiboot:
     mov al, 'M'
     jmp error
