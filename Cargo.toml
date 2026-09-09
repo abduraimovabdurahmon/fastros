@@ -1,0 +1,16 @@
+[package]
+name = "fastros"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fastros"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2

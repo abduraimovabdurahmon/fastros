@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.s text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+linker.ld text eol=lf
