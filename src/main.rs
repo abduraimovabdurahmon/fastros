@@ -28,7 +28,12 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 2. Serial port — early debug output visible in QEMU -serial stdio
     drivers::char::serial::init();
-    drivers::char::serial::write(b"FastROS v0.1.0\n");
+    drivers::char::serial::write(b"\n");
+    drivers::char::serial::write(b"========================================\n");
+    drivers::char::serial::write(b"  FastROS v0.1.0 - kernel is running!\n");
+    drivers::char::serial::write(b"  arch: x86_64  mode: long mode (64-bit)\n");
+    drivers::char::serial::write(b"========================================\n");
+    drivers::char::serial::write(b"\n");
 
     // 3. VGA display
     drivers::display::vga::init();
