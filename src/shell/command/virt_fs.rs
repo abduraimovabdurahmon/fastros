@@ -195,6 +195,10 @@ pub fn is_dir(path: &[u8]) -> bool {
 
 /// Return the static content of a known virtual file, or `None`.
 pub fn get_content(path: &[u8]) -> Option<&'static [u8]> {
+    // memfs takes priority — user-created / editor-saved files override statics
+    if let Some(data) = crate::shell::memfs::read(path) {
+        return Some(data);
+    }
     match path {
         // /etc
         b"/etc/hostname"    => Some(b"fastros\n"),

@@ -33,6 +33,7 @@ pub mod env;
 pub mod executor;
 pub mod history;
 pub mod io;
+pub mod memfs;
 pub mod parser;
 pub mod readline;
 
@@ -92,16 +93,32 @@ fn print_banner(io: &mut dyn ShellIo) {
 
 // ── Prompt ────────────────────────────────────────────────────────────────────
 
-fn print_prompt(env: &ShellEnv, io: &mut dyn ShellIo) {
-    io.write_bytes(b"fastros:");
-    io.write_bytes(env.cwd());
-    io.write_bytes(b"$ ");
+/// Build "root@fastros:cwd# " into `buf`. Returns the prompt length.
+/// Uses `~` when cwd is /root or a subdirectory of /root.
+fn build_prompt(env: &ShellEnv, buf: &mut [u8; 256]) -> usize {
+    let mut n = 0;
+    macro_rules! push_bytes {
+        ($s:expr) => {
+            for &b in $s.iter() { if n < 256 { buf[n] = b; n += 1; } }
+        }
+    }
+    push_bytes!(b"root@fastros:");
+    let cwd = env.cwd();
+    if cwd == b"/root" {
+        push_bytes!(b"~");
+    } else if cwd.len() > 6 && cwd.starts_with(b"/root/") {
+        push_bytes!(b"~/");
+        push_bytes!(&cwd[6..]);
+    } else {
+        push_bytes!(cwd);
+    }
+    push_bytes!(b"# ");
+    n
 }
 
 // ── REPL entry point ──────────────────────────────────────────────────────────
 
 /// Run the shell.  Never returns.
-/// Called from `kernel_main()` instead of the idle `hlt` loop.
 pub fn run() -> ! {
     let mut io       = VgaKeyboardIo;
     let mut env      = ShellEnv::new();
@@ -111,12 +128,15 @@ pub fn run() -> ! {
     print_banner(&mut io);
 
     loop {
-        print_prompt(&env, &mut io);
+        // Build and print prompt, then hand it to readline for redraws
+        let mut prompt_buf = [0u8; 256];
+        let prompt_len = build_prompt(&env, &mut prompt_buf);
+        let prompt = &prompt_buf[..prompt_len];
+        io.write_bytes(prompt);
 
-        let line = editor.read_line(&mut io);
+        let line = editor.read_line(&mut io, prompt);
         if line.is_empty() { continue; }
 
-        // Save to history before executing
         history::push(line);
 
         match parser::parse(line) {

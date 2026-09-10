@@ -355,10 +355,18 @@ fn exec_cmd(st: &mut State, buf: &mut EditorBuf) -> bool {
         }
         b"q!" => { return true; }
         b"w" | b"w!" => {
-            st.modified = false;
-            st.set_msg(b"\"buffer\" written (in memory)");
+            if st.fname_len > 0 {
+                save_to_memfs(buf, &st.fname[..st.fname_len]);
+                st.modified = false;
+                st.set_msg(b"File written");
+            } else {
+                st.set_msg(b"E32: No file name");
+            }
         }
         b"wq" | b"wq!" | b"x" => {
+            if st.fname_len > 0 {
+                save_to_memfs(buf, &st.fname[..st.fname_len]);
+            }
             st.modified = false;
             return true;
         }
@@ -502,6 +510,19 @@ fn redraw(io: &mut dyn ShellIo, buf: &EditorBuf, st: &State) {
             io.move_cursor(clamped as u16, st.cy as u16);
         }
     }
+}
+
+fn save_to_memfs(buf: &EditorBuf, path: &[u8]) {
+    let mut tmp = [0u8; 4096];
+    let mut pos = 0;
+    for i in 0..buf.count {
+        let line = buf.line(i);
+        for &b in line {
+            if pos < 4095 { tmp[pos] = b; pos += 1; }
+        }
+        if pos < 4095 { tmp[pos] = b'\n'; pos += 1; }
+    }
+    crate::shell::memfs::write(path, &tmp[..pos]);
 }
 
 fn write_num(buf: &mut [u8], mut n: u64) -> usize {

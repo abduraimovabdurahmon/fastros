@@ -109,8 +109,13 @@ impl Command for NanoCommand {
 
                 // ── Save ──────────────────────────────────────────────────
                 CTRL_O | CTRL_S => {
-                    st.modified = false;
-                    st.set_msg(b"[ Buffer saved (in memory) ]");
+                    if st.fname_len > 0 {
+                        save_to_memfs(buf, &st.fname[..st.fname_len]);
+                        st.modified = false;
+                        st.set_msg(b"[ File written ]");
+                    } else {
+                        st.set_msg(b"[ No filename - use: nano <filename> ]");
+                    }
                 }
 
                 // ── Cut line ──────────────────────────────────────────────
@@ -302,6 +307,20 @@ fn write_line_col(io: &mut dyn ShellIo, _total: usize, st: &State) {
 
     let col = (SCREEN_COLS - pos.min(SCREEN_COLS)) as u16;
     io.write_at(col, 24, &buf[..pos], CLR_STATUS);
+}
+
+/// Serialize EditorBuf lines (joined with \n) and write to memfs.
+fn save_to_memfs(buf: &EditorBuf, path: &[u8]) {
+    let mut tmp = [0u8; 4096];
+    let mut pos = 0;
+    for i in 0..buf.count {
+        let line = buf.line(i);
+        for &b in line {
+            if pos < 4095 { tmp[pos] = b; pos += 1; }
+        }
+        if pos < 4095 { tmp[pos] = b'\n'; pos += 1; }
+    }
+    crate::shell::memfs::write(path, &tmp[..pos]);
 }
 
 fn write_num(buf: &mut [u8], mut n: u64) -> usize {
