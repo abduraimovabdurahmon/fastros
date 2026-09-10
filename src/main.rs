@@ -81,6 +81,9 @@ pub extern "C" fn kernel_main() -> ! {
     kernel::net::init();
     drivers::net::init();
 
+    // ── Layer 5: SSH server (after network stack is up) ────────────────────
+    kernel::net::ssh::init();
+
     // ── Layer 6: Container runtime ─────────────────────────────────────────
     container::init();
 

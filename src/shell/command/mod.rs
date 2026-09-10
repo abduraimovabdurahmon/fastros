@@ -18,6 +18,7 @@ pub mod passwd;
 pub mod ping;
 pub mod rm;
 pub mod su;
+pub mod sshd;
 pub mod sudo;
 pub mod useradd;
 pub mod userdel;
@@ -113,6 +114,7 @@ impl CommandRegistry {
         r.register(&ping::PING);
         r.register(&ifconfig::IFCONFIG);
         r.register(&netstat::NETSTAT);
+        r.register(&sshd::SSHD);
         // History
         r.register(&history::HISTORY);
         r

@@ -19,6 +19,7 @@ pub mod icmp;
 pub mod ip;
 pub mod route;
 pub mod socket;
+pub mod ssh;
 pub mod tcp;
 pub mod udp;
 
