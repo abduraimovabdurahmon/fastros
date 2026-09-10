@@ -1,46 +1,27 @@
-//! HMAC-SHA256 — Hash-based Message Authentication Code (RFC 2104).
-//!
-//! Used for SSH transport layer MAC (when not using AEAD).
+//! HMAC-SHA-256 backed by the audited `hmac` + `sha2` crates (no_std, no alloc).
+//! Used for SSH transport layer packet authentication.
 
-use super::sha256::Sha256;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
-const BLOCK: usize = 64;
+type HmacInner = Hmac<Sha256>;
 
-pub struct HmacSha256 {
-    inner: Sha256,
-    okey:  [u8; BLOCK],
-}
+pub struct HmacSha256(HmacInner);
 
 impl HmacSha256 {
+    /// Create a new HMAC-SHA256 context. Accepts any key length.
     pub fn new(key: &[u8]) -> Self {
-        let mut k = [0u8; BLOCK];
-        if key.len() > BLOCK {
-            // Keys longer than block size are hashed first
-            let h = super::sha256::hash(key);
-            k[..32].copy_from_slice(&h);
-        } else {
-            k[..key.len()].copy_from_slice(key);
-        }
-
-        let mut ikey = [0u8; BLOCK];
-        let mut okey = [0u8; BLOCK];
-        for i in 0..BLOCK { ikey[i] = k[i] ^ 0x36; okey[i] = k[i] ^ 0x5C; }
-
-        let mut inner = Sha256::new();
-        inner.update(&ikey);
-        Self { inner, okey }
+        // new_from_slice accepts any key length per RFC 2104; never returns Err.
+        Self(HmacInner::new_from_slice(key).unwrap())
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
+        self.0.update(data);
     }
 
     pub fn finalize(self) -> [u8; 32] {
-        let inner_hash = self.inner.finalize();
-        let mut outer = Sha256::new();
-        outer.update(&self.okey);
-        outer.update(&inner_hash);
-        outer.finalize()
+        let out = self.0.finalize().into_bytes();
+        out.as_slice().try_into().unwrap()
     }
 }
 

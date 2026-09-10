@@ -29,6 +29,7 @@ pub const SSH_MSG_USERAUTH_BANNER:    u8 = 53;
 pub const SSH_MSG_CHANNEL_OPEN:       u8 = 90;
 pub const SSH_MSG_CHANNEL_OPEN_CONFIRM: u8 = 91;
 pub const SSH_MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
+pub const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 pub const SSH_MSG_CHANNEL_DATA:       u8 = 94;
 pub const SSH_MSG_CHANNEL_EOF:        u8 = 96;
 pub const SSH_MSG_CHANNEL_CLOSE:      u8 = 97;
@@ -42,21 +43,43 @@ pub const SSH_DISCONNECT_AUTH_CANCELLED: u32 = 13;
 
 // ── Buffer helpers ────────────────────────────────────────────────────────────
 
-/// Write a big-endian u32.
+/// Write a big-endian u32. No-op if buffer too small.
 pub fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+    if off + 4 > buf.len() { return; }
     buf[off..off+4].copy_from_slice(&v.to_be_bytes());
 }
 
-/// Read a big-endian u32.
+/// Read a big-endian u32. Returns 0 if buffer too small.
 pub fn get_u32(buf: &[u8], off: usize) -> u32 {
+    if off + 4 > buf.len() { return 0; }
     u32::from_be_bytes(buf[off..off+4].try_into().unwrap_or([0;4]))
 }
 
-/// Write a length-prefixed SSH string.
+/// Write a length-prefixed SSH string. Returns 0 if buffer too small.
 pub fn put_string(buf: &mut [u8], off: usize, s: &[u8]) -> usize {
+    if off + 4 + s.len() > buf.len() { return 0; }
     put_u32(buf, off, s.len() as u32);
     buf[off+4..off+4+s.len()].copy_from_slice(s);
     4 + s.len()
+}
+
+/// Write an SSH mpint (big-endian; prepend 0x00 if high bit set). Returns bytes written.
+pub fn put_mpint(buf: &mut [u8], off: usize, bytes: &[u8]) -> usize {
+    // Strip leading zeros
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let bytes = &bytes[start..];
+    if bytes.is_empty() {
+        if off + 4 > buf.len() { return 0; }
+        put_u32(buf, off, 0);
+        return 4;
+    }
+    let needs_pad = bytes[0] & 0x80 != 0;
+    let len = bytes.len() + if needs_pad { 1 } else { 0 };
+    if off + 4 + len > buf.len() { return 0; }
+    put_u32(buf, off, len as u32);
+    let data_off = off + 4 + if needs_pad { buf[off + 4] = 0; 1 } else { 0 };
+    buf[data_off..data_off + bytes.len()].copy_from_slice(bytes);
+    4 + len
 }
 
 /// Read a length-prefixed SSH string. Returns (slice, next_offset).
@@ -71,7 +94,7 @@ pub fn get_string(buf: &[u8], off: usize) -> (&[u8], usize) {
 
 pub const KEX_ALGOS:      &str = "curve25519-sha256";
 pub const HOST_KEY_ALGOS: &str = "ssh-ed25519";
-pub const CIPHER_ALGOS:   &str = "aes128-cbc";
+pub const CIPHER_ALGOS:   &str = "aes128-ctr";
 pub const MAC_ALGOS:      &str = "hmac-sha2-256";
 pub const COMP_ALGOS:     &str = "none";
 pub const LANGS:          &str = "";
@@ -97,7 +120,7 @@ impl SessionKeys {
     }
 
     /// Derive session keys from shared_secret and exchange_hash (RFC 4253 §7.2).
-    pub fn derive(shared_secret: &[u8; 32], h: &[u8; 32], session_id: &[u8; 32]) -> Self {
+    pub fn derive(shared_secret: &[u8], h: &[u8; 32], session_id: &[u8; 32]) -> Self {
         let mut keys = Self::zeroed();
         crypto::derive_key(shared_secret, h, b'A', session_id, &mut keys.iv_cs);
         crypto::derive_key(shared_secret, h, b'B', session_id, &mut keys.iv_sc);
@@ -122,6 +145,7 @@ pub fn build_packet(buf: &mut [u8], payload: &[u8]) -> usize {
     if pad_len < 4 { pad_len += block; }
 
     let total = base + pad_len;
+    if total > buf.len() { return 0; }
     put_u32(buf, 0, (1 + payload.len() + pad_len) as u32);
     buf[4] = pad_len as u8;
     buf[5..5+payload.len()].copy_from_slice(payload);

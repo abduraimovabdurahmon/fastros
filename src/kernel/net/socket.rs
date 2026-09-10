@@ -186,12 +186,19 @@ pub fn find_tcp(local_ip: &[u8;4], local_port: u16, peer_ip: &[u8;4], peer_port:
 /// (i.e. SYN_RCVD or ESTABLISHED). Used by the SSH server to detect
 /// incoming connections without requiring an exact 4-tuple match.
 pub fn find_tcp_established(local_port: u16) -> Option<usize> {
+    find_tcp_established_not_in(local_port, &[])
+}
+
+/// Like `find_tcp_established` but skips any socket fd listed in `exclude`.
+/// Used by the SSH server so already-tracked sessions are not re-accepted.
+pub fn find_tcp_established_not_in(local_port: u16, exclude: &[usize]) -> Option<usize> {
     use super::tcp::TcpState;
     unsafe {
         for (i, s) in POOL.iter().enumerate() {
             if s.kind == SockKind::Tcp
                 && s.local_port == local_port
                 && matches!(s.tcp_state, TcpState::SynRcvd | TcpState::Established)
+                && !exclude.contains(&i)
             {
                 return Some(i);
             }

@@ -304,6 +304,49 @@ context_switch:
     ret
 
 ; =============================================================
+; kthread_switch(from: *mut KContext, to: *const KContext)
+;
+; Cooperative kernel-thread context switch with proper stack switching.
+; Unlike context_switch above, this ALSO saves/restores RSP so every
+; kthread runs on its own independent 32 KB stack.
+;
+; KContext layout (must match src/kernel/kthread/mod.rs):
+;   offset  0: rsp   ← saves/restores the full stack pointer
+;   offset  8: rbp
+;   offset 16: rbx
+;   offset 24: r12
+;   offset 32: r13
+;   offset 40: r14
+;   offset 48: r15
+;   offset 56: rip   (kthread_trampoline for new threads; .kret for resumed)
+; =============================================================
+global kthread_switch
+kthread_switch:
+    ; ── Save outgoing thread into *rdi ──
+    mov [rdi +  0], rsp
+    mov [rdi +  8], rbp
+    mov [rdi + 16], rbx
+    mov [rdi + 24], r12
+    mov [rdi + 32], r13
+    mov [rdi + 40], r14
+    mov [rdi + 48], r15
+    lea rax, [rel .kret]
+    mov [rdi + 56], rax
+
+    ; ── Restore incoming thread from *rsi ──
+    mov rsp, [rsi +  0]     ; switch to the incoming thread's own stack
+    mov rbp, [rsi +  8]
+    mov rbx, [rsi + 16]
+    mov r12, [rsi + 24]
+    mov r13, [rsi + 32]
+    mov r14, [rsi + 40]
+    mov r15, [rsi + 48]
+    jmp [rsi + 56]          ; jump to .kret (resumed) or kthread_trampoline (new)
+
+.kret:
+    ret                     ; returns to kthread_switch caller in the resumed thread
+
+; =============================================================
 ; syscall_entry — SYSCALL instruction entry point
 ;
 ; CPU state on entry (per x86_64 SYSCALL spec):

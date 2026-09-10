@@ -27,7 +27,7 @@ pub mod sha512;
 ///
 /// where K = shared secret, H = exchange hash, letter = 'A'..'F'.
 pub fn derive_key(
-    shared_secret: &[u8; 32],
+    shared_secret: &[u8],
     exchange_hash: &[u8; 32],
     letter:        u8,
     session_id:    &[u8; 32],

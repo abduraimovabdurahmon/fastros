@@ -92,6 +92,9 @@ pub extern "C" fn kernel_main() -> ! {
     // Connect the timer IRQ to the scheduler tick
     arch::set_timer_hook(kernel::process::scheduler::tick);
 
+    // Layer 2: Cooperative kernel threads (one per SSH session)
+    kernel::kthread::init();
+
     // ── Layer 3: Network drivers (after PCI, uses kernel::net callbacks) ──
     kernel::net::init();
     drivers::net::init();

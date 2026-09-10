@@ -46,3 +46,18 @@ pub fn poll_byte() -> Option<u8> {
     poll(); // drive the state machine
     server::pop_input_byte()
 }
+
+/// Return the terminal width (columns) negotiated during pty-req.
+pub fn term_cols() -> u32 { server::get_term_cols() }
+pub fn term_rows() -> u32 { server::get_term_rows() }
+
+pub use server::MAX_SESSIONS;
+
+/// Returns the index of the first active shell session, if any.
+pub fn first_active_session() -> Option<usize> { server::first_active_session() }
+pub fn session_is_active(idx: usize) -> bool    { server::session_is_active(idx) }
+pub fn session_has_input(idx: usize) -> bool    { server::session_has_input(idx) }
+pub fn pop_input_from(idx: usize) -> Option<u8> { server::pop_input_from(idx) }
+pub fn send_to_session(idx: usize, data: &[u8]) { server::send_to_session(idx, data) }
+pub fn term_cols_for(idx: usize) -> u32         { server::get_term_cols_for(idx) }
+pub fn term_rows_for(idx: usize) -> u32         { server::get_term_rows_for(idx) }
