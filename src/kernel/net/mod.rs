@@ -248,6 +248,62 @@ pub fn send_arp(dev_idx: usize, frame: &[u8]) -> bool {
     raw_send(dev_idx, frame)
 }
 
+/// Send data on an established TCP connection identified by socket fd.
+/// Builds a TCP PSH+ACK segment and sends it via the routing table.
+/// Returns true on success.
+///
+/// Linux analogue: tcp_sendmsg() → tcp_write_xmit()
+pub fn tcp_send(fd: usize, data: &[u8]) -> bool {
+    if data.is_empty() { return true; }
+
+    // Snapshot the socket state we need (avoid holding borrow during send)
+    let (peer_ip, peer_port, local_port, snd_nxt, rcv_nxt) = {
+        let s = match socket::get_mut(fd) { Some(s) => s, None => return false };
+        if s.tcp_state != tcp::TcpState::Established { return false; }
+        (s.peer_ip, s.peer_port, s.local_port, s.snd_nxt, s.rcv_nxt)
+    };
+
+    // Route lookup
+    let hop = match route::lookup(&peer_ip) { Some(h) => h, None => return false };
+    let nexthop: [u8; 4] = if hop.gateway == [0u8; 4] { peer_ip } else { hop.gateway };
+    let dst_mac = match arp::lookup(&nexthop) { Some(m) => m, None => return false };
+
+    let our_ip  = unsafe { DEVS[hop.dev_idx].ip };
+    let our_mac = unsafe { DEVS[hop.dev_idx].mac };
+
+    let seg_len = (tcp::TCP_HLEN + data.len()) as u16;
+    let pseudo  = ip::pseudo_header_acc(&our_ip, &peer_ip, ip::IPPROTO_TCP, seg_len);
+
+    let sent = unsafe {
+        let tcp_len = tcp::build(
+            &mut TX_BUF[eth::ETH_HLEN + ip::IP_HLEN..],
+            local_port, peer_port,
+            snd_nxt, rcv_nxt,
+            tcp::TCP_ACK | tcp::TCP_PSH, tcp::TCP_WINDOW_DEFAULT,
+            data, pseudo,
+        );
+        if tcp_len == 0 { return false; }
+        // Copy TCP segment to temp buffer to avoid aliasing TX_BUF
+        let mut tmp = [0u8; 1500];
+        tmp[..tcp_len].copy_from_slice(
+            &TX_BUF[eth::ETH_HLEN + ip::IP_HLEN..eth::ETH_HLEN + ip::IP_HLEN + tcp_len]
+        );
+        let n = build_ip_frame(
+            &mut TX_BUF, &our_mac, &dst_mac, &our_ip, &peer_ip,
+            ip::IPPROTO_TCP, &tmp[..tcp_len],
+        );
+        raw_send(hop.dev_idx, &TX_BUF[..n])
+    };
+
+    if sent {
+        // Advance send sequence number
+        if let Some(s) = socket::get_mut(fd) {
+            s.snd_nxt = s.snd_nxt.wrapping_add(data.len() as u32);
+        }
+    }
+    sent
+}
+
 /// Bypass IP stack and send a raw Ethernet frame via device `dev_idx`.
 fn raw_send(dev_idx: usize, frame: &[u8]) -> bool {
     unsafe {
@@ -276,7 +332,14 @@ pub fn receive_frame(frame: &[u8], dev_idx: usize) {
 
     match eth_hdr.ethertype {
         eth::ETH_P_ARP => eth_rcv_arp(payload, dev_idx, &eth_hdr.dst),
-        eth::ETH_P_IP  => eth_rcv_ip(payload, dev_idx),
+        eth::ETH_P_IP  => {
+            // Linux: neigh_update() is called on every received packet.
+            // Learn the sender's IP→MAC mapping so we can reply without ARP.
+            if let Some((ref ip_hdr, _)) = ip::parse(payload) {
+                arp::cache_update(&ip_hdr.src, &eth_hdr.src);
+            }
+            eth_rcv_ip(payload, dev_idx)
+        }
         _              => {}   // unknown ethertype — drop
     }
 }
@@ -432,10 +495,57 @@ fn rcv_tcp(ip_hdr: &ip::IpHdr, payload: &[u8], dev_idx: usize) {
         }
     };
 
+    // Linux-style: LISTEN socket stays in LISTEN; SYN creates a child socket.
+    // Read state and local_port with a shared (immutable) borrow, then release it.
+    let (is_listen, local_port) = {
+        let s = match socket::get(fd) { Some(s) => s, None => return };
+        (s.tcp_state == tcp::TcpState::Listen, s.local_port)
+    };
+
+    if is_listen {
+        // Only respond to SYN; everything else is silently dropped on LISTEN.
+        if tcp_hdr.has_flag(tcp::TCP_SYN) {
+            tcp_handle_syn(ip_hdr, &tcp_hdr, local_port, dev_idx);
+        }
+        return;
+    }
+
     let s = match socket::get_mut(fd) { Some(s) => s, None => return };
 
     // Run the TCP state machine
     tcp_input(s, &tcp_hdr, data, ip_hdr, dev_idx);
+}
+
+/// Handle an incoming SYN on a LISTEN socket.
+/// Linux equivalent: tcp_conn_request() — creates a child (request) socket
+/// and sends SYN-ACK; the LISTEN socket is untouched.
+fn tcp_handle_syn(
+    ip_hdr:     &ip::IpHdr,
+    hdr:        &tcp::TcpHdr,
+    local_port: u16,
+    dev_idx:    usize,
+) {
+    // Allocate a fresh socket for this connection (the "child" socket).
+    let child_fd = match socket::socket(
+        socket::AF_INET, socket::SOCK_STREAM, socket::IPPROTO_TCP,
+    ) {
+        Some(f) => f,
+        None    => return,   // socket pool exhausted
+    };
+
+    if let Some(child) = socket::get_mut(child_fd) {
+        child.local_ip   = ip_hdr.dst;
+        child.local_port = local_port;
+        child.peer_ip    = ip_hdr.src;
+        child.peer_port  = hdr.src_port;
+        child.rcv_nxt    = hdr.seq.wrapping_add(1);
+        child.snd_nxt    = 0x12345678; // ISN
+        child.snd_una    = child.snd_nxt;
+        child.tcp_state  = tcp::TcpState::SynRcvd;
+
+        tcp_send_flags(child, ip_hdr, dev_idx, tcp::TCP_SYN | tcp::TCP_ACK, &[]);
+        child.snd_nxt = child.snd_nxt.wrapping_add(1);
+    }
 }
 
 /// Minimal TCP input state machine (RFC 793 §3.9).
@@ -449,20 +559,9 @@ fn tcp_input(
     use tcp::{TcpState, TCP_SYN, TCP_ACK, TCP_FIN, TCP_RST};
 
     match s.tcp_state {
-        // ── LISTEN: waiting for SYN ──────────────────────────────────────────
-        TcpState::Listen => {
-            if !hdr.has_flag(TCP_SYN) { return; }
-            s.peer_ip   = ip_hdr.src;
-            s.peer_port = hdr.src_port;
-            s.rcv_nxt   = hdr.seq.wrapping_add(1);
-            s.snd_nxt   = 0x12345678;  // ISN (initial sequence number)
-            s.snd_una   = s.snd_nxt;
-            s.tcp_state = TcpState::SynRcvd;
-
-            // Send SYN-ACK
-            tcp_send_flags(s, ip_hdr, dev_idx, TCP_SYN | TCP_ACK, &[]);
-            s.snd_nxt = s.snd_nxt.wrapping_add(1);
-        }
+        // LISTEN is handled in rcv_tcp via tcp_handle_syn() before tcp_input is
+        // called, so this branch should never be reached.
+        TcpState::Listen => {}
 
         // ── SYN_SENT: we sent SYN, waiting for SYN-ACK ──────────────────────
         TcpState::SynSent => {

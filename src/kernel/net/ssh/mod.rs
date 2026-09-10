@@ -39,3 +39,10 @@ pub fn send_to_client(data: &[u8]) {
 pub fn has_client() -> bool {
     server::has_active_client()
 }
+
+/// Return the next byte of SSH shell input, or None if none buffered.
+/// Drives the SSH handshake as a side effect via poll().
+pub fn poll_byte() -> Option<u8> {
+    poll(); // drive the state machine
+    server::pop_input_byte()
+}

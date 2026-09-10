@@ -182,6 +182,24 @@ pub fn find_tcp(local_ip: &[u8;4], local_port: u16, peer_ip: &[u8;4], peer_port:
     None
 }
 
+/// Find the first TCP socket on `local_port` that is past the LISTEN state
+/// (i.e. SYN_RCVD or ESTABLISHED). Used by the SSH server to detect
+/// incoming connections without requiring an exact 4-tuple match.
+pub fn find_tcp_established(local_port: u16) -> Option<usize> {
+    use super::tcp::TcpState;
+    unsafe {
+        for (i, s) in POOL.iter().enumerate() {
+            if s.kind == SockKind::Tcp
+                && s.local_port == local_port
+                && matches!(s.tcp_state, TcpState::SynRcvd | TcpState::Established)
+            {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// Find a RAW socket for the given protocol.
 pub fn find_raw(proto: u8) -> Option<usize> {
     unsafe {

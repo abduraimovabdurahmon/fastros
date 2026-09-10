@@ -412,17 +412,15 @@ impl SshSession {
         self.rx_buf[self.rx_len..self.rx_len + take].copy_from_slice(&data[..take]);
         self.rx_len += take;
 
-        // Handle version exchange (text line before binary protocol)
-        if self.state == SshState::Idle {
-            // Look for \n terminating the client version string
+        // Handle version exchange (text line before binary protocol).
+        // RFC 4253 §4.2: server sends its version first (done in poll()),
+        // then waits for the client's version string (a text line ending with \n).
+        if self.state == SshState::Idle || self.state == SshState::VersionSent {
             if let Some(pos) = find_byte(&self.rx_buf[..self.rx_len], b'\n') {
-                // Client version received; send ours
-                self.send_version();
-                // Remove version line from buffer
+                // Client version received — consume it and send our KEXINIT
                 let consumed = pos + 1;
                 self.rx_buf.copy_within(consumed..self.rx_len, 0);
                 self.rx_len -= consumed;
-                // Send our KEXINIT immediately
                 self.handle_kexinit();
             }
             return ShellInput::None;
@@ -525,27 +523,39 @@ pub enum ShellInput<'a> {
 // ── TCP write helper ──────────────────────────────────────────────────────────
 
 fn tcp_write(fd: usize, data: &[u8]) -> usize {
-    // In our kernel, "sending" means pushing into the socket's internal TX
-    // buffer. The actual TCP ACK/retransmit is handled by the TCP stack.
-    // For now we use a direct approach: store the data for the shell loop to
-    // retrieve and send via send_ipv4/TCP.
-    if let Some(s) = socket::get_mut(fd) {
-        // Push into RX buffer of the peer socket (we're simulating loopback-style)
-        // In a real implementation this would go to a TX ring buffer.
-        // For our single-connection SSH, we use a workaround: push to the
-        // socket's own RX buffer and let the shell loop read it.
-        // Actually this pushes into the SENDER's socket which is wrong.
-        // For a correct implementation, this needs the full TCP TX path.
-        // We mark as data available by returning the length.
-        let _ = s;
-        data.len()
-    } else {
-        0
-    }
+    if crate::kernel::net::tcp_send(fd, data) { data.len() } else { 0 }
 }
 
 fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
+}
+
+// ── SSH input byte ring buffer (for shell integration) ────────────────────────
+
+const INPUT_BUF_SIZE: usize = 256;
+static mut INPUT_BUF:  [u8; INPUT_BUF_SIZE] = [0; INPUT_BUF_SIZE];
+static mut INPUT_HEAD: usize = 0;
+static mut INPUT_TAIL: usize = 0;
+
+fn push_input(data: &[u8]) {
+    unsafe {
+        for &b in data {
+            let next = (INPUT_TAIL + 1) % INPUT_BUF_SIZE;
+            if next != INPUT_HEAD {
+                INPUT_BUF[INPUT_TAIL] = b;
+                INPUT_TAIL = next;
+            }
+        }
+    }
+}
+
+pub fn pop_input_byte() -> Option<u8> {
+    unsafe {
+        if INPUT_HEAD == INPUT_TAIL { return None; }
+        let b = INPUT_BUF[INPUT_HEAD];
+        INPUT_HEAD = (INPUT_HEAD + 1) % INPUT_BUF_SIZE;
+        Some(b)
+    }
 }
 
 // ── Global server state ───────────────────────────────────────────────────────
@@ -580,12 +590,15 @@ pub fn poll() -> Option<&'static [u8]> {
             }
         }
 
-        // Try to accept a new connection
+        // Try to accept a new connection — scan for ESTABLISHED socket on port 22
         if SERVER_SESSION.is_none() {
-            if let Some(fd) = socket::find_tcp(&[0;4], 22, &[0;4], 0) {
+            if let Some(fd) = socket::find_tcp_established(22) {
                 if let Some(s) = socket::get(fd) {
                     if s.tcp_state == TcpState::Established {
-                        SERVER_SESSION = Some(SshSession::new(fd));
+                        let mut session = SshSession::new(fd);
+                        // RFC 4253 §4.2: server sends its version string first
+                        session.send_version();
+                        SERVER_SESSION = Some(session);
                     }
                 }
             }
@@ -599,8 +612,11 @@ pub fn poll() -> Option<&'static [u8]> {
                     let n = s.rx_pop(&mut buf);
                     if n > 0 {
                         match session.process_received(&buf[..n]) {
-                            ShellInput::Data(d) => return Some(d),
-                            ShellInput::None    => {}
+                            ShellInput::Data(d) => {
+                                push_input(d);
+                                return Some(d);
+                            }
+                            ShellInput::None => {}
                         }
                     }
                 }

@@ -18,7 +18,7 @@ use env::ShellEnv;
 use io::ShellIo;
 use readline::LineEditor;
 
-// ── Concrete I/O implementation ───────────────────────────────────────────────
+// ── Concrete I/O implementations ──────────────────────────────────────────────
 
 struct VgaKeyboardIo;
 
@@ -26,6 +26,14 @@ impl ShellIo for VgaKeyboardIo {
     fn write_byte(&mut self, b: u8) { crate::drivers::display::vga::write(&[b]); }
     fn write_bytes(&mut self, s: &[u8]) { crate::drivers::display::vga::write(s); }
     fn read_byte(&mut self) -> Option<u8> { crate::drivers::char::keyboard::read_byte() }
+    // Override blocking read to also drive network polling while idle
+    fn read_byte_blocking(&mut self) -> u8 {
+        loop {
+            crate::kernel::net::poll_drivers();
+            if let Some(b) = self.read_byte() { return b; }
+            core::hint::spin_loop();
+        }
+    }
     fn clear_screen(&mut self) { crate::drivers::display::vga::clear(); }
     fn put_char_at(&mut self, col: u16, row: u16, ch: u8, color: u8) {
         crate::drivers::display::vga::put_at(col as usize, row as usize, ch, color);
@@ -38,6 +46,38 @@ impl ShellIo for VgaKeyboardIo {
     }
     fn move_cursor(&mut self, col: u16, row: u16) {
         crate::drivers::display::vga::set_cursor(col as usize, row as usize);
+    }
+}
+
+/// SSH I/O backend — reads from SSH channel, writes back via SSH.
+struct SshIo;
+
+impl ShellIo for SshIo {
+    fn write_byte(&mut self, b: u8) {
+        crate::kernel::net::ssh::send_to_client(&[b]);
+    }
+    fn write_bytes(&mut self, s: &[u8]) {
+        if !s.is_empty() {
+            crate::kernel::net::ssh::send_to_client(s);
+        }
+    }
+    fn read_byte(&mut self) -> Option<u8> {
+        crate::kernel::net::poll_drivers();
+        crate::kernel::net::ssh::poll_byte()
+    }
+    fn read_byte_blocking(&mut self) -> u8 {
+        loop {
+            if let Some(b) = self.read_byte() { return b; }
+            core::hint::spin_loop();
+        }
+    }
+    fn clear_screen(&mut self) {
+        // ANSI escape: erase screen + move to top-left
+        crate::kernel::net::ssh::send_to_client(b"\x1b[2J\x1b[H");
+    }
+    fn newline(&mut self) {
+        // SSH/telnet: send CR+LF for proper line ending
+        crate::kernel::net::ssh::send_to_client(b"\r\n");
     }
 }
 
@@ -116,10 +156,86 @@ fn build_prompt(env: &ShellEnv, buf: &mut [u8; 256]) -> usize {
 // ── REPL entry point ──────────────────────────────────────────────────────────
 
 pub fn run() -> ! {
-    let mut io       = VgaKeyboardIo;
-    let mut env      = do_login(&mut io);
-    let mut editor   = LineEditor::new();
-    let     registry = CommandRegistry::init();
+    let registry = CommandRegistry::init();
+
+    // Outer loop: alternate between SSH sessions and local session.
+    // SSH sessions are ephemeral; once an SSH client disconnects we loop back.
+    // The local VGA session never returns.
+    loop {
+        // ── Wait for SSH client or local keyboard ──────────────────────────
+        // Poll the network stack until either an SSH shell becomes active or
+        // the user presses a local key (whichever comes first).
+        let use_ssh = wait_for_input();
+
+        if use_ssh {
+            run_ssh_session(&registry);
+            // Client disconnected → loop back and wait for the next session
+        } else {
+            // Local session: never returns
+            run_local_session(&registry);
+        }
+    }
+}
+
+/// Spin until either an SSH shell session becomes active (returns true)
+/// or a local key is pressed (returns false).
+fn wait_for_input() -> bool {
+    loop {
+        crate::kernel::net::poll_drivers();
+        crate::kernel::net::ssh::poll(); // drive handshake
+
+        if crate::kernel::net::ssh::has_client() {
+            return true;
+        }
+        if crate::drivers::char::keyboard::read_byte().is_some() {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Run one SSH shell session. Returns when the client disconnects.
+fn run_ssh_session(registry: &CommandRegistry) {
+    let mut io  = SshIo;
+    let mut env = ShellEnv::new();
+
+    // SSH already authenticated the user — use root credentials
+    let root_home = b"/root";
+    let root_name = b"root";
+    env.set_session(0, 0, root_home, root_name);
+
+    io.write_bytes(b"\r\nFastROS SSH shell\r\nType 'help' for available commands.\r\n\r\n");
+
+    let mut editor = LineEditor::new();
+
+    loop {
+        if !crate::kernel::net::ssh::has_client() { break; }
+
+        let mut prompt_buf = [0u8; 256];
+        let prompt_len = build_prompt(&env, &mut prompt_buf);
+        let prompt = &prompt_buf[..prompt_len];
+        io.write_bytes(prompt);
+
+        let line = editor.read_line(&mut io, prompt, env.cwd());
+
+        // Check disconnect during readline
+        if !crate::kernel::net::ssh::has_client() { break; }
+        if line.is_empty() { continue; }
+
+        history::push(line);
+
+        match parser::parse(line) {
+            Some(cmd) => { executor::execute(&cmd, registry, &mut env, &mut io); }
+            None      => {}
+        }
+    }
+}
+
+/// Run the local VGA/keyboard session. Never returns.
+fn run_local_session(registry: &CommandRegistry) -> ! {
+    let mut io  = VgaKeyboardIo;
+    let mut env = do_login(&mut io);
+    let mut editor = LineEditor::new();
 
     loop {
         let mut prompt_buf = [0u8; 256];
@@ -133,7 +249,7 @@ pub fn run() -> ! {
         history::push(line);
 
         match parser::parse(line) {
-            Some(cmd) => { executor::execute(&cmd, &registry, &mut env, &mut io); }
+            Some(cmd) => { executor::execute(&cmd, registry, &mut env, &mut io); }
             None      => {}
         }
     }
