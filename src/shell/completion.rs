@@ -87,13 +87,24 @@ fn complete_paths(partial: &[u8], cwd: &[u8], list: &mut CompletionList) {
     //      "/etc/"      → dir="/etc", frag=""
     let (dir, frag) = split_dir_frag(partial, cwd);
 
+    // The "typed prefix" is everything the user typed up to and including
+    // the last '/'.  We prepend this to each child name so the completion
+    // replaces only the fragment, not the whole path.
+    //   ""        → typed_prefix = ""      (no slash typed)
+    //   "f"       → typed_prefix = ""
+    //   "/etc/h"  → typed_prefix = "/etc/"
+    //   "sub/h"   → typed_prefix = "sub/"
+    let typed_prefix: &[u8] = match partial.iter().rposition(|&b| b == b'/') {
+        None    => b"",
+        Some(i) => &partial[..i + 1],
+    };
+
     // Iterate virtual FS directory entries
     if let Some(children) = crate::shell::command::virt_fs::lookup(dir) {
         for &child in children {
             if child.starts_with(frag) {
-                // Build full completion path
-                let full = build_path(dir, child);
-                list.push(full.as_slice());
+                let entry = build_prefixed(typed_prefix, child);
+                list.push(entry.as_slice());
             }
         }
     }
@@ -103,11 +114,11 @@ fn complete_paths(partial: &[u8], cwd: &[u8], list: &mut CompletionList) {
     let n = memfs::list(&mut memfs_paths);
     for i in 0..n {
         let path = memfs_paths[i];
-        // Check if path is directly under `dir`
         if path_parent_is(path, dir) {
             let name = path_name(path);
             if name.starts_with(frag) {
-                list.push(path);
+                let entry = build_prefixed(typed_prefix, name);
+                list.push(entry.as_slice());
             }
         }
     }
@@ -150,10 +161,12 @@ impl PathBuf {
     fn push_bytes(&mut self, s: &[u8]) { for &b in s { self.push(b); } }
     fn as_slice(&self) -> &[u8] { &self.data[..self.len] }
 }
-fn build_path(dir: &[u8], name: &[u8]) -> PathBuf {
+
+/// Build `prefix + name` — preserves whatever the user actually typed before
+/// the fragment so we never expand a bare name into an absolute path.
+fn build_prefixed(prefix: &[u8], name: &[u8]) -> PathBuf {
     let mut p = PathBuf::new();
-    p.push_bytes(dir);
-    if dir != b"/" { p.push(b'/'); }
+    p.push_bytes(prefix);
     p.push_bytes(name);
     p
 }
