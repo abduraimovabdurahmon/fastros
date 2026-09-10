@@ -31,6 +31,7 @@
 pub mod command;
 pub mod env;
 pub mod executor;
+pub mod history;
 pub mod io;
 pub mod parser;
 pub mod readline;
@@ -61,6 +62,22 @@ impl ShellIo for VgaKeyboardIo {
 
     fn clear_screen(&mut self) {
         crate::drivers::display::vga::clear();
+    }
+
+    fn put_char_at(&mut self, col: u16, row: u16, ch: u8, color: u8) {
+        crate::drivers::display::vga::put_at(col as usize, row as usize, ch, color);
+    }
+
+    fn write_at(&mut self, col: u16, row: u16, s: &[u8], color: u8) {
+        crate::drivers::display::vga::write_at(col as usize, row as usize, s, color);
+    }
+
+    fn fill_row(&mut self, row: u16, ch: u8, color: u8) {
+        crate::drivers::display::vga::fill_row(row as usize, ch, color);
+    }
+
+    fn move_cursor(&mut self, col: u16, row: u16) {
+        crate::drivers::display::vga::set_cursor(col as usize, row as usize);
     }
 }
 
@@ -98,6 +115,9 @@ pub fn run() -> ! {
 
         let line = editor.read_line(&mut io);
         if line.is_empty() { continue; }
+
+        // Save to history before executing
+        history::push(line);
 
         match parser::parse(line) {
             Some(cmd) => { executor::execute(&cmd, &registry, &mut env, &mut io); }

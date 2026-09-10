@@ -1,6 +1,10 @@
 //! `ls` — list directory contents.
 //!
-//! Backed by the static virtual FS table in `virt_fs`.
+//! Flags:
+//!   -a   show all entries including hidden (dot-files)
+//!   -l   long listing (currently shows name only, no stat)
+//!
+//! By default, entries whose names begin with '.' are hidden.
 
 use super::Command;
 use crate::shell::env::ShellEnv;
@@ -11,29 +15,49 @@ pub static LS: LsCommand = LsCommand;
 
 impl Command for LsCommand {
     fn name(&self) -> &'static str { "ls" }
-    fn description(&self) -> &'static str { "List directory contents" }
+    fn description(&self) -> &'static str { "List directory contents (-a show hidden)" }
 
     fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
-        let target: &[u8] = if args.is_empty() { env.cwd() } else { args[0] };
+        let mut show_all = false;
+        let mut target: &[u8] = env.cwd();
+
+        // Parse flags and path
+        for &arg in args {
+            if arg.starts_with(b"-") {
+                if arg.contains(&b'a') { show_all = true; }
+                // -l flag accepted but output is the same (no inode info yet)
+            } else {
+                target = arg;
+            }
+        }
 
         match super::virt_fs::lookup(target) {
-            Some(children) if children.is_empty() => {
-                io.write_bytes(b"(empty)\n");
-                0
-            }
-            Some(children) => {
-                for name in children.iter() {
-                    io.write_bytes(name);
-                    io.write_bytes(b"  ");
-                }
-                io.newline();
-                0
-            }
             None => {
                 io.write_bytes(b"ls: ");
                 io.write_bytes(target);
                 io.write_bytes(b": No such directory\n");
                 1
+            }
+            Some(children) => {
+                let visible: &[&[u8]] = children;
+                let mut count = 0;
+
+                for &name in visible {
+                    if !show_all && name.first() == Some(&b'.') {
+                        continue; // skip hidden
+                    }
+                    io.write_bytes(name);
+                    io.write_bytes(b"  ");
+                    count += 1;
+                }
+
+                if count > 0 {
+                    io.newline();
+                } else if show_all {
+                    io.write_bytes(b"(empty)\n");
+                }
+                // Without -a, an all-hidden dir shows nothing (like real ls)
+                0
             }
         }
     }

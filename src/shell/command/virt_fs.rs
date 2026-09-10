@@ -190,3 +190,191 @@ pub fn lookup(path: &[u8]) -> Option<&'static [&'static [u8]]> {
 pub fn is_dir(path: &[u8]) -> bool {
     lookup(path).is_some()
 }
+
+// ── Virtual file contents ─────────────────────────────────────────────────────
+
+/// Return the static content of a known virtual file, or `None`.
+pub fn get_content(path: &[u8]) -> Option<&'static [u8]> {
+    match path {
+        // /etc
+        b"/etc/hostname"    => Some(b"fastros\n"),
+        b"/etc/os-release"  => Some(
+            b"NAME=FastROS\n\
+              VERSION=0.1.0\n\
+              ID=fastros\n\
+              PRETTY_NAME=\"FastROS 0.1.0 (Container-Native)\"\n\
+              HOME_URL=\"https://github.com/fastros\"\n\
+              BUILD_ID=rust-no_std-x86_64\n"
+        ),
+        b"/etc/passwd"      => Some(
+            b"root:x:0:0:Root:/root:/bin/sh\n\
+              nobody:x:65534:65534:Nobody:/:/bin/false\n"
+        ),
+        b"/etc/group"       => Some(
+            b"root:x:0:\n\
+              nobody:x:65534:\n"
+        ),
+        b"/etc/shadow"      => Some(b"root:!:19000:0:99999:7:::\n"),
+        b"/etc/hosts"       => Some(
+            b"127.0.0.1   localhost\n\
+              127.0.1.1   fastros\n\
+              ::1         localhost ip6-localhost ip6-loopback\n"
+        ),
+        b"/etc/resolv.conf" => Some(
+            b"# FastROS DNS configuration\n\
+              nameserver 8.8.8.8\n\
+              nameserver 8.8.4.4\n"
+        ),
+        b"/etc/fstab"       => Some(
+            b"# <filesystem>  <mount>  <type>   <options>        <dump> <pass>\n\
+              tmpfs           /tmp     tmpfs    defaults,nosuid  0      0\n\
+              tmpfs           /run     tmpfs    defaults,nosuid  0      0\n"
+        ),
+        b"/etc/motd"        => Some(
+            b"\n\
+              Welcome to FastROS 0.1.0!\n\
+              A container-native OS written in Rust.\n\n"
+        ),
+        b"/etc/shells"      => Some(b"/bin/sh\n/bin/bash\n"),
+        b"/etc/profile"     => Some(
+            b"# /etc/profile - system-wide shell configuration\n\
+              export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin\n\
+              export HOME=/root\n\
+              export TERM=vt100\n\
+              umask 022\n"
+        ),
+        b"/etc/environment" => Some(b"PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"),
+        b"/etc/timezone"    => Some(b"UTC\n"),
+        b"/etc/sysctl.conf" => Some(
+            b"# FastROS kernel parameters\n\
+              kernel.hostname = fastros\n\
+              vm.swappiness = 10\n"
+        ),
+        b"/etc/nsswitch.conf" => Some(
+            b"passwd:   files\n\
+              group:    files\n\
+              shadow:   files\n\
+              hosts:    files dns\n"
+        ),
+        b"/etc/login.defs"  => Some(
+            b"PASS_MAX_DAYS  99999\n\
+              PASS_MIN_DAYS  0\n\
+              PASS_MIN_LEN   5\n\
+              PASS_WARN_AGE  7\n\
+              UID_MIN        1000\n\
+              UID_MAX        60000\n"
+        ),
+        b"/etc/network/interfaces" => Some(
+            b"# FastROS network interfaces\n\
+              auto lo\n\
+              iface lo inet loopback\n\n\
+              auto eth0\n\
+              iface eth0 inet dhcp\n"
+        ),
+        // /proc
+        b"/proc/version"    => Some(
+            b"FastROS 0.1.0 (Rust nightly x86_64-unknown-none) #1 SMP\n"
+        ),
+        b"/proc/cpuinfo"    => Some(
+            b"processor\t: 0\n\
+              vendor_id\t: GenuineIntel\n\
+              model name\t: QEMU Virtual CPU version 2.5+\n\
+              cpu MHz\t\t: 2400.000\n\
+              cache size\t: 4096 KB\n\
+              physical id\t: 0\n\
+              siblings\t: 1\n\
+              cpu cores\t: 1\n\
+              flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep\n\
+              bogomips\t: 4800.00\n"
+        ),
+        b"/proc/meminfo"    => Some(
+            b"MemTotal:       262144 kB\n\
+              MemFree:        258048 kB\n\
+              MemAvailable:   258048 kB\n\
+              Buffers:             0 kB\n\
+              Cached:              0 kB\n\
+              SwapTotal:           0 kB\n\
+              SwapFree:            0 kB\n\
+              Dirty:               0 kB\n\
+              Writeback:           0 kB\n"
+        ),
+        b"/proc/uptime"     => Some(b"0.00 0.00\n"),
+        b"/proc/cmdline"    => Some(b"fastros ro quiet\n"),
+        b"/proc/mounts"     => Some(
+            b"tmpfs / tmpfs rw,nosuid,nodev 0 0\n\
+              tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n\
+              tmpfs /run tmpfs rw,nosuid,nodev 0 0\n"
+        ),
+        b"/proc/filesystems" => Some(b"nodev\ttmpfs\n\text2\n\tfat32\n\toverlay\n"),
+        b"/proc/loadavg"    => Some(b"0.00 0.00 0.00 1/1 1\n"),
+        b"/proc/stat"       => Some(
+            b"cpu  0 0 0 0 0 0 0 0 0 0\n\
+              cpu0 0 0 0 0 0 0 0 0 0 0\n\
+              intr 0\n\
+              ctxt 0\n\
+              btime 0\n\
+              processes 1\n\
+              procs_running 1\n\
+              procs_blocked 0\n"
+        ),
+        b"/proc/interrupts" => Some(
+            b"           CPU0\n\
+                1:        42   PIC  i8042\n\
+               14:         0   PIC  ata_piix\n"
+        ),
+        b"/proc/net/dev"    => Some(
+            b"Inter-|   Receive                  |  Transmit\n\
+               face |bytes packets errs drop|bytes packets errs drop\n\
+                  lo:    0     0    0    0    0     0    0    0\n\
+                eth0:    0     0    0    0    0     0    0    0\n"
+        ),
+        // /root
+        b"/root/.bashrc"    => Some(
+            b"# ~/.bashrc - FastROS root shell config\n\
+              export PS1='root@fastros:\\w# '\n\
+              export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
+              alias ll='ls -la'\n\
+              alias la='ls -a'\n"
+        ),
+        b"/root/.profile"   => Some(
+            b"# ~/.profile\n\
+              [ -f ~/.bashrc ] && . ~/.bashrc\n"
+        ),
+        b"/root/.bash_history" => Some(
+            b"ls /\ncat /etc/hostname\nps\nmem\nuname\n"
+        ),
+        // /usr
+        b"/usr/lib/os-release" => Some(
+            b"NAME=FastROS\n\
+              VERSION=0.1.0\n\
+              ID=fastros\n\
+              PRETTY_NAME=\"FastROS 0.1.0\"\n"
+        ),
+        // /var/log
+        b"/var/log/dmesg"   => Some(
+            b"[    0.000000] FastROS kernel 0.1.0 starting\n\
+              [    0.000001] GDT loaded\n\
+              [    0.000002] IDT loaded\n\
+              [    0.000003] PIC remapped: IRQ0-7 -> 0x20, IRQ8-15 -> 0x28\n\
+              [    0.000004] PMM: 256 MiB detected\n\
+              [    0.000005] VMM: page tables initialized\n\
+              [    0.000006] Heap: ready\n\
+              [    0.000007] PS/2 keyboard initialized\n\
+              [    0.000008] VGA text mode 80x25 initialized\n\
+              [    0.000009] Shell started\n"
+        ),
+        b"/var/log/messages" => Some(
+            b"FastROS 0.1.0 kernel started.\n\
+              Shell session opened.\n"
+        ),
+        b"/var/log/boot.log" => Some(
+            b"[  OK  ] Started FastROS kernel\n\
+              [  OK  ] Mounted virtual filesystems\n\
+              [  OK  ] Started shell\n"
+        ),
+        // /proc/sys pseudo-files
+        b"/proc/sys/kernel" => Some(b"/proc/sys/kernel: directory\n"),
+        b"/sys/power/state"  => Some(b"freeze mem disk\n"),
+        _ => None,
+    }
+}

@@ -8,10 +8,24 @@
 //!
 //! IRQ 1 (vector 33) fires on every key event (press + release).
 //! Break codes = make code | 0x80 → we ignore them.
-//! Special keys (Shift) update modifier state but produce no ASCII.
+//! Extended prefix 0xE0 is tracked for arrow/home/end/pgup/pgdn keys.
+//! Ctrl modifier generates ASCII control characters (0x01–0x1A).
 
 use crate::libs::collections::ring_buffer::RingBuffer;
 use crate::kernel::sync::spinlock::SpinLock;
+
+// ── Special key codes (above 0x7F, never conflict with ASCII) ─────────────────
+
+pub const KEY_UP:    u8 = 0x80;
+pub const KEY_DOWN:  u8 = 0x81;
+pub const KEY_LEFT:  u8 = 0x82;
+pub const KEY_RIGHT: u8 = 0x83;
+pub const KEY_HOME:  u8 = 0x84;
+pub const KEY_END:   u8 = 0x85;
+pub const KEY_PGUP:  u8 = 0x86;
+pub const KEY_PGDN:  u8 = 0x87;
+pub const KEY_INS:   u8 = 0x88;
+pub const KEY_DEL:   u8 = 0x89;
 
 // ── Scancode → ASCII tables (PS/2 Set 1) ─────────────────────────────────────
 
@@ -139,34 +153,34 @@ const MAP_UPPER: [u8; 58] = [
     b' ',   // 0x39 — Space
 ];
 
-// Scancode constants for modifier keys
+// ── Scancode constants ────────────────────────────────────────────────────────
+
 const SC_LSHIFT: u8 = 0x2A;
 const SC_RSHIFT: u8 = 0x36;
-const SC_BREAK:  u8 = 0x80; // bit 7 set = key release
+const SC_CTRL:   u8 = 0x1D;  // Left Ctrl
+const SC_EXT:    u8 = 0xE0;  // Extended key prefix
+const SC_BREAK:  u8 = 0x80;  // bit 7 set = key release
 
 // ── Keyboard state ────────────────────────────────────────────────────────────
 
 /// ASCII buffer: up to 256 pending keystrokes.
 static mut KEY_BUF: RingBuffer<256> = RingBuffer::new();
-static mut SHIFT:   bool            = false;
-static     KBD_LOCK: SpinLock       = SpinLock::new();
+static mut SHIFT:   bool = false;
+static mut CTRL:    bool = false;
+static mut EXT:     bool = false;  // 0xE0 prefix pending
+static     KBD_LOCK: SpinLock = SpinLock::new();
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Initialize internal keyboard state.
-///
-/// Wiring note (Clean Architecture):
-///   Drivers cannot import arch, so main.rs is responsible for:
-///     `arch::set_keyboard_hook(drivers::char::keyboard::on_irq)`
-///     `arch::unmask_irq(1)`
-///   This function only resets buffer state.
 pub fn init() {
     KBD_LOCK.lock();
-    unsafe { KEY_BUF = RingBuffer::new(); SHIFT = false; }
+    unsafe { KEY_BUF = RingBuffer::new(); SHIFT = false; CTRL = false; EXT = false; }
     KBD_LOCK.unlock();
 }
 
-/// Non-blocking read: returns the next ASCII byte from the key buffer, or None.
+/// Non-blocking read: returns the next byte from the key buffer, or None.
+/// Returns both ASCII bytes and KEY_* special codes.
 pub fn read_byte() -> Option<u8> {
     KBD_LOCK.lock();
     let result = unsafe { KEY_BUF.pop() };
@@ -175,27 +189,64 @@ pub fn read_byte() -> Option<u8> {
 }
 
 /// Called by the arch IRQ1 handler with the raw PS/2 scancode byte.
-/// This is the boundary between arch (hardware) and driver (software).
 pub fn on_irq(scancode: u8) {
-    // Bit 7 = break code (key release)
-    let is_release = (scancode & SC_BREAK) != 0;
-    let make       = scancode & !SC_BREAK; // strip break bit
+    // ── Extended prefix ───────────────────────────────────────────────────────
+    if scancode == SC_EXT {
+        unsafe { EXT = true; }
+        return;
+    }
 
-    // Update modifier state
+    let is_release = (scancode & SC_BREAK) != 0;
+    let make       = scancode & !SC_BREAK;
+
+    // ── Extended key (arrow, home, end, pgup, pgdn, ins, del) ────────────────
+    let was_ext = unsafe { let e = EXT; EXT = false; e };
+    if was_ext {
+        if !is_release {
+            let key = ext_translate(make);
+            if key != 0 {
+                KBD_LOCK.lock();
+                unsafe { KEY_BUF.push(key); }
+                KBD_LOCK.unlock();
+            }
+        }
+        return;
+    }
+
+    // ── Modifier keys ─────────────────────────────────────────────────────────
     if make == SC_LSHIFT || make == SC_RSHIFT {
         unsafe { SHIFT = !is_release; }
         return;
     }
+    if make == SC_CTRL {
+        unsafe { CTRL = !is_release; }
+        return;
+    }
 
-    // Ignore key releases for all other keys
+    // Ignore all key releases for normal keys
     if is_release { return; }
 
-    // Translate make code → ASCII
+    // ── Translate make code → ASCII ───────────────────────────────────────────
     let ascii = translate(make);
-    if ascii == 0 { return; } // non-printable / unmapped
+    if ascii == 0 { return; }
+
+    // ── Apply Ctrl modifier ───────────────────────────────────────────────────
+    // Ctrl+A..Z → 0x01..0x1A (standard ASCII control characters)
+    let out = if unsafe { CTRL } {
+        let lo = if ascii >= b'A' && ascii <= b'Z' {
+            ascii - b'A' + 1
+        } else if ascii >= b'a' && ascii <= b'z' {
+            ascii - b'a' + 1
+        } else {
+            ascii
+        };
+        lo
+    } else {
+        ascii
+    };
 
     KBD_LOCK.lock();
-    unsafe { KEY_BUF.push(ascii); }
+    unsafe { KEY_BUF.push(out); }
     KBD_LOCK.unlock();
 }
 
@@ -206,5 +257,22 @@ fn translate(make: u8) -> u8 {
     if idx >= MAP_LOWER.len() { return 0; }
     unsafe {
         if SHIFT { MAP_UPPER[idx] } else { MAP_LOWER[idx] }
+    }
+}
+
+/// Translate extended make code → KEY_* constant.
+fn ext_translate(make: u8) -> u8 {
+    match make {
+        0x48 => KEY_UP,
+        0x50 => KEY_DOWN,
+        0x4B => KEY_LEFT,
+        0x4D => KEY_RIGHT,
+        0x47 => KEY_HOME,
+        0x4F => KEY_END,
+        0x49 => KEY_PGUP,
+        0x51 => KEY_PGDN,
+        0x52 => KEY_INS,
+        0x53 => KEY_DEL,
+        _    => 0,
     }
 }

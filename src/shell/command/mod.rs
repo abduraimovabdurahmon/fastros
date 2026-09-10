@@ -19,9 +19,20 @@
 //!   ls.rs     — list directory contents (virtual FS view)
 //!   cd.rs     — change working directory
 //!   exit.rs   — ACPI power-off (shuts down QEMU)
+//!   cat.rs    — print file contents
+//!   nano.rs   — simple full-screen text editor
+//!   vim.rs    — modal text editor (vi-compatible subset)
+//!   history.rs — command history list
+//!   editor.rs  — shared EditorBuf (used by nano and vim)
+//!   virt_fs.rs — virtual FS tree + file contents
 
+pub mod cat;
 pub mod cd;
+pub mod editor;
 pub mod exit;
+pub mod history;
+pub mod nano;
+pub mod vim;
 pub mod virt_fs;
 pub mod clear;
 pub mod echo;
@@ -115,6 +126,10 @@ impl CommandRegistry {
         r.register(&ls::LS);
         r.register(&cd::CD);
         r.register(&exit::EXIT);
+        r.register(&cat::CAT);
+        r.register(&nano::NANO);
+        r.register(&vim::VIM);
+        r.register(&history::HISTORY);
         r
     }
 }

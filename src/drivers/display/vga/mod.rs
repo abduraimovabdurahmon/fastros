@@ -96,6 +96,29 @@ pub fn clear() {
     update_hw_cursor(0, 0);
 }
 
+/// Move the hardware cursor to (col, row) and update internal state.
+pub fn set_cursor(col: usize, row: usize) {
+    unsafe { COL = col.min(COLS - 1); ROW = row.min(ROWS - 1); }
+    update_hw_cursor(col.min(COLS - 1), row.min(ROWS - 1));
+}
+
+/// Fill an entire row with `ch` using `color`.
+pub fn fill_row(row: usize, ch: u8, color: u8) {
+    if row >= ROWS { return; }
+    for col in 0..COLS {
+        write_cell(col, row, ch, color);
+    }
+}
+
+/// Write a byte slice at (x, y) with explicit `color`, clipping at screen edge.
+pub fn write_at(x: usize, y: usize, s: &[u8], color: u8) {
+    if y >= ROWS { return; }
+    for (i, &b) in s.iter().enumerate() {
+        if x + i >= COLS { break; }
+        write_cell(x + i, y, b, color);
+    }
+}
+
 /// Write a single character with an explicit color at position (x, y).
 pub fn put_at(x: usize, y: usize, ch: u8, color: u8) {
     if x >= COLS || y >= ROWS { return; }

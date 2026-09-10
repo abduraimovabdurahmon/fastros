@@ -55,4 +55,25 @@ pub trait ShellIo {
 
     /// Clear the entire screen and reset cursor to top-left.
     fn clear_screen(&mut self);
+
+    // ── Full-screen editor support ────────────────────────────────────────────
+    // Default implementations are no-ops so non-VGA backends compile fine.
+
+    /// Write character at absolute (col, row) with VGA attribute byte.
+    fn put_char_at(&mut self, _col: u16, _row: u16, _ch: u8, _color: u8) {}
+
+    /// Write byte slice at absolute (col, row) with VGA attribute byte, clipped.
+    fn write_at(&mut self, _col: u16, _row: u16, _s: &[u8], _color: u8) {}
+
+    /// Fill an entire screen row with `ch` and `color`.
+    fn fill_row(&mut self, _row: u16, _ch: u8, _color: u8) {}
+
+    /// Move the hardware cursor to (col, row).
+    fn move_cursor(&mut self, _col: u16, _row: u16) {}
+
+    /// Screen width in columns.
+    fn screen_cols(&self) -> u16 { 80 }
+
+    /// Screen height in rows.
+    fn screen_rows(&self) -> u16 { 25 }
 }
