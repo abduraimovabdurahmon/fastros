@@ -1,6 +1,6 @@
 //! `cd` — change working directory.
 //!
-//! Validates against the virtual filesystem; updates `ShellEnv::cwd`.
+//! Validates against the virtual filesystem table in `virt_fs`.
 
 use super::Command;
 use crate::shell::env::ShellEnv;
@@ -9,11 +9,6 @@ use crate::shell::io::ShellIo;
 pub struct CdCommand;
 pub static CD: CdCommand = CdCommand;
 
-/// Known directories in the virtual FS.
-const KNOWN_DIRS: &[&[u8]] = &[
-    b"/", b"/bin", b"/dev", b"/etc", b"/proc", b"/sys", b"/tmp",
-];
-
 impl Command for CdCommand {
     fn name(&self) -> &'static str { "cd" }
     fn description(&self) -> &'static str { "Change working directory" }
@@ -21,21 +16,19 @@ impl Command for CdCommand {
     fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
         let target = match args.first() {
             Some(t) => *t,
-            None    => b"/",        // cd with no args → go to root
+            None    => b"/",    // cd with no args → root
         };
 
-        // Resolve to absolute path for validation
-        let resolved = resolve_absolute(env.cwd(), target);
-
-        if KNOWN_DIRS.iter().any(|d| *d == resolved.as_slice()) {
-            if env.chdir(resolved.as_slice()) {
-                return 0;
-            }
-        }
-
-        // Handle ".." specially — always allow going up
+        // Handle ".." — go up one level without full resolution
         if target == b".." {
             env.chdir(b"..");
+            return 0;
+        }
+
+        let resolved = resolve_absolute(env.cwd(), target);
+
+        if super::virt_fs::is_dir(resolved.as_slice()) {
+            env.chdir(resolved.as_slice());
             return 0;
         }
 
@@ -46,8 +39,7 @@ impl Command for CdCommand {
     }
 }
 
-/// Resolve a path to absolute without heap allocation.
-/// Returns a fixed-size buffer (max 256 bytes) containing the resolved path.
+/// Resolve `path` against `cwd` into an absolute path (no heap, max 256 B).
 fn resolve_absolute(cwd: &[u8], path: &[u8]) -> PathBuf {
     let mut buf = PathBuf::new();
     if path.first() == Some(&b'/') {

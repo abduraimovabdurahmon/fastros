@@ -22,6 +22,7 @@
 
 pub mod cd;
 pub mod exit;
+pub mod virt_fs;
 pub mod clear;
 pub mod echo;
 pub mod help;
