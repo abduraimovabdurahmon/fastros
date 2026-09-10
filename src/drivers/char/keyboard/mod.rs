@@ -26,6 +26,17 @@ pub const KEY_PGUP:  u8 = 0x86;
 pub const KEY_PGDN:  u8 = 0x87;
 pub const KEY_INS:   u8 = 0x88;
 pub const KEY_DEL:   u8 = 0x89;
+// Function keys F1-F10 (PS/2 Set1 scancodes 0x3B-0x44)
+pub const KEY_F1:    u8 = 0x90;
+pub const KEY_F2:    u8 = 0x91;
+pub const KEY_F3:    u8 = 0x92;
+pub const KEY_F4:    u8 = 0x93;
+pub const KEY_F5:    u8 = 0x94;
+pub const KEY_F6:    u8 = 0x95;
+pub const KEY_F7:    u8 = 0x96;
+pub const KEY_F8:    u8 = 0x97;
+pub const KEY_F9:    u8 = 0x98;
+pub const KEY_F10:   u8 = 0x99;
 
 // ── Scancode → ASCII tables (PS/2 Set 1) ─────────────────────────────────────
 
@@ -225,6 +236,14 @@ pub fn on_irq(scancode: u8) {
 
     // Ignore all key releases for normal keys
     if is_release { return; }
+
+    // ── F1–F10 keys (scancodes 0x3B–0x44, non-extended) ──────────────────────
+    if make >= 0x3B && make <= 0x44 {
+        KBD_LOCK.lock();
+        unsafe { KEY_BUF.push(KEY_F1 + (make - 0x3B)); }
+        KBD_LOCK.unlock();
+        return;
+    }
 
     // ── Translate make code → ASCII ───────────────────────────────────────────
     let ascii = translate(make);

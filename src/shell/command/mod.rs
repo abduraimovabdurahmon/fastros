@@ -31,6 +31,7 @@ pub mod cd;
 pub mod editor;
 pub mod exit;
 pub mod history;
+pub mod htop;
 pub mod mkdir;
 pub mod nano;
 pub mod vim;
@@ -128,6 +129,7 @@ impl CommandRegistry {
         r.register(&cd::CD);
         r.register(&exit::EXIT);
         r.register(&cat::CAT);
+        r.register(&htop::HTOP);
         r.register(&mkdir::MKDIR);
         r.register(&nano::NANO);
         r.register(&vim::VIM);
