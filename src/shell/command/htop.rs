@@ -38,25 +38,31 @@ fn calc_proc_rows(term_rows: u16) -> usize {
     (term_rows as usize).saturating_sub(7).max(1)
 }
 
-// ── Color palette (VGA attribute bytes: high-nibble=bg, low-nibble=fg) ────────
-// Designed to look good both in VGA text mode and via ANSI over SSH.
+// ── Color palette (VGA attribute byte: HIGH-nibble=bg, LOW-nibble=fg) ─────────
+// ANSI mapping: bg nibble → 40+vga_ansi[n] (normal) or 100+vga_ansi[n] (bright)
+//               fg nibble → 30+vga_ansi[n] (normal) or  90+vga_ansi[n] (bright)
+// VGA_TO_ANSI: [0,4,2,6,1,5,3,7]  (Black→0, Blue→4, Green→2, Cyan→6, ...)
 
-const CLR_TITLE:    u8 = 0x1F; // White   on Blue         — title bar
-const CLR_UPTIME:   u8 = 0x1B; // Cyan    on Blue         — uptime text
-const CLR_MTR_LBL:  u8 = 0x0F; // Bright  White on Black  — "CPU[" label
-const CLR_MTR_BG:   u8 = 0x00; // Black   on Black        — empty meter (dark band)
-const CLR_CPU_USED: u8 = 0x2A; // LightGreen on Green     — CPU used (solid green bar)
-const CLR_MEM_USED: u8 = 0x19; // LightBlue  on Blue      — Mem used (solid blue bar)
-const CLR_SWP_USED: u8 = 0x4C; // LightRed   on Red       — Swap used (unused)
-const CLR_COL_HDR:  u8 = 0x30; // Black   on Cyan         — column header
-const CLR_DEFAULT:  u8 = 0x07; // Gray    on Black         — normal process row
-const CLR_RUNNING:  u8 = 0x0A; // LightGreen on Black     — running process
-const CLR_ZOMBIE:   u8 = 0x0C; // LightRed   on Black     — zombie
-const CLR_SELECTED: u8 = 0x70; // Black   on LightGray     — selected row highlight
-const CLR_STATUS:   u8 = 0x1F; // White   on Blue         — status bar (matches title)
-const CLR_FK_NUM:   u8 = 0x0E; // Yellow  on Black        — F-key number
-const CLR_FK_LBL:   u8 = 0x1F; // White   on Blue         — F-key label
-const CLR_HILITE:   u8 = 0x0B; // LightCyan on Black      — highlighted value
+// For solid-block meter bars (space char), only the BACKGROUND color matters.
+// bg nibbles used:  0=Black(40)  2=Green(42)  1=Blue(44)  8=DkGray(100)
+//                   A=BrGreen(102) 9=BrBlue(104) C=BrRed(101)
+
+const CLR_TITLE:    u8 = 0x1F; // bg=Blue(44)    fg=BrWhite(97)  — title bar
+const CLR_UPTIME:   u8 = 0x1B; // bg=Blue(44)    fg=BrCyan(96)   — uptime
+const CLR_MTR_LBL:  u8 = 0x0F; // bg=Black(40)   fg=BrWhite(97)  — "CPU[" label
+const CLR_MTR_BG:   u8 = 0x80; // bg=DkGray(100) fg=Black(30)    — empty meter slot
+const CLR_CPU_USED: u8 = 0xA0; // bg=BrGreen(102) fg=Black(30)   — CPU bar (bright green)
+const CLR_MEM_USED: u8 = 0x90; // bg=BrBlue(104)  fg=Black(30)   — Mem bar (bright blue)
+const CLR_SWP_USED: u8 = 0xC0; // bg=BrRed(101)   fg=Black(30)   — Swap (unused)
+const CLR_COL_HDR:  u8 = 0x30; // bg=Cyan(46)    fg=Black(30)    — column header
+const CLR_DEFAULT:  u8 = 0x07; // bg=Black(40)   fg=Gray(37)     — normal process row
+const CLR_RUNNING:  u8 = 0x0A; // bg=Black(40)   fg=BrGreen(92)  — running process
+const CLR_ZOMBIE:   u8 = 0x0C; // bg=Black(40)   fg=BrRed(91)    — zombie
+const CLR_SELECTED: u8 = 0x70; // bg=Gray(47)    fg=Black(30)    — selected row
+const CLR_STATUS:   u8 = 0x1F; // bg=Blue(44)    fg=BrWhite(97)  — status bar
+const CLR_FK_NUM:   u8 = 0x0E; // bg=Black(40)   fg=BrYellow(93) — F-key number
+const CLR_FK_LBL:   u8 = 0x1F; // bg=Blue(44)    fg=BrWhite(97)  — F-key label
+const CLR_HILITE:   u8 = 0x0B; // bg=Black(40)   fg=BrCyan(96)   — highlighted value
 
 // ── Sort key ─────────────────────────────────────────────────────────────────
 
