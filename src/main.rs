@@ -65,8 +65,23 @@ pub extern "C" fn kernel_main() -> ! {
     arch::set_keyboard_hook(drivers::char::keyboard::on_irq);
     arch::unmask_irq(1); // enable IRQ 1 (PS/2 keyboard)
 
+    // ── Layer 3: ATA disk driver (data persistence) ───────────────────────
+    let ata_ok = drivers::block::ata::init();
+    if ata_ok {
+        drivers::char::serial::write(b"  ata: data disk detected (IDE primary)\n");
+    }
+
     // ── Layer 4: File systems ──────────────────────────────────────────────
     fs::init();
+
+    // ── Layer 4: Persistent disk FS (loads saved files/dirs from disk) ────
+    if ata_ok {
+        if fs::disk_init() {
+            drivers::char::serial::write(b"  diskfs: persistent storage mounted\n");
+        } else {
+            drivers::char::serial::write(b"  diskfs: formatted new disk\n");
+        }
+    }
 
     // ── Layer 2: User/group management ────────────────────────────────────
     kernel::users::init();

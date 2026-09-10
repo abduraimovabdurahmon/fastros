@@ -8,6 +8,7 @@
 //! CANNOT IMPORT: arch/, drivers/, fs/, container/, orchestrator/, userspace/
 
 pub mod cgroup;
+pub mod log;
 pub mod ipc;
 pub mod memory;
 pub mod namespace;

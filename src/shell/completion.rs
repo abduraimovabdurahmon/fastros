@@ -17,7 +17,7 @@ use crate::shell::memfs;
 const COMMANDS: &[&[u8]] = &[
     b"cat", b"cd", b"chmod", b"chown", b"clear", b"echo", b"exit",
     b"groups", b"help", b"history", b"htop", b"id", b"ifconfig",
-    b"ls", b"mem", b"mkdir", b"nano", b"netstat",
+    b"journalctl", b"ls", b"mem", b"mkdir", b"nano", b"netstat",
     b"passwd", b"ping", b"ps", b"reboot", b"rm",
     b"sshd", b"su", b"sudo", b"uname", b"uptime",
     b"useradd", b"userdel", b"vim", b"whoami",

@@ -1,6 +1,7 @@
 //! Shell command subsystem
 
 pub mod cat;
+pub mod journalctl;
 pub mod cd;
 pub mod chmod;
 pub mod chown;
@@ -44,7 +45,7 @@ pub trait Command: Send + Sync {
     fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32;
 }
 
-pub const MAX_COMMANDS: usize = 56;
+pub const MAX_COMMANDS: usize = 58;
 
 pub struct CommandRegistry {
     entries: [Option<&'static dyn Command>; MAX_COMMANDS],
@@ -117,6 +118,8 @@ impl CommandRegistry {
         r.register(&sshd::SSHD);
         // History
         r.register(&history::HISTORY);
+        // Logging
+        r.register(&journalctl::JOURNALCTL);
         r
     }
 }

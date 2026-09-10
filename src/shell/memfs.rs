@@ -57,6 +57,10 @@ pub fn write_owned(path: &[u8], data: &[u8], uid: u32, gid: u32, mode: u16) -> b
     FS_LOCK.lock();
     let result = unsafe { store_write(path, data, uid, gid, mode) };
     FS_LOCK.unlock();
+    // Persist to disk (no-op if ATA disk not present)
+    if result {
+        crate::fs::diskfs::persist_file(path, data);
+    }
     result
 }
 
@@ -156,6 +160,9 @@ pub fn remove(path: &[u8]) -> bool {
         }
     };
     FS_LOCK.unlock();
+    if result {
+        crate::fs::diskfs::remove(path);
+    }
     result
 }
 

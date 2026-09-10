@@ -8,6 +8,7 @@
 //! CAN IMPORT:   kernel/, drivers/block, libs/
 //! CANNOT IMPORT: arch/, hal/, container/, orchestrator/, userspace/
 
+pub mod diskfs;
 pub mod ext2;
 pub mod fat32;
 pub mod overlayfs;
@@ -16,6 +17,9 @@ pub mod vfs;
 
 pub fn init() {
     vfs::init();
-    // Mount tmpfs as rootfs initially
-    // tmpfs::mount("/");
+}
+
+/// Initialize persistent disk filesystem. Called after ATA driver is up.
+pub fn disk_init() -> bool {
+    diskfs::init()
 }

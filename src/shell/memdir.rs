@@ -48,6 +48,9 @@ pub fn create_owned(path: &[u8], uid: u32, gid: u32, mode: u16) -> bool {
     DIR_LOCK.lock();
     let result = unsafe { store_create(path, uid, gid, mode) };
     DIR_LOCK.unlock();
+    if result {
+        crate::fs::diskfs::persist_dir(path);
+    }
     result
 }
 
