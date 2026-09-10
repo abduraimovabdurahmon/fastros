@@ -16,8 +16,8 @@ use crate::shell::memfs;
 /// Must be kept in sync with CommandRegistry::init().
 const COMMANDS: &[&[u8]] = &[
     b"cat", b"cd", b"clear", b"echo", b"exit",
-    b"help", b"history", b"ls", b"mem", b"nano",
-    b"ps", b"reboot", b"uname", b"uptime", b"vim",
+    b"help", b"history", b"ls", b"mem", b"mkdir",
+    b"nano", b"ps", b"reboot", b"uname", b"uptime", b"vim",
 ];
 
 /// Maximum completions returned for a single Tab press.
@@ -114,6 +114,21 @@ fn complete_paths(partial: &[u8], cwd: &[u8], list: &mut CompletionList) {
     let n = memfs::list(&mut memfs_paths);
     for i in 0..n {
         let path = memfs_paths[i];
+        if path_parent_is(path, dir) {
+            let name = path_name(path);
+            if name.starts_with(frag) {
+                let entry = build_prefixed(typed_prefix, name);
+                list.push(entry.as_slice());
+            }
+        }
+    }
+
+    // Also check memdir for user-created subdirectories under `dir`
+    let mut memdir_paths: [&'static [u8]; crate::shell::memdir::MAX_DIRS] =
+        [b""; crate::shell::memdir::MAX_DIRS];
+    let nd = crate::shell::memdir::list(&mut memdir_paths);
+    for i in 0..nd {
+        let path = memdir_paths[i];
         if path_parent_is(path, dir) {
             let name = path_name(path);
             if name.starts_with(frag) {

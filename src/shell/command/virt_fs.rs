@@ -186,9 +186,9 @@ pub fn lookup(path: &[u8]) -> Option<&'static [&'static [u8]]> {
     None
 }
 
-/// Returns `true` if `path` is a known directory.
+/// Returns `true` if `path` is a known directory (static tree OR user-created).
 pub fn is_dir(path: &[u8]) -> bool {
-    lookup(path).is_some()
+    lookup(path).is_some() || crate::shell::memdir::exists(path)
 }
 
 // ── Virtual file contents ─────────────────────────────────────────────────────

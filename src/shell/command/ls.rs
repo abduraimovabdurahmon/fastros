@@ -11,6 +11,7 @@ use super::Command;
 use crate::shell::env::ShellEnv;
 use crate::shell::io::ShellIo;
 use crate::shell::memfs;
+use crate::shell::memdir;
 
 pub struct LsCommand;
 pub static LS: LsCommand = LsCommand;
@@ -57,13 +58,24 @@ impl Command for LsCommand {
         // Also include user-created files from memfs under this directory
         let mut memfs_paths: [&'static [u8]; memfs::MAX_FILES] = [b""; memfs::MAX_FILES];
         let mcount = memfs::list(&mut memfs_paths);
-        'outer: for i in 0..mcount {
+        'mf: for i in 0..mcount {
             let path = memfs_paths[i];
             if !memfs_path_parent_is(path, target) { continue; }
             let name = memfs_path_name(path);
             if !show_all && name.first() == Some(&b'.') { continue; }
-            // Skip if already listed by virt_fs
-            for j in 0..count { if visible[j] == name { continue 'outer; } }
+            for j in 0..count { if visible[j] == name { continue 'mf; } }
+            if count < 256 { visible[count] = name; count += 1; }
+        }
+
+        // Also include user-created directories from memdir under this directory
+        let mut memdir_paths: [&'static [u8]; memdir::MAX_DIRS] = [b""; memdir::MAX_DIRS];
+        let dcount = memdir::list(&mut memdir_paths);
+        'md: for i in 0..dcount {
+            let path = memdir_paths[i];
+            if !memfs_path_parent_is(path, target) { continue; }
+            let name = memfs_path_name(path);
+            if !show_all && name.first() == Some(&b'.') { continue; }
+            for j in 0..count { if visible[j] == name { continue 'md; } }
             if count < 256 { visible[count] = name; count += 1; }
         }
 

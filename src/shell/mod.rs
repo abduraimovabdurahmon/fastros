@@ -34,6 +34,7 @@ pub mod env;
 pub mod executor;
 pub mod history;
 pub mod io;
+pub mod memdir;
 pub mod memfs;
 pub mod parser;
 pub mod readline;
