@@ -17,5 +17,6 @@ pub mod net;
 pub fn init() {
     display::vga::init();
     char::serial::init();
+    char::keyboard::init();
     bus::pci::init();
 }

@@ -28,3 +28,8 @@ pub fn set_timer_hook(f: fn()) {
 pub fn set_page_fault_hook(f: fn(u64, bool, bool, bool, u64) -> bool) {
     interrupts::set_page_fault_hook(f);
 }
+
+/// Hook called on PS/2 keyboard IRQ 1 with raw scancode byte.
+pub fn set_keyboard_hook(f: fn(u8)) {
+    interrupts::set_keyboard_hook(f);
+}

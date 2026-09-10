@@ -21,6 +21,7 @@ mod hal;
 mod kernel;
 mod libs;
 mod orchestrator;
+mod shell;
 
 /// Called from arch/x86_64/boot.s after entering 64-bit long mode.
 #[no_mangle]
@@ -57,6 +58,10 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Layer 3: Remaining drivers ────────────────────────────────────────
     drivers::init();
 
+    // Wire PS/2 keyboard IRQ → keyboard driver (arch↔drivers boundary lives here)
+    arch::set_keyboard_hook(drivers::char::keyboard::on_irq);
+    arch::unmask_irq(1); // enable IRQ 1 (PS/2 keyboard)
+
     // ── Layer 4: File systems ──────────────────────────────────────────────
     fs::init();
 
@@ -72,12 +77,10 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Layer 7: Orchestration layer ───────────────────────────────────────
     orchestrator::init();
 
-    drivers::char::serial::write(b"  Boot complete. Entering idle loop.\n");
+    drivers::char::serial::write(b"  Boot complete. Starting shell.\n");
 
-    // Idle loop — the scheduler preempts this when processes are runnable
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-    }
+    // Launch the interactive shell — never returns
+    shell::run();
 }
 
 #[panic_handler]

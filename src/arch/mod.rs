@@ -26,3 +26,15 @@ pub fn set_page_fault_hook(f: fn(u64, bool, bool, bool, u64) -> bool) {
     #[cfg(target_arch = "x86_64")]
     x86_64::set_page_fault_hook(f);
 }
+
+/// Set the raw PS/2 scancode receiver (called by keyboard driver init).
+pub fn set_keyboard_hook(f: fn(u8)) {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::set_keyboard_hook(f);
+}
+
+/// Unmask a PIC IRQ line (0–15).  Called from main.rs to enable specific IRQs.
+pub fn unmask_irq(irq: u8) {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::interrupts::pic::unmask(irq);
+}

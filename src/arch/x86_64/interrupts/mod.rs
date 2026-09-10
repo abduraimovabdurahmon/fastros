@@ -29,3 +29,9 @@ pub fn set_timer_hook(f: fn()) {
 pub fn set_page_fault_hook(f: fn(u64, bool, bool, bool, u64) -> bool) {
     unsafe { idt::PAGE_FAULT_HOOK = Some(f); }
 }
+
+/// Set the raw PS/2 scancode receiver.
+/// Called by `drivers::char::keyboard::init()` via `arch::set_keyboard_hook()`.
+pub fn set_keyboard_hook(f: fn(u8)) {
+    unsafe { idt::KEYBOARD_HOOK = Some(f); }
+}

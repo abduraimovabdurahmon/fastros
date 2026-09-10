@@ -205,8 +205,14 @@ extern "x86-interrupt" fn irq_timer(frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn irq_keyboard(frame: InterruptStackFrame) {
     let _ = frame;
-    // TODO: read scancode from 0x60, push to keyboard driver ring buffer
+    // Read the scancode BEFORE sending EOI (PIC clears the request on EOI)
+    let scancode: u8;
+    unsafe { core::arch::asm!("in al, 0x60", out("al") scancode, options(nomem, nostack)); }
     pic::end_of_interrupt(1);
+    // Dispatch to the keyboard driver via hook (arch layer cannot import drivers)
+    unsafe {
+        if let Some(hook) = KEYBOARD_HOOK { hook(scancode); }
+    }
 }
 
 extern "x86-interrupt" fn irq_spurious(frame: InterruptStackFrame) {
@@ -222,6 +228,10 @@ pub static mut TIMER_HOOK: Option<fn()> = None;
 /// Called on page fault.  Returns true if the fault was handled (demand page).
 /// Signature: (fault_addr, present, write, user, rip) → handled
 pub static mut PAGE_FAULT_HOOK: Option<fn(u64, bool, bool, bool, u64) -> bool> = None;
+
+/// Called on IRQ 1 (PS/2 keyboard) with the raw scancode byte.
+/// Set by `drivers::char::keyboard::init()` via `arch::set_keyboard_hook()`.
+pub static mut KEYBOARD_HOOK: Option<fn(u8)> = None;
 
 // ── Load IDT ─────────────────────────────────────────────────────────────────
 
