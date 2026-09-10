@@ -14,3 +14,4 @@ pub mod namespace;
 pub mod process;
 pub mod sync;
 pub mod syscall;
+pub mod users;

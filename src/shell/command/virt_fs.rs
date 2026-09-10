@@ -191,6 +191,50 @@ pub fn is_dir(path: &[u8]) -> bool {
     lookup(path).is_some() || crate::shell::memdir::exists(path)
 }
 
+/// Return Unix metadata (uid, gid, mode) for a path.
+/// For static virt_fs entries the mode is fixed; for memfs/memdir the stored value is used.
+pub fn get_stat(path: &[u8]) -> (u32, u32, u16) {
+    use crate::kernel::users::permission::*;
+
+    // Check memfs first (user-created files override static content)
+    if let Some((uid, gid, mode)) = crate::shell::memfs::get_meta(path) {
+        return (uid, gid, mode);
+    }
+    // Check memdir (user-created directories)
+    if let Some((uid, gid, mode)) = crate::shell::memdir::get_meta(path) {
+        return (uid, gid, mode);
+    }
+
+    // Special static paths with non-default permissions
+    match path {
+        b"/etc/shadow"                  => return (0, 0, MODE_SHADOW),
+        b"/root"                        => return (0, 0, MODE_HOME),
+        b"/tmp"                         => return (0, 0, MODE_TMP),
+        _ => {}
+    }
+    if path.starts_with(b"/root/") {
+        return (0, 0, MODE_ROOT_FILE);
+    }
+    // /home/username — look up uid/gid from user table
+    if path.len() > 6 && path.starts_with(b"/home/") {
+        let uname = &path[6..];
+        if !uname.contains(&b'/') {
+            let (uid, gid) = crate::kernel::users::with_users(|db| {
+                match db.find_by_name(uname) {
+                    Some(u) => (u.uid, u.gid),
+                    None    => (0u32, 0u32),
+                }
+            });
+            return (uid, gid, MODE_HOME);
+        }
+    }
+
+    // Static directories → drwxr-xr-x  root root
+    if lookup(path).is_some() { return (0, 0, MODE_DIR); }
+    // Static files → -rw-r--r--  root root
+    (0, 0, MODE_FILE)
+}
+
 // ── Virtual file contents ─────────────────────────────────────────────────────
 
 /// Return the static content of a known virtual file, or `None`.

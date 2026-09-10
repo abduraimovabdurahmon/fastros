@@ -1,41 +1,26 @@
 //! Shell command subsystem
-//!
-//! Design principles:
-//!   • Each command is a zero-sized unit struct in its own file.
-//!   • All commands implement the `Command` trait.
-//!   • Commands interact with the world ONLY through `ShellIo` and `ShellEnv`.
-//!   • No command imports VGA, serial, or keyboard directly.
-//!   • Adding a new command = create a file + add one line in CommandRegistry::init().
-//!
-//! Command files:
-//!   help.rs   — list all commands
-//!   clear.rs  — clear screen
-//!   echo.rs   — print arguments
-//!   mem.rs    — physical memory stats
-//!   uname.rs  — kernel version info
-//!   uptime.rs — elapsed ticks since boot
-//!   reboot.rs — reset the machine
-//!   ps.rs     — list kernel processes
-//!   ls.rs     — list directory contents (virtual FS view)
-//!   cd.rs     — change working directory
-//!   exit.rs   — ACPI power-off (shuts down QEMU)
-//!   cat.rs    — print file contents
-//!   nano.rs   — simple full-screen text editor
-//!   vim.rs    — modal text editor (vi-compatible subset)
-//!   history.rs — command history list
-//!   editor.rs  — shared EditorBuf (used by nano and vim)
-//!   virt_fs.rs — virtual FS tree + file contents
 
 pub mod cat;
 pub mod cd;
+pub mod chmod;
+pub mod chown;
 pub mod editor;
 pub mod exit;
+pub mod groups;
 pub mod history;
 pub mod htop;
+pub mod id;
 pub mod mkdir;
 pub mod nano;
+pub mod passwd;
+pub mod rm;
+pub mod su;
+pub mod sudo;
+pub mod useradd;
+pub mod userdel;
 pub mod vim;
 pub mod virt_fs;
+pub mod whoami;
 pub mod clear;
 pub mod echo;
 pub mod help;
@@ -49,34 +34,14 @@ pub mod uptime;
 use crate::shell::env::ShellEnv;
 use crate::shell::io::ShellIo;
 
-// ── Command trait ─────────────────────────────────────────────────────────────
-
-/// Every shell command implements this trait.
-///
-/// Object-safe: all methods take `&self` (commands are stateless unit structs).
 pub trait Command: Send + Sync {
-    /// The name the user types (e.g. `"ls"`).
     fn name(&self) -> &'static str;
-
-    /// One-line description shown by `help`.
     fn description(&self) -> &'static str;
-
-    /// Execute the command.
-    ///
-    /// `args` — slice of argument tokens (does NOT include the command name).
-    /// Returns an exit code (0 = success, non-zero = error).
     fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32;
 }
 
-// ── CommandRegistry ───────────────────────────────────────────────────────────
+pub const MAX_COMMANDS: usize = 48;
 
-/// Maximum number of simultaneously registered commands.
-pub const MAX_COMMANDS: usize = 32;
-
-/// Static registry of all available commands.
-///
-/// Commands are `&'static dyn Command` — each command is a static singleton.
-/// Registered at boot time; never mutated afterwards.
 pub struct CommandRegistry {
     entries: [Option<&'static dyn Command>; MAX_COMMANDS],
     count:   usize,
@@ -87,7 +52,6 @@ impl CommandRegistry {
         Self { entries: [None; MAX_COMMANDS], count: 0 }
     }
 
-    /// Register a command. Silently ignores if the registry is full.
     pub fn register(&mut self, cmd: &'static dyn Command) {
         if self.count < MAX_COMMANDS {
             self.entries[self.count] = Some(cmd);
@@ -95,44 +59,54 @@ impl CommandRegistry {
         }
     }
 
-    /// Look up a command by name.  O(n) — registry is small.
     pub fn find(&self, name: &[u8]) -> Option<&'static dyn Command> {
         for i in 0..self.count {
             if let Some(cmd) = self.entries[i] {
-                if cmd.name().as_bytes() == name {
-                    return Some(cmd);
-                }
+                if cmd.name().as_bytes() == name { return Some(cmd); }
             }
         }
         None
     }
 
-    /// Iterate over all registered commands.
     pub fn iter(&self) -> impl Iterator<Item = &'static dyn Command> + '_ {
-        self.entries[..self.count]
-            .iter()
-            .filter_map(|e| *e)
+        self.entries[..self.count].iter().filter_map(|e| *e)
     }
 
-    /// Build and return the populated registry.
     pub fn init() -> Self {
         let mut r = Self::empty();
+        // Core utils
         r.register(&help::HELP);
         r.register(&clear::CLEAR);
         r.register(&echo::ECHO);
-        r.register(&mem::MEM);
         r.register(&uname::UNAME);
         r.register(&uptime::UPTIME);
         r.register(&reboot::REBOOT);
+        r.register(&exit::EXIT);
+        // Process / memory
         r.register(&ps::PS);
+        r.register(&mem::MEM);
+        r.register(&htop::HTOP);
+        // Filesystem
         r.register(&ls::LS);
         r.register(&cd::CD);
-        r.register(&exit::EXIT);
         r.register(&cat::CAT);
-        r.register(&htop::HTOP);
         r.register(&mkdir::MKDIR);
+        r.register(&rm::RM);
+        r.register(&chmod::CHMOD);
+        r.register(&chown::CHOWN);
+        // Editors
         r.register(&nano::NANO);
         r.register(&vim::VIM);
+        // User management
+        r.register(&whoami::WHOAMI);
+        r.register(&id::ID);
+        r.register(&groups::GROUPS);
+        r.register(&su::SU);
+        r.register(&sudo::SUDO);
+        r.register(&useradd::USERADD);
+        r.register(&userdel::USERDEL);
+        r.register(&passwd::PASSWD);
+        // History
         r.register(&history::HISTORY);
         r
     }

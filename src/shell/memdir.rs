@@ -1,14 +1,7 @@
 //! In-memory directory store — tracks user-created directories.
 //!
-//! Mirrors the design of `memfs` but for directories instead of files.
-//! Directories persist within a session and are lost on reboot.
-//!
-//! Used by:
-//!   mkdir          — creates entries here
-//!   virt_fs::is_dir — checks here after checking the static tree
-//!   ls             — lists entries here alongside virt_fs children
-//!   cd             — navigates here (via virt_fs::is_dir)
-//!   tab completion — completes into these directories
+//! Each directory carries Unix-style metadata: uid, gid, mode.
+//! Default: uid=0, gid=0, mode=0o755 (drwxr-xr-x).
 
 use crate::kernel::sync::spinlock::SpinLock;
 
@@ -18,12 +11,15 @@ const PATH_CAP:    usize = 256;
 struct MemDirEntry {
     path:     [u8; PATH_CAP],
     path_len: usize,
+    uid:      u32,
+    gid:      u32,
+    mode:     u16,
     used:     bool,
 }
 
 impl MemDirEntry {
     const fn empty() -> Self {
-        Self { path: [0u8; PATH_CAP], path_len: 0, used: false }
+        Self { path: [0u8; PATH_CAP], path_len: 0, uid: 0, gid: 0, mode: 0o755, used: false }
     }
 }
 
@@ -41,17 +37,21 @@ static mut STORE: [MemDirEntry; MAX_DIRS] = [
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Create a directory.  Returns false if the store is full or path is too long.
-/// Does NOT check whether the path already exists — callers must do that.
+/// Create a directory with default ownership (uid=0 gid=0 mode=0o755).
 pub fn create(path: &[u8]) -> bool {
+    create_owned(path, 0, 0, 0o755)
+}
+
+/// Create a directory with explicit uid/gid/mode.
+pub fn create_owned(path: &[u8], uid: u32, gid: u32, mode: u16) -> bool {
     if path.len() >= PATH_CAP { return false; }
     DIR_LOCK.lock();
-    let result = unsafe { store_create(path) };
+    let result = unsafe { store_create(path, uid, gid, mode) };
     DIR_LOCK.unlock();
     result
 }
 
-/// True if `path` is a user-created directory in this store.
+/// True if path is a user-created directory.
 pub fn exists(path: &[u8]) -> bool {
     DIR_LOCK.lock();
     let result = unsafe { store_find(path).is_some() };
@@ -59,7 +59,75 @@ pub fn exists(path: &[u8]) -> bool {
     result
 }
 
-/// List all stored directory absolute paths into `out`. Returns count.
+/// Get directory metadata (uid, gid, mode).
+pub fn get_meta(path: &[u8]) -> Option<(u32, u32, u16)> {
+    DIR_LOCK.lock();
+    let result = unsafe {
+        store_find(path).map(|i| {
+            let e = &STORE[i];
+            (e.uid, e.gid, e.mode)
+        })
+    };
+    DIR_LOCK.unlock();
+    result
+}
+
+/// Update only mode bits.
+pub fn set_mode(path: &[u8], mode: u16) -> bool {
+    DIR_LOCK.lock();
+    let result = unsafe {
+        match store_find(path) {
+            Some(i) => { STORE[i].mode = mode; true }
+            None    => false,
+        }
+    };
+    DIR_LOCK.unlock();
+    result
+}
+
+/// Update only owner (uid, gid).
+pub fn set_owner(path: &[u8], uid: u32, gid: u32) -> bool {
+    DIR_LOCK.lock();
+    let result = unsafe {
+        match store_find(path) {
+            Some(i) => { STORE[i].uid = uid; STORE[i].gid = gid; true }
+            None    => false,
+        }
+    };
+    DIR_LOCK.unlock();
+    result
+}
+
+/// Remove a directory entry. Returns true if found.
+pub fn remove(path: &[u8]) -> bool {
+    DIR_LOCK.lock();
+    let result = unsafe {
+        match store_find(path) {
+            Some(i) => { STORE[i] = MemDirEntry::empty(); true }
+            None    => false,
+        }
+    };
+    DIR_LOCK.unlock();
+    result
+}
+
+/// Remove all entries whose path starts with `prefix` (for recursive removal).
+pub fn remove_recursive(prefix: &[u8]) -> usize {
+    DIR_LOCK.lock();
+    let mut count = 0;
+    unsafe {
+        for e in STORE.iter_mut() {
+            if e.used && e.path[..e.path_len].starts_with(prefix) {
+                *e = MemDirEntry::empty();
+                count += 1;
+            }
+        }
+    }
+    DIR_LOCK.unlock();
+    count
+}
+
+/// List all stored directory absolute paths. Returns count.
 pub fn list(out: &mut [&'static [u8]; MAX_DIRS]) -> usize {
     DIR_LOCK.lock();
     let mut n = 0;
@@ -86,17 +154,19 @@ unsafe fn store_find(path: &[u8]) -> Option<usize> {
     None
 }
 
-unsafe fn store_create(path: &[u8]) -> bool {
-    // Already exists — idempotent (caller decides whether to error)
+unsafe fn store_create(path: &[u8], uid: u32, gid: u32, mode: u16) -> bool {
     if store_find(path).is_some() { return false; }
     for e in STORE.iter_mut() {
         if !e.used {
             let n = path.len().min(PATH_CAP - 1);
             e.path[..n].copy_from_slice(&path[..n]);
             e.path_len = n;
+            e.uid  = uid;
+            e.gid  = gid;
+            e.mode = mode;
             e.used = true;
             return true;
         }
     }
-    false // store full
+    false
 }

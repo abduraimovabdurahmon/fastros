@@ -16,8 +16,14 @@ impl Command for CdCommand {
     fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
         let target = match args.first() {
             Some(t) => *t,
-            None    => b"/",    // cd with no args → root
+            None    => b"~",    // cd with no args → home (Linux default)
         };
+
+        // Handle "~" and "~/..." — home directory expansion
+        if target == b"~" || (target.len() >= 2 && target[0] == b'~' && target[1] == b'/') {
+            env.chdir(target);
+            return 0;
+        }
 
         // Handle ".." — go up one level without full resolution
         if target == b".." {

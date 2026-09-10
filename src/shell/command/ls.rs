@@ -95,11 +95,37 @@ impl Command for LsCommand {
         if long_fmt {
             let mut lines_shown = 0usize;
             for i in 0..count {
-                // Type indicator: 'd' for known directories, '-' for files
                 let full_path = make_abs_path(target, visible[i]);
-                let is_dir = super::virt_fs::is_dir(full_path.as_slice());
-                io.write_byte(if is_dir { b'd' } else { b'-' });
-                io.write_bytes(b"  ");
+                let fp = full_path.as_slice();
+                let is_dir = super::virt_fs::is_dir(fp);
+                let (uid, gid, mode) = super::virt_fs::get_stat(fp);
+
+                // Mode string: drwxr-xr-x
+                let mut mode_str = [0u8; 10];
+                crate::kernel::users::permission::fmt_mode_str(is_dir, mode, &mut mode_str);
+                io.write_bytes(&mode_str);
+
+                // Owner name
+                io.write_byte(b' ');
+                let mut uname = [0u8; 32];
+                let un = crate::kernel::users::uid_to_name(uid, &mut uname);
+                io.write_bytes(&uname[..un]);
+
+                // Group name
+                io.write_byte(b' ');
+                let mut gname = [0u8; 32];
+                let gn = crate::kernel::users::gid_to_name(gid, &mut gname);
+                io.write_bytes(&gname[..gn]);
+
+                // Size
+                io.write_bytes(b" ");
+                let size = crate::shell::memfs::get_size(fp).unwrap_or(0);
+                write_padded_u32(io, size as u32, 6);
+
+                // Date (static — no RTC)
+                io.write_bytes(b" Jan  1 00:00 ");
+
+                // Name
                 io.write_bytes(visible[i]);
                 io.newline();
                 lines_shown += 1;
@@ -146,6 +172,17 @@ impl Command for LsCommand {
 
         0
     }
+}
+
+fn write_padded_u32(io: &mut dyn ShellIo, mut n: u32, width: usize) {
+    let mut buf = [b' '; 10];
+    let mut len = 0;
+    if n == 0 { buf[0] = b'0'; len = 1; }
+    else { while n > 0 { buf[len] = b'0' + (n % 10) as u8; n /= 10; len += 1; } }
+    // Right-align in `width`
+    let pad = width.saturating_sub(len);
+    for _ in 0..pad { io.write_byte(b' '); }
+    for i in (0..len).rev() { io.write_byte(buf[i]); }
 }
 
 /// Show "-- More --" and wait for input. Returns true if user quit.

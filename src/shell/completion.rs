@@ -15,9 +15,12 @@ use crate::shell::memfs;
 /// Static list of all registered command names.
 /// Must be kept in sync with CommandRegistry::init().
 const COMMANDS: &[&[u8]] = &[
-    b"cat", b"cd", b"clear", b"echo", b"exit",
-    b"help", b"history", b"htop", b"ls", b"mem", b"mkdir",
-    b"nano", b"ps", b"reboot", b"uname", b"uptime", b"vim",
+    b"cat", b"cd", b"chmod", b"chown", b"clear", b"echo", b"exit",
+    b"groups", b"help", b"history", b"htop", b"id",
+    b"ls", b"mem", b"mkdir", b"nano",
+    b"passwd", b"ps", b"reboot", b"rm",
+    b"su", b"sudo", b"uname", b"uptime",
+    b"useradd", b"userdel", b"vim", b"whoami",
 ];
 
 /// Maximum completions returned for a single Tab press.

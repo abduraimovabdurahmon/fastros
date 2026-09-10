@@ -65,6 +65,9 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Layer 4: File systems ──────────────────────────────────────────────
     fs::init();
 
+    // ── Layer 2: User/group management ────────────────────────────────────
+    kernel::users::init();
+
     // ── Layer 2: Process manager + scheduler ──────────────────────────────
     kernel::process::init();
 

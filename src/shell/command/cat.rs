@@ -1,11 +1,11 @@
 //! `cat` — print file contents to the terminal.
 //!
-//! Reads from the virtual file store (virt_fs::get_content).
-//! No real disk I/O yet; all content is static.
+//! Permission check: caller must have read permission on the file.
 
 use super::Command;
 use crate::shell::env::ShellEnv;
 use crate::shell::io::ShellIo;
+use crate::kernel::users::permission::{self, MAY_READ};
 
 pub struct CatCommand;
 pub static CAT: CatCommand = CatCommand;
@@ -23,7 +23,6 @@ impl Command for CatCommand {
         let mut exit_code = 0;
 
         for &arg in args {
-            // Resolve relative path against CWD
             let mut path_buf = [0u8; 256];
             let path = resolve(env.cwd(), arg, &mut path_buf);
 
@@ -31,6 +30,16 @@ impl Command for CatCommand {
                 io.write_bytes(b"cat: ");
                 io.write_bytes(arg);
                 io.write_bytes(b": Is a directory\n");
+                exit_code = 1;
+                continue;
+            }
+
+            // Permission check
+            let (uid, gid, mode) = super::virt_fs::get_stat(path);
+            if !permission::check(uid, gid, mode, env.euid(), env.egid(), MAY_READ) {
+                io.write_bytes(b"cat: ");
+                io.write_bytes(arg);
+                io.write_bytes(b": Permission denied\n");
                 exit_code = 1;
                 continue;
             }
@@ -50,7 +59,6 @@ impl Command for CatCommand {
     }
 }
 
-/// Resolve `path` against `cwd` into `buf`. Returns slice into `buf`.
 fn resolve<'a>(cwd: &[u8], path: &[u8], buf: &'a mut [u8; 256]) -> &'a [u8] {
     if path.first() == Some(&b'/') {
         let len = path.len().min(255);
