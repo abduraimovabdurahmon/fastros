@@ -124,44 +124,54 @@ impl ShellIo for SshIo {
         if b != 0x1b { return Some(b); }
 
         // Translate ANSI/VT escape sequences → VGA KEY_* constants.
-        // Bytes of one sequence arrive in the same TCP segment, so
-        // non-blocking pop() is sufficient — no need to block or buffer.
-        let pop = || crate::kernel::net::ssh::pop_input_from(self.0);
-        match pop() {
-            Some(b'[') => match pop() {
+        // Use explicit idx capture (not closure) to avoid borrow issues.
+        // After ESC, poll once more to ensure remaining bytes are buffered.
+        crate::kernel::net::ssh::poll();
+        let idx = self.0;
+        macro_rules! pop {
+            () => { crate::kernel::net::ssh::pop_input_from(idx) }
+        }
+        match pop!() {
+            Some(b'[') => match pop!() {            // CSI sequences
                 Some(b'A') => Some(KEY_UP),
                 Some(b'B') => Some(KEY_DOWN),
                 Some(b'C') => Some(KEY_RIGHT),
                 Some(b'D') => Some(KEY_LEFT),
                 Some(b'H') => Some(KEY_HOME),
                 Some(b'F') => Some(KEY_END),
-                Some(b'1') => match pop() {
+                Some(b'1') => match pop!() {
                     Some(b'~') => Some(KEY_HOME),
-                    Some(b'7') => { let _ = pop(); Some(KEY_F6)  }
-                    Some(b'8') => { let _ = pop(); Some(KEY_F7)  }
-                    Some(b'9') => { let _ = pop(); Some(KEY_F8)  }
+                    Some(b'7') => { let _ = pop!(); Some(KEY_F6)  }
+                    Some(b'8') => { let _ = pop!(); Some(KEY_F7)  }
+                    Some(b'9') => { let _ = pop!(); Some(KEY_F8)  }
                     _ => Some(0x1b),
                 },
-                Some(b'2') => match pop() {
+                Some(b'2') => match pop!() {
                     Some(b'~') => Some(KEY_INS),
-                    Some(b'0') => { let _ = pop(); Some(KEY_F9)  }
-                    Some(b'1') => { let _ = pop(); Some(KEY_F10) }
+                    Some(b'0') => { let _ = pop!(); Some(KEY_F9)  }
+                    Some(b'1') => { let _ = pop!(); Some(KEY_F10) }
                     _ => Some(0x1b),
                 },
-                Some(b'3') => { let _ = pop(); Some(KEY_DEL)  }
-                Some(b'4') => { let _ = pop(); Some(KEY_END)  }
-                Some(b'5') => { let _ = pop(); Some(KEY_PGUP) }
-                Some(b'6') => { let _ = pop(); Some(KEY_PGDN) }
+                Some(b'3') => { let _ = pop!(); Some(KEY_DEL)  }
+                Some(b'4') => { let _ = pop!(); Some(KEY_END)  }
+                Some(b'5') => { let _ = pop!(); Some(KEY_PGUP) }
+                Some(b'6') => { let _ = pop!(); Some(KEY_PGDN) }
                 _ => Some(0x1b),
             },
-            Some(b'O') => match pop() { // SS3: F1-F4
+            Some(b'O') => match pop!() {            // SS3: arrows (app mode) + F1-F4
+                Some(b'A') => Some(KEY_UP),          // \x1bOA = up   (DECCKM)
+                Some(b'B') => Some(KEY_DOWN),        // \x1bOB = down
+                Some(b'C') => Some(KEY_RIGHT),       // \x1bOC = right
+                Some(b'D') => Some(KEY_LEFT),        // \x1bOD = left
+                Some(b'H') => Some(KEY_HOME),
+                Some(b'F') => Some(KEY_END),
                 Some(b'P') => Some(KEY_F1),
                 Some(b'Q') => Some(KEY_F2),
                 Some(b'R') => Some(KEY_F3),
                 Some(b'S') => Some(KEY_F4),
                 _ => Some(0x1b),
             },
-            _ => Some(0x1b), // lone ESC
+            _ => Some(0x1b),                        // lone ESC
         }
     }
     fn read_byte_blocking(&mut self) -> u8 {
