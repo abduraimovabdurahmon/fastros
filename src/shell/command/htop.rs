@@ -332,7 +332,15 @@ fn kill_selected(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) -> boo
                 if pid == 2 {
                     return true;
                 }
-                // PID 0/1 = kernel/shell — don't kill synthetic procs
+                // PID 0 = kernel idle process — always protected (like swapper in Linux)
+                if pid == 0 {
+                    for r in 11u16..=13 {
+                        io.fill_row(r, b' ', 0x4F);
+                    }
+                    io.write_at(10, 12, b"  Operation not permitted (kernel)  Press any key...  ", 0x4F);
+                    io.read_byte_blocking();
+                    return false;
+                }
                 // PID >= 3 = real kernel threads
                 if pid >= 3 {
                     unsafe {
