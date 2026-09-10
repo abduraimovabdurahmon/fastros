@@ -12,11 +12,13 @@
 use core::panic::PanicInfo;
 
 mod arch;
+mod container;
 mod drivers;
 mod fs;
 mod hal;
 mod kernel;
 mod libs;
+mod orchestrator;
 
 /// Called from arch/x86_64/boot.s after entering 64-bit long mode.
 ///
@@ -54,13 +56,19 @@ pub extern "C" fn kernel_main() -> ! {
     // 8. Drivers
     drivers::init();
 
-    // 9. File systems
+    // 9. File systems (VFS + overlayfs for containers)
     fs::init();
 
     // 10. Process manager + scheduler
     kernel::process::init();
 
-    // 10. Hand off to init process (userspace PID 1)
+    // 11. Container runtime (image store, lifecycle manager)
+    container::init();
+
+    // 12. Orchestration layer (node agent, service discovery, network mesh)
+    orchestrator::init();
+
+    // 13. Hand off to init process (userspace PID 1)
     // kernel::process::spawn_init();
 
     loop {}

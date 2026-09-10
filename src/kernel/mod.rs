@@ -5,10 +5,12 @@
 //! All hardware access goes through hal/ traits.
 //!
 //! CAN IMPORT:   hal/, libs/
-//! CANNOT IMPORT: arch/, drivers/, fs/, userspace/
+//! CANNOT IMPORT: arch/, drivers/, fs/, container/, orchestrator/, userspace/
 
+pub mod cgroup;
 pub mod ipc;
 pub mod memory;
+pub mod namespace;
 pub mod process;
 pub mod sync;
 pub mod syscall;
