@@ -4,7 +4,8 @@ QEMU   := "C:/Program Files/QEMU/qemu-system-x86_64.exe"
 
 # Network: QEMU user-mode networking with e1000 NIC.
 # Guest IP: 10.0.2.15  Gateway: 10.0.2.2  DNS: 10.0.2.3
-NET    := -netdev user,id=net0 -device e1000,netdev=net0
+# Port forward: host:2222 → guest:22 (SSH)
+NET    := -netdev user,id=net0,hostfwd=tcp::2222-:22 -device e1000,netdev=net0
 
 .PHONY: help build run run-display run-vnc clean
 
@@ -17,7 +18,9 @@ help:
 	@echo "  make clean       - Remove build artifacts"
 	@echo ""
 	@echo "  Network: guest 10.0.2.15/24, gateway 10.0.2.2 (QEMU user-net)"
-	@echo "  Try: ping 10.0.2.2   ifconfig   netstat -r"
+	@echo "  SSH:     host port 2222 → guest port 22"
+	@echo "  Connect: ssh root@127.0.0.1 -p 2222   (password: root)"
+	@echo "  Try: ping 10.0.2.2   ifconfig   netstat -r   sshd"
 	@echo ""
 
 build:

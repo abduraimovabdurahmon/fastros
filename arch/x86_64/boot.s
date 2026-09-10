@@ -40,9 +40,15 @@ align 4096
 p4_table:
     resb 4096       ; Page Map Level 4 (PML4)
 p3_table:
-    resb 4096       ; Page Directory Pointer Table (PDPT)
-p2_table:
-    resb 4096       ; Page Directory — 2 MB huge pages
+    resb 4096       ; Page Directory Pointer Table (PDPT) — covers 0-512 GB
+p2_table_0:
+    resb 4096       ; Page Directory — 2 MB huge pages (0 GB – 1 GB)
+p2_table_1:
+    resb 4096       ; Page Directory — 2 MB huge pages (1 GB – 2 GB)
+p2_table_2:
+    resb 4096       ; Page Directory — 2 MB huge pages (2 GB – 3 GB)
+p2_table_3:
+    resb 4096       ; Page Directory — 2 MB huge pages (3 GB – 4 GB)
 
 stack_bottom:
     resb 4096 * 16  ; 64 KB kernel stack
@@ -138,24 +144,70 @@ check_long_mode:
     mov al, 'L'
     jmp error
 
-; ---- Identity-map first 1 GB (2 MB huge pages) ----
+; ---- Identity-map first 4 GB (2 MB huge pages, 4 x PDPT entries) ----
+; Covers MMIO regions up to 0xFFFFFFFF (e.g. e1000 BAR0 at ~0xFEBC0000)
 setup_page_tables:
+    ; PML4[0] → p3_table (covers 0–512 GB virtual)
     mov eax, p3_table
     or eax, 0b11
     mov [p4_table], eax
 
-    mov eax, p2_table
+    ; PDPT[0] → p2_table_0  (0 GB – 1 GB)
+    mov eax, p2_table_0
     or eax, 0b11
-    mov [p3_table], eax
+    mov [p3_table + 0 * 8], eax
 
+    ; PDPT[1] → p2_table_1  (1 GB – 2 GB)
+    mov eax, p2_table_1
+    or eax, 0b11
+    mov [p3_table + 1 * 8], eax
+
+    ; PDPT[2] → p2_table_2  (2 GB – 3 GB)
+    mov eax, p2_table_2
+    or eax, 0b11
+    mov [p3_table + 2 * 8], eax
+
+    ; PDPT[3] → p2_table_3  (3 GB – 4 GB)
+    mov eax, p2_table_3
+    or eax, 0b11
+    mov [p3_table + 3 * 8], eax
+
+    ; Fill all 4 page directories: 4 * 512 = 2048 entries × 2 MB = 4 GB
     mov ecx, 0
 .map_p2:
+    ; Physical address = ecx * 2 MB
     mov eax, 0x200000
     mul ecx
-    or eax, 0b10000011      ; present + writable + huge
-    mov [p2_table + ecx * 8], eax
+    or eax, 0b10000011          ; present + writable + huge (2 MB page)
+
+    ; Select which p2_table based on which GB we're in (ecx / 512)
+    ; ecx 0–511   → p2_table_0, index = ecx
+    ; ecx 512–1023 → p2_table_1, index = ecx - 512
+    ; etc.
+    mov edx, ecx
+    cmp edx, 512
+    jl .in_table0
+    cmp edx, 1024
+    jl .in_table1
+    cmp edx, 1536
+    jl .in_table2
+    ; else table3
+    sub edx, 1536
+    mov [p2_table_3 + edx * 8], eax
+    jmp .next
+.in_table0:
+    mov [p2_table_0 + edx * 8], eax
+    jmp .next
+.in_table1:
+    sub edx, 512
+    mov [p2_table_1 + edx * 8], eax
+    jmp .next
+.in_table2:
+    sub edx, 1024
+    mov [p2_table_2 + edx * 8], eax
+.next:
     inc ecx
-    cmp ecx, 512
+    cmp ecx, 2048
     jne .map_p2
     ret
 
