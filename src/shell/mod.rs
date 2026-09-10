@@ -116,10 +116,53 @@ impl ShellIo for SshIo {
         }
     }
     fn read_byte(&mut self) -> Option<u8> {
+        use crate::drivers::char::keyboard::*;
         // Drive the network stack so data is received and buffered
         crate::kernel::net::poll_drivers();
         crate::kernel::net::ssh::poll();
-        crate::kernel::net::ssh::pop_input_from(self.0)
+        let b = crate::kernel::net::ssh::pop_input_from(self.0)?;
+        if b != 0x1b { return Some(b); }
+
+        // Translate ANSI/VT escape sequences → VGA KEY_* constants.
+        // Bytes of one sequence arrive in the same TCP segment, so
+        // non-blocking pop() is sufficient — no need to block or buffer.
+        let pop = || crate::kernel::net::ssh::pop_input_from(self.0);
+        match pop() {
+            Some(b'[') => match pop() {
+                Some(b'A') => Some(KEY_UP),
+                Some(b'B') => Some(KEY_DOWN),
+                Some(b'C') => Some(KEY_RIGHT),
+                Some(b'D') => Some(KEY_LEFT),
+                Some(b'H') => Some(KEY_HOME),
+                Some(b'F') => Some(KEY_END),
+                Some(b'1') => match pop() {
+                    Some(b'~') => Some(KEY_HOME),
+                    Some(b'7') => { let _ = pop(); Some(KEY_F6)  }
+                    Some(b'8') => { let _ = pop(); Some(KEY_F7)  }
+                    Some(b'9') => { let _ = pop(); Some(KEY_F8)  }
+                    _ => Some(0x1b),
+                },
+                Some(b'2') => match pop() {
+                    Some(b'~') => Some(KEY_INS),
+                    Some(b'0') => { let _ = pop(); Some(KEY_F9)  }
+                    Some(b'1') => { let _ = pop(); Some(KEY_F10) }
+                    _ => Some(0x1b),
+                },
+                Some(b'3') => { let _ = pop(); Some(KEY_DEL)  }
+                Some(b'4') => { let _ = pop(); Some(KEY_END)  }
+                Some(b'5') => { let _ = pop(); Some(KEY_PGUP) }
+                Some(b'6') => { let _ = pop(); Some(KEY_PGDN) }
+                _ => Some(0x1b),
+            },
+            Some(b'O') => match pop() { // SS3: F1-F4
+                Some(b'P') => Some(KEY_F1),
+                Some(b'Q') => Some(KEY_F2),
+                Some(b'R') => Some(KEY_F3),
+                Some(b'S') => Some(KEY_F4),
+                _ => Some(0x1b),
+            },
+            _ => Some(0x1b), // lone ESC
+        }
     }
     fn read_byte_blocking(&mut self) -> u8 {
         loop {
@@ -160,11 +203,17 @@ impl ShellIo for SshIo {
     }
 
     fn fill_row(&mut self, row: u16, ch: u8, color: u8) {
+        let cols = self.screen_cols() as usize;
         let mut hdr = [0u8; 24];
         let hn = build_ansi_hdr(&mut hdr, 0, row, color);
         crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
-        let line = [ch; 80];
-        crate::kernel::net::ssh::send_to_session(self.0, &line);
+        let chunk = [ch; 64];
+        let mut sent = 0;
+        while sent < cols {
+            let n = (cols - sent).min(64);
+            crate::kernel::net::ssh::send_to_session(self.0, &chunk[..n]);
+            sent += n;
+        }
         crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
     }
 
@@ -178,6 +227,24 @@ impl ShellIo for SshIo {
         n += ansi_u16(&mut buf[n..], col + 1);
         buf[n] = b'H'; n += 1;
         crate::kernel::net::ssh::send_to_session(self.0, &buf[..n]);
+    }
+
+    fn enter_altscreen(&mut self) {
+        // Switch to alternate screen buffer and hide cursor
+        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[?1049h\x1b[?25l");
+    }
+
+    fn exit_altscreen(&mut self) {
+        // Restore main screen buffer and show cursor
+        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[?1049l\x1b[?25h");
+    }
+
+    fn screen_cols(&self) -> u16 {
+        crate::kernel::net::ssh::term_cols_for(self.0) as u16
+    }
+
+    fn screen_rows(&self) -> u16 {
+        crate::kernel::net::ssh::term_rows_for(self.0) as u16
     }
 }
 

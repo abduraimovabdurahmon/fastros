@@ -71,6 +71,12 @@ pub trait ShellIo {
     /// Move the hardware cursor to (col, row).
     fn move_cursor(&mut self, _col: u16, _row: u16) {}
 
+    /// Enter alternate screen + hide cursor (for full-screen TUI). No-op by default.
+    fn enter_altscreen(&mut self) {}
+
+    /// Exit alternate screen + show cursor. No-op by default.
+    fn exit_altscreen(&mut self) {}
+
     /// Screen width in columns.
     fn screen_cols(&self) -> u16 { 80 }
 

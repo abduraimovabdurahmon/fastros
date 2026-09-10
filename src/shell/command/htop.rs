@@ -29,29 +29,34 @@ use crate::drivers::char::keyboard::{
 
 // ── Screen geometry ───────────────────────────────────────────────────────────
 
-const COLS:        usize = 80;
-const PROC_ROWS:   usize = 18; // rows 5–22
-const PROC_ROW0:   u16   = 5;
-const REFRESH_TKS: u64   = 100; // 1 second at 100 Hz
+const PROC_ROW0:   u16 = 5;        // first row of process list (always row 5)
+const REFRESH_TKS: u64 = 100;      // 1 second at 100 Hz
 
-// ── VGA colors ────────────────────────────────────────────────────────────────
+// Fixed rows above the process list: title(1)+cpu(1)+mem(1)+swp(1)+hdr(1) = 5
+// Fixed rows below: status(1)+fkeys(1) = 2  →  total overhead = 7
+fn calc_proc_rows(term_rows: u16) -> usize {
+    (term_rows as usize).saturating_sub(7).max(1)
+}
 
-const CLR_TITLE:    u8 = 0x1F; // White on DarkBlue   — title bar
-const CLR_UPTIME:   u8 = 0x1B; // Cyan on DarkBlue    — uptime/hostname
-const CLR_MTR_LBL:  u8 = 0x1F; // White on DarkBlue   — "CPU[" label
-const CLR_MTR_BG:   u8 = 0x08; // DarkGray on Black   — empty meter
-const CLR_CPU_USED: u8 = 0x2E; // Yellow on DarkGreen — CPU used bar
-const CLR_MEM_USED: u8 = 0x2F; // White on DarkGreen  — Mem used bar
-const CLR_SWP_USED: u8 = 0x4F; // White on DarkRed    — Swap used (never shown)
-const CLR_COL_HDR:  u8 = 0x30; // Black on DarkCyan   — column header
-const CLR_DEFAULT:  u8 = 0x07; // LightGray on Black  — normal process row
-const CLR_RUNNING:  u8 = 0x0A; // LightGreen on Black — running process
-const CLR_ZOMBIE:   u8 = 0x0C; // Red on Black        — zombie
-const CLR_SELECTED: u8 = 0x70; // Black on LightGray  — selected row
-const CLR_STATUS:   u8 = 0x08; // DarkGray on Black   — status bar
-const CLR_FK_NUM:   u8 = 0x1E; // Yellow on DarkBlue  — F-key number
-const CLR_FK_LBL:   u8 = 0x30; // Black on DarkCyan   — F-key label
-const CLR_HILITE:   u8 = 0x0E; // Yellow on Black     — important value
+// ── Color palette (VGA attribute bytes: high-nibble=bg, low-nibble=fg) ────────
+// Designed to look good both in VGA text mode and via ANSI over SSH.
+
+const CLR_TITLE:    u8 = 0x1F; // White   on Blue         — title bar
+const CLR_UPTIME:   u8 = 0x1B; // Cyan    on Blue         — uptime text
+const CLR_MTR_LBL:  u8 = 0x0F; // Bright  White on Black  — "CPU[" label
+const CLR_MTR_BG:   u8 = 0x00; // Black   on Black        — empty meter (dark band)
+const CLR_CPU_USED: u8 = 0x2A; // LightGreen on Green     — CPU used (solid green bar)
+const CLR_MEM_USED: u8 = 0x19; // LightBlue  on Blue      — Mem used (solid blue bar)
+const CLR_SWP_USED: u8 = 0x4C; // LightRed   on Red       — Swap used (unused)
+const CLR_COL_HDR:  u8 = 0x30; // Black   on Cyan         — column header
+const CLR_DEFAULT:  u8 = 0x07; // Gray    on Black         — normal process row
+const CLR_RUNNING:  u8 = 0x0A; // LightGreen on Black     — running process
+const CLR_ZOMBIE:   u8 = 0x0C; // LightRed   on Black     — zombie
+const CLR_SELECTED: u8 = 0x70; // Black   on LightGray     — selected row highlight
+const CLR_STATUS:   u8 = 0x1F; // White   on Blue         — status bar (matches title)
+const CLR_FK_NUM:   u8 = 0x0E; // Yellow  on Black        — F-key number
+const CLR_FK_LBL:   u8 = 0x1F; // White   on Blue         — F-key label
+const CLR_HILITE:   u8 = 0x0B; // LightCyan on Black      — highlighted value
 
 // ── Sort key ─────────────────────────────────────────────────────────────────
 
@@ -110,33 +115,32 @@ impl Command for HtopCommand {
         let mut selected:  usize    = 0;
         let mut sort:      SortKey  = SortKey::Pid;
         let mut last_tick: u64      = tick();
-        let mut idle_cnt:  u32      = 0;   // hlt calls since last refresh
-        let mut cpu_pct:   u32      = 0;   // last computed CPU% × 10
+        let mut idle_cnt:  u32      = 0;
+        let mut cpu_pct:   u32      = 0;
 
+        io.enter_altscreen();
         io.clear_screen();
 
         loop {
-            let now = tick();
-            let elapsed = now.wrapping_sub(last_tick);
+            let now        = tick();
+            let elapsed    = now.wrapping_sub(last_tick);
+            let term_rows  = io.screen_rows();
+            let term_cols  = io.screen_cols() as usize;
+            let proc_rows  = calc_proc_rows(term_rows);
 
             if elapsed >= REFRESH_TKS {
-                // CPU% = (elapsed - idle) / elapsed * 100
                 let active = elapsed.saturating_sub(idle_cnt as u64);
                 cpu_pct   = (active * 1000 / elapsed.max(1)) as u32;
                 idle_cnt  = 0;
                 last_tick = now;
 
                 let procs = collect_procs(cpu_pct, now);
-                let total  = procs.count;
-                let clamped_sel = selected.min(total.saturating_sub(1));
-                selected = clamped_sel;
-                let clamped_scroll = scroll.min(total.saturating_sub(1));
-                scroll = clamped_scroll;
+                selected = selected.min(procs.count.saturating_sub(1));
+                scroll   = scroll.min(procs.count.saturating_sub(1));
 
-                redraw(io, &procs, scroll, selected, sort, cpu_pct, now);
+                redraw(io, &procs, scroll, selected, sort, cpu_pct, now, term_rows, term_cols);
             }
 
-            // Non-blocking key check
             match io.read_byte() {
                 None => {
                     idle_cnt += 1;
@@ -146,7 +150,7 @@ impl Command for HtopCommand {
                     let procs = collect_procs(cpu_pct, tick());
                     let total = procs.count;
                     match key {
-                        b'q' | KEY_F10 | 0x1B => break,
+                        b'q' | KEY_F10 | 0x1B | 0x03 => break, // q/F10/Esc/Ctrl-C
 
                         KEY_UP => {
                             if selected > 0 { selected -= 1; }
@@ -154,42 +158,40 @@ impl Command for HtopCommand {
                         }
                         KEY_DOWN => {
                             if selected + 1 < total { selected += 1; }
-                            if selected >= scroll + PROC_ROWS { scroll = selected + 1 - PROC_ROWS; }
+                            if selected >= scroll + proc_rows { scroll = selected + 1 - proc_rows; }
                         }
                         KEY_PGUP => {
-                            selected = selected.saturating_sub(PROC_ROWS);
-                            scroll   = scroll.saturating_sub(PROC_ROWS);
+                            selected = selected.saturating_sub(proc_rows);
+                            scroll   = scroll.saturating_sub(proc_rows);
                         }
                         KEY_PGDN => {
-                            selected = (selected + PROC_ROWS).min(total.saturating_sub(1));
-                            if selected >= scroll + PROC_ROWS { scroll = selected + 1 - PROC_ROWS; }
+                            selected = (selected + proc_rows).min(total.saturating_sub(1));
+                            if selected >= scroll + proc_rows { scroll = selected + 1 - proc_rows; }
                         }
                         KEY_HOME => { selected = 0; scroll = 0; }
                         KEY_END  => {
                             selected = total.saturating_sub(1);
-                            scroll   = total.saturating_sub(PROC_ROWS);
+                            scroll   = total.saturating_sub(proc_rows);
                         }
 
                         KEY_F6 | b's' | b'S' => { sort = sort.next(); }
 
                         KEY_F9 | b'k' | b'K' => {
-                            if total > 0 {
-                                if kill_selected(io, &procs, selected) {
-                                    break; // htop killed itself
-                                }
+                            if total > 0 && kill_selected(io, &procs, selected) {
+                                break;
                             }
                         }
-                        _ => { continue; } // unknown key — don't redraw
+                        _ => { continue; }
                     }
 
-                    // Redraw immediately after navigation
                     let procs2 = collect_procs(cpu_pct, tick());
-                    redraw(io, &procs2, scroll, selected, sort, cpu_pct, tick());
+                    redraw(io, &procs2, scroll, selected, sort, cpu_pct, tick(), term_rows, term_cols);
                 }
             }
         }
 
         io.clear_screen();
+        io.exit_altscreen();
         0
     }
 }
@@ -365,46 +367,48 @@ fn kill_selected(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) -> boo
 // ── Full screen redraw ────────────────────────────────────────────────────────
 
 fn redraw(
-    io:       &mut dyn ShellIo,
-    procs:    &SnapList,
-    scroll:   usize,
-    selected: usize,
-    sort:     SortKey,
-    cpu_pct:  u32,
-    now:      u64,
+    io:        &mut dyn ShellIo,
+    procs:     &SnapList,
+    scroll:    usize,
+    selected:  usize,
+    sort:      SortKey,
+    cpu_pct:   u32,
+    now:       u64,
+    term_rows: u16,
+    term_cols: usize,
 ) {
-    draw_title(io, procs.count, now);
+    let proc_rows  = calc_proc_rows(term_rows);
+    let status_row = term_rows.saturating_sub(2);
+    let fkey_row   = term_rows.saturating_sub(1);
+
+    draw_title(io, procs.count, now, term_cols);
     draw_cpu_meter(io, cpu_pct);
     draw_mem_meter(io);
     draw_swp_meter(io);
-    draw_col_header(io, sort);
-    draw_proc_list(io, procs, scroll, selected);
-    draw_status(io, procs, selected);
-    draw_fkeys(io);
+    draw_col_header(io, sort, term_cols);
+    draw_proc_list(io, procs, scroll, selected, proc_rows);
+    draw_status(io, procs, selected, status_row, term_cols);
+    draw_fkeys(io, fkey_row, term_cols);
 
-    // Hide cursor inside process area
     io.move_cursor(0, PROC_ROW0 + (selected.saturating_sub(scroll)) as u16);
 }
 
 // ── Title bar (row 0) ─────────────────────────────────────────────────────────
 
-fn draw_title(io: &mut dyn ShellIo, total: usize, now: u64) {
+fn draw_title(io: &mut dyn ShellIo, total: usize, now: u64, cols: usize) {
     io.fill_row(0, b' ', CLR_TITLE);
 
-    // Left: "  FastROS htop 0.1 - fastros"
-    io.write_at(0,  0, b"  FastROS htop 0.1 - fastros", CLR_TITLE);
+    io.write_at(0, 0, b"  FastROS htop 0.1 - fastros", CLR_TITLE);
 
-    // Middle: task counts
     let mut buf = [0u8; 48];
     let mut p = 0usize;
     p += copy_bytes(&mut buf[p..], b"  Tasks: ");
     p += fmt_u32_into(&mut buf[p..], total as u32);
     io.write_at(32, 0, &buf[..p], CLR_TITLE);
 
-    // Right: uptime
-    let s   = now / 100;
-    let m   = s   / 60;
-    let h   = m   / 60;
+    let s = now / 100;
+    let m = s   / 60;
+    let h = m   / 60;
     let mut ub = [0u8; 20];
     let mut up = 0usize;
     up += copy_bytes(&mut ub[up..], b"up ");
@@ -413,7 +417,7 @@ fn draw_title(io: &mut dyn ShellIo, total: usize, now: u64) {
     up += fmt_u32_2d(&mut ub[up..], (m % 60) as u32);
     ub[up] = b':'; up += 1;
     up += fmt_u32_2d(&mut ub[up..], (s % 60) as u32);
-    let col = (COLS - up).saturating_sub(2) as u16;
+    let col = cols.saturating_sub(up + 2) as u16;
     io.write_at(col, 0, &ub[..up], CLR_UPTIME);
 }
 
@@ -433,7 +437,7 @@ fn draw_meter(io: &mut dyn ShellIo, row: u16, label: &[u8], pct_x10: u32,
     // Bar
     let filled = ((pct_x10 as usize) * METER_INNER / 1000).min(METER_INNER);
     let empty  = METER_INNER - filled;
-    let bar_used = [b'|'; METER_INNER];
+    let bar_used = [b' '; METER_INNER];
     let bar_free = [b' '; METER_INNER];
     io.write_at(x0 as u16, row, &bar_used[..filled], clr_used);
     io.write_at(x0 + filled as u16, row, &bar_free[..empty], CLR_MTR_BG);
@@ -471,7 +475,7 @@ fn draw_swp_meter(io: &mut dyn ShellIo) {
 
 // ── Column header (row 4) ─────────────────────────────────────────────────────
 
-fn draw_col_header(io: &mut dyn ShellIo, sort: SortKey) {
+fn draw_col_header(io: &mut dyn ShellIo, sort: SortKey, _cols: usize) {
     io.fill_row(4, b' ', CLR_COL_HDR);
     //         PID  USER      PRI  NI  VIRT   RES   S  CPU%  MEM%  TIME+   Command
     io.write_at(0, 4,
@@ -489,8 +493,8 @@ fn draw_col_header(io: &mut dyn ShellIo, sort: SortKey) {
 
 // ── Process list (rows 5–22) ──────────────────────────────────────────────────
 
-fn draw_proc_list(io: &mut dyn ShellIo, procs: &SnapList, scroll: usize, selected: usize) {
-    for r in 0..PROC_ROWS {
+fn draw_proc_list(io: &mut dyn ShellIo, procs: &SnapList, scroll: usize, selected: usize, proc_rows: usize) {
+    for r in 0..proc_rows {
         let screen_row = (PROC_ROW0 as usize + r) as u16;
         let proc_idx   = scroll + r;
 
@@ -590,8 +594,8 @@ fn draw_proc_list(io: &mut dyn ShellIo, procs: &SnapList, scroll: usize, selecte
 
 // ── Status bar (row 23) ───────────────────────────────────────────────────────
 
-fn draw_status(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) {
-    io.fill_row(23, b' ', CLR_STATUS);
+fn draw_status(io: &mut dyn ShellIo, procs: &SnapList, selected: usize, status_row: u16, cols: usize) {
+    io.fill_row(status_row, b' ', CLR_STATUS);
 
     if selected < procs.count {
         let p = procs.get(selected);
@@ -604,13 +608,13 @@ fn draw_status(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) {
         buf[n..n + nm].copy_from_slice(&p.name_bytes()[..nm]);
         n += nm;
         n += copy_bytes(&mut buf[n..], b")");
-        io.write_at(0, 23, &buf[..n], CLR_STATUS);
+        io.write_at(0, status_row, &buf[..n], CLR_STATUS);
     }
 
-    let hint = b"  [Up/Down] navigate  [s/F6] sort  [k/F9] kill  [q/F10] quit";
-    let hlen = hint.len().min(COLS);
-    let hcol = (COLS - hlen) as u16;
-    io.write_at(hcol, 23, &hint[..hlen], CLR_STATUS);
+    let hint = b"  [Up/Down] navigate  [s/F6] sort  [k/F9] kill  [q/F10/Ctrl-C] quit";
+    let hlen = hint.len().min(cols);
+    let hcol = cols.saturating_sub(hlen) as u16;
+    io.write_at(hcol, status_row, &hint[..hlen], CLR_STATUS);
 }
 
 // ── F-key bar (row 24) ────────────────────────────────────────────────────────
@@ -628,14 +632,14 @@ const FKEYS: &[(&[u8], &[u8])] = &[
     (b"F10", b"Quit"),
 ];
 
-fn draw_fkeys(io: &mut dyn ShellIo) {
-    io.fill_row(24, b' ', CLR_FK_LBL);
+fn draw_fkeys(io: &mut dyn ShellIo, fkey_row: u16, cols: usize) {
+    io.fill_row(fkey_row, b' ', CLR_STATUS);
     let mut col = 0u16;
     for (num, lbl) in FKEYS {
-        if col as usize >= COLS { break; }
-        io.write_at(col, 24, num, CLR_FK_NUM);
+        if col as usize >= cols { break; }
+        io.write_at(col, fkey_row, num, CLR_FK_NUM);
         col += num.len() as u16;
-        io.write_at(col, 24, lbl, CLR_FK_LBL);
+        io.write_at(col, fkey_row, lbl, CLR_STATUS);
         col += lbl.len() as u16;
     }
 }
