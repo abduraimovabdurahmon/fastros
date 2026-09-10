@@ -29,12 +29,15 @@ pub extern "C" fn kernel_main() -> ! {
     // GDT + TSS, IDT + PIC (interrupts enabled), SYSCALL MSRs, PIT timer
     arch::init();
 
-    // ── Layer 3 (early): Serial — needs interrupts enabled ─────────────────
+    // ── Layer 3 (early): Serial + VGA ─────────────────────────────────────
     drivers::char::serial::init();
     drivers::char::serial::write(b"\n");
     drivers::char::serial::write(b"=====================================\n");
     drivers::char::serial::write(b"  FastROS v0.1.0  [64-bit long mode]\n");
     drivers::char::serial::write(b"=====================================\n");
+
+    // VGA text mode: draws boot banner visible in QEMU display window
+    drivers::display::vga::init();
 
     // ── Layer 2: Physical memory manager ──────────────────────────────────
     kernel::memory::pmm::init();
