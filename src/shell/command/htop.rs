@@ -174,7 +174,9 @@ impl Command for HtopCommand {
 
                         KEY_F9 | b'k' | b'K' => {
                             if total > 0 {
-                                kill_selected(io, &procs, selected);
+                                if kill_selected(io, &procs, selected) {
+                                    break; // htop killed itself
+                                }
                             }
                         }
                         _ => { continue; } // unknown key — don't redraw
@@ -302,8 +304,9 @@ fn collect_procs(cpu_pct: u32, _now: u64) -> SnapList {
 
 // ── Kill selected process ─────────────────────────────────────────────────────
 
-fn kill_selected(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) {
-    if selected >= procs.count { return; }
+/// Returns true if htop should quit (i.e. htop killed itself).
+fn kill_selected(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) -> bool {
+    if selected >= procs.count { return false; }
     let p = procs.get(selected);
 
     // Overlay dialog on rows 11-13
@@ -325,10 +328,13 @@ fn kill_selected(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) {
         let key = io.read_byte_blocking();
         match key {
             b'\n' | b'\r' => {
-                // Only kill real kernel threads (pid >= 3)
+                // PID 2 = htop itself — quit
+                if pid == 2 {
+                    return true;
+                }
+                // PID 0/1 = kernel/shell — don't kill synthetic procs
+                // PID >= 3 = real kernel threads
                 if pid >= 3 {
-                    // In a real kernel we'd call kill(pid, SIGKILL)
-                    // For now just signal the process through the process table
                     unsafe {
                         for i in 0..MAX_PROCESSES {
                             if !PROCESS_USED[i] { continue; }
@@ -340,9 +346,9 @@ fn kill_selected(io: &mut dyn ShellIo, procs: &SnapList, selected: usize) {
                         }
                     }
                 }
-                break;
+                return false;
             }
-            0x1B => break, // Esc = cancel
+            0x1B => return false, // Esc = cancel
             _ => {}
         }
     }
