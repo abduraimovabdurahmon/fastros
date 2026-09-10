@@ -58,6 +58,9 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Layer 3: Remaining drivers ────────────────────────────────────────
     drivers::init();
 
+    // ── Layer 3: PCI enumeration (required before network driver probe) ───
+    drivers::bus::pci::init();
+
     // Wire PS/2 keyboard IRQ → keyboard driver (arch↔drivers boundary lives here)
     arch::set_keyboard_hook(drivers::char::keyboard::on_irq);
     arch::unmask_irq(1); // enable IRQ 1 (PS/2 keyboard)
@@ -73,6 +76,10 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Connect the timer IRQ to the scheduler tick
     arch::set_timer_hook(kernel::process::scheduler::tick);
+
+    // ── Layer 3: Network drivers (after PCI, uses kernel::net callbacks) ──
+    kernel::net::init();
+    drivers::net::init();
 
     // ── Layer 6: Container runtime ─────────────────────────────────────────
     container::init();

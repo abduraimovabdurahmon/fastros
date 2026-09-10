@@ -11,6 +11,7 @@ pub mod cgroup;
 pub mod ipc;
 pub mod memory;
 pub mod namespace;
+pub mod net;
 pub mod process;
 pub mod sync;
 pub mod syscall;

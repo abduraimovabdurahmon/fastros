@@ -10,9 +10,12 @@ pub mod groups;
 pub mod history;
 pub mod htop;
 pub mod id;
+pub mod ifconfig;
 pub mod mkdir;
 pub mod nano;
+pub mod netstat;
 pub mod passwd;
+pub mod ping;
 pub mod rm;
 pub mod su;
 pub mod sudo;
@@ -40,7 +43,7 @@ pub trait Command: Send + Sync {
     fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32;
 }
 
-pub const MAX_COMMANDS: usize = 48;
+pub const MAX_COMMANDS: usize = 56;
 
 pub struct CommandRegistry {
     entries: [Option<&'static dyn Command>; MAX_COMMANDS],
@@ -106,6 +109,10 @@ impl CommandRegistry {
         r.register(&useradd::USERADD);
         r.register(&userdel::USERDEL);
         r.register(&passwd::PASSWD);
+        // Networking
+        r.register(&ping::PING);
+        r.register(&ifconfig::IFCONFIG);
+        r.register(&netstat::NETSTAT);
         // History
         r.register(&history::HISTORY);
         r
