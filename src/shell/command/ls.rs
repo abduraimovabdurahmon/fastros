@@ -37,20 +37,27 @@ impl Command for LsCommand {
             }
         }
 
-        let children = match super::virt_fs::lookup(target) {
-            None => {
-                io.write_bytes(b"ls: ");
-                io.write_bytes(target);
-                io.write_bytes(b": No such directory\n");
-                return 1;
-            }
+        // Look up children from static tree first; if this is a user-created
+        // directory (memdir) it won't be in the static tree but is still valid.
+        let static_children: &[&[u8]] = match super::virt_fs::lookup(target) {
             Some(c) => c,
+            None => {
+                // Not in static tree — check if it's a user-created directory
+                if !super::virt_fs::is_dir(target) {
+                    io.write_bytes(b"ls: ");
+                    io.write_bytes(target);
+                    io.write_bytes(b": No such directory\n");
+                    return 1;
+                }
+                // It's a memdir — no static children, memfs/memdir will fill it
+                &[]
+            }
         };
 
-        // ── Filter visible entries (virt_fs + memfs) ─────────────────────────
+        // ── Filter visible entries (virt_fs + memfs + memdir) ─────────────────
         let mut visible: [&[u8]; 256] = [b""; 256];
         let mut count = 0usize;
-        for &name in children {
+        for &name in static_children {
             if !show_all && name.first() == Some(&b'.') { continue; }
             if count < 256 { visible[count] = name; count += 1; }
         }
