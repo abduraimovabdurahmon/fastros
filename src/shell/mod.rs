@@ -58,6 +58,51 @@ impl ShellIo for VgaKeyboardIo {
     }
 }
 
+// ── ANSI helpers for SSH full-screen rendering ────────────────────────────────
+
+// VGA color order: 0=Black,1=Blue,2=Green,3=Cyan,4=Red,5=Magenta,6=Brown,7=LightGray
+// Maps VGA nibble → ANSI color index (0-7)
+const VGA_TO_ANSI: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+
+/// Write a u16 in decimal into buf. Returns bytes written.
+fn ansi_u16(buf: &mut [u8], mut n: u16) -> usize {
+    if buf.is_empty() { return 0; }
+    if n == 0 { buf[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 5];
+    let mut len = 0;
+    while n > 0 { tmp[len] = b'0' + (n % 10) as u8; n /= 10; len += 1; }
+    let out = len.min(buf.len());
+    for i in 0..out { buf[i] = tmp[len - 1 - i]; }
+    out
+}
+
+/// Build `ESC[row+1;col+1H ESC[fg;bgm` into a 24-byte buffer.
+/// Returns number of bytes written.
+fn build_ansi_hdr(buf: &mut [u8; 24], col: u16, row: u16, color: u8) -> usize {
+    let mut n = 0usize;
+    // Cursor position: ESC[row;colH
+    buf[n] = 0x1b; n += 1;
+    buf[n] = b'['; n += 1;
+    n += ansi_u16(&mut buf[n..], row + 1);
+    buf[n] = b';'; n += 1;
+    n += ansi_u16(&mut buf[n..], col + 1);
+    buf[n] = b'H'; n += 1;
+    // Color: ESC[fg;bgm
+    let fg_vga  = color & 0x0F;
+    let bg_vga  = (color >> 4) & 0x0F;
+    let fg_ansi = VGA_TO_ANSI[(fg_vga & 7) as usize];
+    let bg_ansi = VGA_TO_ANSI[(bg_vga & 7) as usize];
+    let fg_code = if fg_vga >= 8 { 90 + fg_ansi as u16 } else { 30 + fg_ansi as u16 };
+    let bg_code = if bg_vga >= 8 { 100 + bg_ansi as u16 } else { 40 + bg_ansi as u16 };
+    buf[n] = 0x1b; n += 1;
+    buf[n] = b'['; n += 1;
+    n += ansi_u16(&mut buf[n..], fg_code);
+    buf[n] = b';'; n += 1;
+    n += ansi_u16(&mut buf[n..], bg_code);
+    buf[n] = b'm'; n += 1;
+    n
+}
+
 /// SSH I/O backend — one per session index.
 struct SshIo(usize);
 
@@ -95,6 +140,44 @@ impl ShellIo for SshIo {
     }
     fn newline(&mut self) {
         crate::kernel::net::ssh::send_to_session(self.0, b"\r\n");
+    }
+
+    fn put_char_at(&mut self, col: u16, row: u16, ch: u8, color: u8) {
+        let mut hdr = [0u8; 24];
+        let hn = build_ansi_hdr(&mut hdr, col, row, color);
+        crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
+        crate::kernel::net::ssh::send_to_session(self.0, &[ch]);
+        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
+    }
+
+    fn write_at(&mut self, col: u16, row: u16, s: &[u8], color: u8) {
+        if s.is_empty() { return; }
+        let mut hdr = [0u8; 24];
+        let hn = build_ansi_hdr(&mut hdr, col, row, color);
+        crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
+        crate::kernel::net::ssh::send_to_session(self.0, s);
+        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
+    }
+
+    fn fill_row(&mut self, row: u16, ch: u8, color: u8) {
+        let mut hdr = [0u8; 24];
+        let hn = build_ansi_hdr(&mut hdr, 0, row, color);
+        crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
+        let line = [ch; 80];
+        crate::kernel::net::ssh::send_to_session(self.0, &line);
+        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
+    }
+
+    fn move_cursor(&mut self, col: u16, row: u16) {
+        let mut buf = [0u8; 16];
+        let mut n = 0usize;
+        buf[n] = 0x1b; n += 1;
+        buf[n] = b'['; n += 1;
+        n += ansi_u16(&mut buf[n..], row + 1);
+        buf[n] = b';'; n += 1;
+        n += ansi_u16(&mut buf[n..], col + 1);
+        buf[n] = b'H'; n += 1;
+        crate::kernel::net::ssh::send_to_session(self.0, &buf[..n]);
     }
 }
 
