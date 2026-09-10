@@ -90,7 +90,7 @@ impl Command for VimCommand {
     fn name(&self) -> &'static str { "vim" }
     fn description(&self) -> &'static str { "Modal text editor (Esc=Normal, i=Insert, :q=quit)" }
 
-    fn execute(&self, args: &[&[u8]], _env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
+    fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
         let buf = unsafe { &mut VIM_BUF };
 
         let mut st = State {
@@ -104,10 +104,13 @@ impl Command for VimCommand {
         };
 
         if let Some(&fname) = args.first() {
-            let n = fname.len().min(64);
-            st.fname[..n].copy_from_slice(&fname[..n]);
+            // Resolve to absolute path so memfs key matches cat/ls
+            let mut abs_buf = [0u8; 256];
+            let abs = resolve_path(env.cwd(), fname, &mut abs_buf);
+            let n = abs.len().min(64);
+            st.fname[..n].copy_from_slice(&abs[..n]);
             st.fname_len = n;
-            if let Some(content) = super::virt_fs::get_content(fname) {
+            if let Some(content) = super::virt_fs::get_content(abs) {
                 buf.load(content);
             } else {
                 buf.clear();
@@ -536,4 +539,18 @@ fn write_num(buf: &mut [u8], mut n: u64) -> usize {
     let out = len.min(buf.len());
     for i in 0..out { buf[i] = tmp[len - 1 - i]; }
     out
+}
+
+/// Resolve `path` against `cwd` into `buf`. Returns slice of buf.
+fn resolve_path<'a>(cwd: &[u8], path: &[u8], buf: &'a mut [u8; 256]) -> &'a [u8] {
+    if path.first() == Some(&b'/') {
+        let n = path.len().min(255);
+        buf[..n].copy_from_slice(&path[..n]);
+        return &buf[..n];
+    }
+    let mut n = 0usize;
+    for &b in cwd { if n < 255 { buf[n] = b; n += 1; } }
+    if cwd != b"/" && n < 255 { buf[n] = b'/'; n += 1; }
+    for &b in path { if n < 255 { buf[n] = b; n += 1; } }
+    &buf[..n]
 }

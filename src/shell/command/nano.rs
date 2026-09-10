@@ -71,7 +71,7 @@ impl Command for NanoCommand {
     fn name(&self) -> &'static str { "nano" }
     fn description(&self) -> &'static str { "Simple text editor (Ctrl+X to exit)" }
 
-    fn execute(&self, args: &[&[u8]], _env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
+    fn execute(&self, args: &[&[u8]], env: &mut ShellEnv, io: &mut dyn ShellIo) -> i32 {
         let buf = unsafe { &mut NANO_BUF };
 
         // Build filename
@@ -83,13 +83,16 @@ impl Command for NanoCommand {
         };
 
         if let Some(&fname) = args.first() {
-            let n = fname.len().min(64);
-            st.fname[..n].copy_from_slice(&fname[..n]);
+            // Resolve to absolute path so memfs key matches what cat/ls use
+            let mut abs_buf = [0u8; 256];
+            let abs = resolve_path(env.cwd(), fname, &mut abs_buf);
+            let n = abs.len().min(64);
+            st.fname[..n].copy_from_slice(&abs[..n]);
             st.fname_len = n;
-            // Try to load known virtual file
-            if let Some(content) = super::virt_fs::get_content(fname) {
+            // Try to load content (memfs first, then virtual FS static content)
+            if let Some(content) = super::virt_fs::get_content(abs) {
                 buf.load(content);
-                st.set_msg(b"File loaded (read-only virtual FS)");
+                st.set_msg(b"File loaded");
             } else {
                 buf.clear();
             }
@@ -337,4 +340,18 @@ fn write_num(buf: &mut [u8], mut n: u64) -> usize {
     let out = len.min(buf.len());
     for i in 0..out { buf[i] = tmp[len - 1 - i]; }
     out
+}
+
+/// Resolve `path` against `cwd` into `buf`. Returns slice of buf.
+fn resolve_path<'a>(cwd: &[u8], path: &[u8], buf: &'a mut [u8; 256]) -> &'a [u8] {
+    if path.first() == Some(&b'/') {
+        let n = path.len().min(255);
+        buf[..n].copy_from_slice(&path[..n]);
+        return &buf[..n];
+    }
+    let mut n = 0usize;
+    for &b in cwd { if n < 255 { buf[n] = b; n += 1; } }
+    if cwd != b"/" && n < 255 { buf[n] = b'/'; n += 1; }
+    for &b in path { if n < 255 { buf[n] = b; n += 1; } }
+    &buf[..n]
 }

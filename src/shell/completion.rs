@@ -61,6 +61,9 @@ impl CompletionList {
 pub fn complete(partial: &[u8], is_command: bool, cwd: &[u8]) -> CompletionList {
     let mut list = CompletionList::empty();
 
+    // Never complete on empty input (Linux behaviour)
+    if partial.is_empty() { return list; }
+
     if is_command {
         // Complete command names
         for &cmd in COMMANDS {

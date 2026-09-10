@@ -10,6 +10,7 @@
 use super::Command;
 use crate::shell::env::ShellEnv;
 use crate::shell::io::ShellIo;
+use crate::shell::memfs;
 
 pub struct LsCommand;
 pub static LS: LsCommand = LsCommand;
@@ -45,11 +46,24 @@ impl Command for LsCommand {
             Some(c) => c,
         };
 
-        // ── Filter visible entries ────────────────────────────────────────────
+        // ── Filter visible entries (virt_fs + memfs) ─────────────────────────
         let mut visible: [&[u8]; 256] = [b""; 256];
         let mut count = 0usize;
         for &name in children {
             if !show_all && name.first() == Some(&b'.') { continue; }
+            if count < 256 { visible[count] = name; count += 1; }
+        }
+
+        // Also include user-created files from memfs under this directory
+        let mut memfs_paths: [&'static [u8]; memfs::MAX_FILES] = [b""; memfs::MAX_FILES];
+        let mcount = memfs::list(&mut memfs_paths);
+        'outer: for i in 0..mcount {
+            let path = memfs_paths[i];
+            if !memfs_path_parent_is(path, target) { continue; }
+            let name = memfs_path_name(path);
+            if !show_all && name.first() == Some(&b'.') { continue; }
+            // Skip if already listed by virt_fs
+            for j in 0..count { if visible[j] == name { continue 'outer; } }
             if count < 256 { visible[count] = name; count += 1; }
         }
 
@@ -141,6 +155,28 @@ impl PathBuf {
     fn push_bytes(&mut self, s: &[u8]) { for &b in s { self.push(b); } }
     fn as_slice(&self) -> &[u8] { &self.data[..self.len] }
 }
+/// True if `path` is directly inside `dir` (no further slashes in the tail).
+fn memfs_path_parent_is(path: &[u8], dir: &[u8]) -> bool {
+    if path.len() <= dir.len() { return false; }
+    if !path.starts_with(dir) { return false; }
+    let rest = &path[dir.len()..];
+    if dir == b"/" {
+        // dir is root: rest must be just "name" with no slash
+        !rest.contains(&b'/')
+    } else {
+        // rest should be "/name" with no further slashes
+        rest.first() == Some(&b'/') && !rest[1..].contains(&b'/')
+    }
+}
+
+/// Extract the last path component.
+fn memfs_path_name(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        None    => path,
+        Some(i) => &path[i + 1..],
+    }
+}
+
 fn make_abs_path(parent: &[u8], name: &[u8]) -> PathBuf {
     let mut p = PathBuf::new();
     p.push_bytes(parent);
