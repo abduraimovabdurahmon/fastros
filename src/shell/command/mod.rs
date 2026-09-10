@@ -18,8 +18,10 @@
 //!   ps.rs     — list kernel processes
 //!   ls.rs     — list directory contents (virtual FS view)
 //!   cd.rs     — change working directory
+//!   exit.rs   — ACPI power-off (shuts down QEMU)
 
 pub mod cd;
+pub mod exit;
 pub mod clear;
 pub mod echo;
 pub mod help;
@@ -111,6 +113,7 @@ impl CommandRegistry {
         r.register(&ps::PS);
         r.register(&ls::LS);
         r.register(&cd::CD);
+        r.register(&exit::EXIT);
         r
     }
 }
