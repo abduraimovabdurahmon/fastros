@@ -29,6 +29,7 @@
 //!               Command::execute (trait call)
 
 pub mod command;
+pub mod completion;
 pub mod env;
 pub mod executor;
 pub mod history;
@@ -134,7 +135,7 @@ pub fn run() -> ! {
         let prompt = &prompt_buf[..prompt_len];
         io.write_bytes(prompt);
 
-        let line = editor.read_line(&mut io, prompt);
+        let line = editor.read_line(&mut io, prompt, env.cwd());
         if line.is_empty() { continue; }
 
         history::push(line);

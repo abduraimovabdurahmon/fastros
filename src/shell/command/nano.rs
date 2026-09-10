@@ -97,6 +97,7 @@ impl Command for NanoCommand {
             buf.clear();
         }
 
+        io.clear_screen();
         redraw(io, buf, &st);
 
         loop {

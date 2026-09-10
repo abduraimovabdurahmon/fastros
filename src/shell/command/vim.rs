@@ -116,6 +116,8 @@ impl Command for VimCommand {
             buf.clear();
         }
 
+        // Clear screen before entering full-screen mode
+        io.clear_screen();
         redraw(io, buf, &st);
 
         loop {
