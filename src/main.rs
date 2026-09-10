@@ -1,13 +1,15 @@
 //! FastROS — Kernel Entry Point
 //!
-//! This file only orchestrates the boot sequence.
-//! Each subsystem initializes itself in order.
-//! No subsystem logic lives here.
+//! Boot sequence: each subsystem initializes in dependency order.
+//! No subsystem logic lives here — only orchestration.
 
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(generic_const_exprs)]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 use core::panic::PanicInfo;
 
@@ -21,62 +23,78 @@ mod libs;
 mod orchestrator;
 
 /// Called from arch/x86_64/boot.s after entering 64-bit long mode.
-///
-/// Boot sequence order is intentional — each layer depends on the one below it.
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
-    // 1. Architecture-specific early init (GDT, IDT)
+    // ── Layer 0: Architecture ──────────────────────────────────────────────
+    // GDT + TSS, IDT + PIC (interrupts enabled), SYSCALL MSRs, PIT timer
     arch::init();
 
-    // 2. Serial port — early debug output visible in QEMU -serial stdio
+    // ── Layer 3 (early): Serial — needs interrupts enabled ─────────────────
     drivers::char::serial::init();
     drivers::char::serial::write(b"\n");
-    drivers::char::serial::write(b"========================================\n");
-    drivers::char::serial::write(b"  FastROS v0.1.0 - kernel is running!\n");
-    drivers::char::serial::write(b"  arch: x86_64  mode: long mode (64-bit)\n");
-    drivers::char::serial::write(b"========================================\n");
-    drivers::char::serial::write(b"\n");
+    drivers::char::serial::write(b"=====================================\n");
+    drivers::char::serial::write(b"  FastROS v0.1.0  [64-bit long mode]\n");
+    drivers::char::serial::write(b"=====================================\n");
 
-    // 3. VGA display
-    drivers::display::vga::init();
-    drivers::display::vga::print(b"FastROS v0.1.0", 0x0a); // green
-
-    // 4. Physical memory manager
+    // ── Layer 2: Physical memory manager ──────────────────────────────────
     kernel::memory::pmm::init();
 
-    // 5. Virtual memory / paging
+    // ── Layer 2: Virtual memory manager ───────────────────────────────────
     kernel::memory::vmm::init();
 
-    // 6. Kernel heap
+    // Hook the page-fault handler so demand paging works
+    arch::set_page_fault_hook(kernel::memory::vmm::handle_page_fault);
+
+    // ── Layer 2: Kernel heap (bump allocator — enables Box/Vec) ───────────
     kernel::memory::heap::init();
 
-    // 7. Interrupts + timer
+    // ── Layer 2: Sync primitives (already usable via SpinLock::new) ───────
     kernel::sync::init();
 
-    // 8. Drivers
+    // ── Layer 3: Remaining drivers ────────────────────────────────────────
     drivers::init();
 
-    // 9. File systems (VFS + overlayfs for containers)
+    // ── Layer 4: File systems ──────────────────────────────────────────────
     fs::init();
 
-    // 10. Process manager + scheduler
+    // ── Layer 2: Process manager + scheduler ──────────────────────────────
     kernel::process::init();
 
-    // 11. Container runtime (image store, lifecycle manager)
+    // Connect the timer IRQ to the scheduler tick
+    arch::set_timer_hook(kernel::process::scheduler::tick);
+
+    // ── Layer 6: Container runtime ─────────────────────────────────────────
     container::init();
 
-    // 12. Orchestration layer (node agent, service discovery, network mesh)
+    // ── Layer 7: Orchestration layer ───────────────────────────────────────
     orchestrator::init();
 
-    // 13. Hand off to init process (userspace PID 1)
-    // kernel::process::spawn_init();
+    drivers::char::serial::write(b"  Boot complete. Entering idle loop.\n");
 
-    loop {}
+    // Idle loop — the scheduler preempts this when processes are runnable
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // TODO: print panic info via serial/VGA
-    let _ = info;
-    loop {}
+    // Write panic message to serial
+    drivers::char::serial::write(b"KERNEL PANIC: ");
+    if let Some(loc) = info.location() {
+        // Write file name bytes
+        drivers::char::serial::write(loc.file().as_bytes());
+    }
+    drivers::char::serial::write(b"\n");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, noreturn)); }
+    }
+}
+
+#[alloc_error_handler]
+fn alloc_error(_layout: core::alloc::Layout) -> ! {
+    drivers::char::serial::write(b"KERNEL PANIC: out of memory\n");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, noreturn)); }
+    }
 }

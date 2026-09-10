@@ -1,38 +1,48 @@
-//! Bitmap physical frame allocator
+//! Bitmap physical frame allocator — core bit operations.
 //!
-//! Each bit represents one 4 KB physical frame.
-//! Total memory 4 GB → 1 million frames → 128 KB bitmap.
+//! 1 bit per 4 KB frame.  0 = free, 1 = used.
+//! 64 frames packed per u64 word → fast scan with trailing-zeros trick.
 
-const FRAME_SIZE: u64 = 4096;
+pub const FRAME_SIZE: u64 = 4096;
 
-/// Find the first free frame in the bitmap. Returns frame index.
-pub fn find_free(_bitmap: &mut [u64]) -> Option<usize> {
-    // TODO: scan bitmap for zero bit using bit tricks
+/// Find the first free (0) bit.  Returns the frame index or None if full.
+pub fn find_free(bitmap: &[u64]) -> Option<usize> {
+    for (word_idx, &word) in bitmap.iter().enumerate() {
+        if word != !0u64 {
+            // At least one free bit in this word
+            let bit = word.trailing_ones() as usize; // first 0 bit position
+            return Some(word_idx * 64 + bit);
+        }
+    }
     None
 }
 
-/// Mark a frame as used.
-pub fn set_bit(_bitmap: &mut [u64], _frame: usize) {
-    // TODO: bitmap[frame / 64] |= 1 << (frame % 64)
+/// Mark frame `n` as used (set bit to 1).
+#[inline]
+pub fn set_bit(bitmap: &mut [u64], n: usize) {
+    bitmap[n / 64] |= 1u64 << (n % 64);
 }
 
-/// Mark a frame as free.
-pub fn clear_bit(_bitmap: &mut [u64], _frame: usize) {
-    // TODO: bitmap[frame / 64] &= !(1 << (frame % 64))
+/// Mark frame `n` as free (clear bit to 0).
+#[inline]
+pub fn clear_bit(bitmap: &mut [u64], n: usize) {
+    bitmap[n / 64] &= !(1u64 << (n % 64));
 }
 
-/// Check if a frame is free.
-pub fn is_free(_bitmap: &[u64], _frame: usize) -> bool {
-    // TODO: (bitmap[frame / 64] >> (frame % 64)) & 1 == 0
-    false
+/// Check if frame `n` is free.
+#[inline]
+pub fn is_free(bitmap: &[u64], n: usize) -> bool {
+    (bitmap[n / 64] >> (n % 64)) & 1 == 0
 }
 
-/// Convert a physical address to a frame index.
+/// Physical address → frame index.
+#[inline]
 pub fn addr_to_frame(phys: u64) -> usize {
     (phys / FRAME_SIZE) as usize
 }
 
-/// Convert a frame index to a physical address.
+/// Frame index → physical address.
+#[inline]
 pub fn frame_to_addr(frame: usize) -> u64 {
     (frame as u64) * FRAME_SIZE
 }

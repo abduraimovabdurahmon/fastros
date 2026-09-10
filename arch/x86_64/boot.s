@@ -33,7 +33,7 @@ align 4
     db "Xen", 0             ; name (4 bytes, null-terminated)
     dd _pvh_start           ; 32-bit physical address of PVH entry
 
-; ---- BSS: page tables + kernel stack ----
+; ---- BSS: page tables + stacks ----
 section .bss
 align 4096
 
@@ -47,6 +47,18 @@ p2_table:
 stack_bottom:
     resb 4096 * 16  ; 64 KB kernel stack
 stack_top:
+
+; Dedicated stack for SYSCALL entry (separate from IRQ stack)
+align 16
+syscall_kstack_bottom:
+    resb 4096 * 2   ; 8 KB
+syscall_kstack_top:
+
+; ---- SYSCALL global state ----
+section .data
+align 8
+global syscall_user_rsp         ; save slot for user RSP on SYSCALL entry
+syscall_user_rsp: dq 0
 
 ; ---- GDT for 64-bit long mode ----
 section .rodata
@@ -193,3 +205,108 @@ long_mode_start:
     hlt
 .hang:
     jmp .hang
+
+; =============================================================
+; context_switch(old_ctx: *mut Context, new_ctx: *const Context)
+;
+; Saves callee-saved registers into *old_ctx, then restores from *new_ctx.
+; If old_ctx is NULL, only restores (used to start the very first thread).
+;
+; Context layout (must match src/kernel/process/thread.rs):
+;   offset  0: r15
+;   offset  8: r14
+;   offset 16: r13
+;   offset 24: r12
+;   offset 32: rbp
+;   offset 40: rbx
+;   offset 48: rip  (saved return address — resumes after this call)
+; =============================================================
+global context_switch
+context_switch:
+    test rdi, rdi
+    jz .restore             ; old_ctx == NULL → skip save
+
+    ; Save callee-saved registers into *old_ctx
+    mov [rdi +  0], r15
+    mov [rdi +  8], r14
+    mov [rdi + 16], r13
+    mov [rdi + 24], r12
+    mov [rdi + 32], rbp
+    mov [rdi + 40], rbx
+    ; Save return address as the rip to resume at
+    lea rax, [rel .ctx_return]
+    mov [rdi + 48], rax
+
+.restore:
+    ; Restore callee-saved registers from *new_ctx
+    mov r15, [rsi +  0]
+    mov r14, [rsi +  8]
+    mov r13, [rsi + 16]
+    mov r12, [rsi + 24]
+    mov rbp, [rsi + 32]
+    mov rbx, [rsi + 40]
+    ; Jump to saved rip of next thread (memory-indirect)
+    jmp [rsi + 48]
+
+.ctx_return:
+    ret
+
+; =============================================================
+; syscall_entry — SYSCALL instruction entry point
+;
+; CPU state on entry (per x86_64 SYSCALL spec):
+;   rax  = syscall number
+;   rdi  = arg0
+;   rsi  = arg1
+;   rdx  = arg2
+;   r10  = arg3  (r10 used instead of rcx because SYSCALL clobbers rcx)
+;   r8   = arg4
+;   r9   = arg5
+;   rcx  = user RIP  (saved by SYSCALL instruction)
+;   r11  = user RFLAGS (saved by SYSCALL instruction)
+;   rsp  = user stack (unchanged, we must switch to kernel stack)
+; =============================================================
+global syscall_entry
+extern kernel_syscall_dispatch
+syscall_entry:
+    ; ── 1. Switch to kernel stack ────────────────────────────
+    mov [rel syscall_user_rsp], rsp
+    lea rsp, [rel syscall_kstack_top]
+
+    ; ── 2. Save user return context ─────────────────────────
+    push r11            ; user RFLAGS
+    push rcx            ; user RIP
+
+    ; ── 3. Save registers we will clobber during shuffle ────
+    push r10            ; arg3
+    push r9             ; arg5
+    push r8             ; arg4
+
+    ; ── 4. Shuffle arguments for Rust calling convention ────
+    ; dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64)
+    ; Rust/SysV ABI: rdi=nr, rsi=arg0, rdx=arg1, rcx=arg2
+    ; Current:       rax=nr, rdi=arg0, rsi=arg1, rdx=arg2
+    mov r9,  rdi        ; temporarily hold arg0
+    mov rdi, rax        ; rdi = nr
+    mov rcx, rdx        ; rcx = arg2
+    mov rdx, rsi        ; rdx = arg1
+    mov rsi, r9         ; rsi = arg0
+
+    ; ── 5. Call Rust dispatcher ──────────────────────────────
+    call kernel_syscall_dispatch
+    ; rax = return value (i64)
+
+    ; ── 6. Restore saved registers ──────────────────────────
+    pop r8
+    pop r9
+    pop r10
+
+    ; ── 7. Restore user return context ──────────────────────
+    pop rcx             ; user RIP → rcx (SYSRETQ uses it)
+    pop r11             ; user RFLAGS → r11 (SYSRETQ uses it)
+
+    ; ── 8. Switch back to user stack ────────────────────────
+    mov rsp, [rel syscall_user_rsp]
+
+    ; ── 9. Return to user mode ──────────────────────────────
+    sysretq
