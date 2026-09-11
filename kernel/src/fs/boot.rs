@@ -145,7 +145,7 @@ fn seed_etc(ctx: &Ctx) {
         ctx,
         "/etc/profile",
         0o644,
-        "# System-wide shell profile.\nexport PATH=/bin:/usr/local/bin\nalias ll='ls -l'\nalias la='ls -A'\n",
+        "# System-wide shell profile.\nexport PATH=/bin:/usr/local/bin\nalias ll='ls -l'\nalias la='ls -A'\nalias grep='grep --color=auto'\n",
     );
     seed(ctx, "/etc/motd", 0o644, "");
     seed(ctx, "/etc/issue", 0o644, "FastROS \\r \\l\n\n");

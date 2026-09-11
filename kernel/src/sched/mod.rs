@@ -256,7 +256,8 @@ pub fn try_spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Option<Arc<Ta
 /// The running task.
 pub fn current() -> Arc<Task> {
     let _irq = cpu::IrqGuard::new();
-    RQ.lock().current.clone().expect("sched::init not called")
+    let cur = RQ.lock().current.clone();
+    cur.expect("sched::init not called")
 }
 
 /// Cheap access to the running task without touching reference counts.

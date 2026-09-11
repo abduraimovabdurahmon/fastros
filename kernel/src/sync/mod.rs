@@ -26,9 +26,29 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering}
 
 /// Number of spinlocks currently held (the scheduler asserts it is zero).
 static HELD: AtomicUsize = AtomicUsize::new(0);
+/// An interrupt-enable owed to a guard that was dropped while another
+/// spinlock was still held. Guards need not be dropped in LIFO order — in
+/// edition 2021 a tail-expression temporary like `RQ.lock().x.clone()`
+/// outlives the block's locals, e.g. an earlier `IrqGuard` — so interrupts
+/// come back only when the last spinlock is released. Task switches happen
+/// only with no spinlock held, so this flag never crosses tasks.
+static PENDING_IRQ_ENABLE: AtomicBool = AtomicBool::new(false);
 
 pub fn spinlocks_held() -> usize {
     HELD.load(Ordering::Relaxed)
+}
+
+/// Restore the interrupt flag saved by `irq_save`, deferring the enable
+/// while any spinlock is held.
+pub fn restore_irqs(was_enabled: bool) {
+    if !was_enabled {
+        return;
+    }
+    if HELD.load(Ordering::Relaxed) > 0 {
+        PENDING_IRQ_ENABLE.store(true, Ordering::Relaxed);
+    } else {
+        cpu::irq_enable();
+    }
 }
 
 pub struct SpinLock<T: ?Sized> {
@@ -121,8 +141,14 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.owner.store(core::ptr::null_mut(), Ordering::Relaxed);
         self.lock.locked.store(false, Ordering::Release);
-        HELD.fetch_sub(1, Ordering::Relaxed);
-        cpu::irq_restore(self.irq);
+        let left = HELD.fetch_sub(1, Ordering::Relaxed) - 1;
+        if left > 0 {
+            if self.irq {
+                PENDING_IRQ_ENABLE.store(true, Ordering::Relaxed);
+            }
+        } else if PENDING_IRQ_ENABLE.swap(false, Ordering::Relaxed) || self.irq {
+            cpu::irq_enable();
+        }
     }
 }
 

@@ -2,12 +2,19 @@
 
 pub mod account;
 pub mod basic;
+pub mod diff;
+pub mod fileinfo;
 pub mod fileops;
 pub mod files;
+pub mod findutils;
 pub mod fmtutil;
+pub mod grep;
+pub mod pager;
+pub mod posixre;
 pub mod procinfo;
 pub mod procps;
 pub mod runutil;
+pub mod sed;
 pub mod sysutil;
 pub mod text;
 pub mod textutils;
@@ -37,14 +44,20 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("cut", textutils::cut, "remove sections from each line", "-b|-c|-f LIST [-d DELIM] [FILE]..."),
     cmd!("date", sysutil::date, "print or set the system date and time", "[-uR] [-d STRING] [-s STRING] [-I[FMT]] [+FORMAT]"),
     cmd!("df", sysutil::df, "report file system disk space usage", "[-ahHiTP] [-t TYPE] [-x TYPE] [-B SIZE] [FILE]..."),
+    cmd!("diff", diff::diff, "compare files line by line", "[-uqsrNibwa] [-U N] FILE1 FILE2"),
     cmd!("dirname", files::dirname, "strip the last component from a file name", "NAME..."),
     cmd!("dmesg", sysutil::dmesg, "print the kernel ring buffer", "[-TxrctwW] [-l LEVELS]"),
+    cmd!("du", fileinfo::du, "estimate file space usage", "[-ashbcxL] [-d N] [FILE]..."),
     cmd!("echo", basic::echo, "display a line of text", "[-neE] [STRING]..."),
+    cmd!("egrep", grep::egrep, "search with extended regular expressions (grep -E)", "PATTERNS [FILE]..."),
     cmd!("env", basic::env, "print or modify the environment", "[-i] [NAME=VALUE]... [COMMAND [ARG]...]"),
     cmd!("false", basic::false_, "do nothing, unsuccessfully", ""),
+    cmd!("fgrep", grep::fgrep, "search for fixed strings (grep -F)", "PATTERNS [FILE]..."),
+    cmd!("find", findutils::find, "search for files in a directory hierarchy", "[-H] [-L] [-P] [PATH...] [EXPRESSION]"),
     cmd!("free", procps::free, "display amount of free and used memory", "[-bkmgh] [-w] [-t] [-s N] [-c N]"),
     cmd!("fsh", crate::shell::sh_main, "the FastROS shell", "[-euxfC] [-c COMMAND [NAME [ARG]...]] [FILE [ARG]...]"),
     cmd!("gpasswd", account::gpasswd, "administer /etc/group", "[-a USER | -d USER | -M USERS] GROUP"),
+    cmd!("grep", grep::grep, "print lines that match patterns", "[OPTION]... PATTERNS [FILE]..."),
     cmd!("groupadd", account::groupadd, "create a new group", "[-g GID] [-f] GROUP"),
     cmd!("groupdel", account::groupdel, "delete a group", "GROUP"),
     cmd!("groups", sysutil::groups, "print the groups a user is in", "[USER]..."),
@@ -57,7 +70,9 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("kill", procps::kill, "send a signal to a process", "[-s SIGNAL | -SIGNAL] PID... | -l [SIGNAL]"),
     cmd!("killall", procps::killall, "kill processes by name", "[-eIiqrvw] [-s SIGNAL | -SIGNAL] [-u USER] NAME..."),
     cmd!("last", procps::last, "show a listing of last logged in users", "[-n N] [-x] [-f FILE] [USER|TTY]..."),
+    cmd!("less", pager::less, "view text one screen at a time", "[-NSRFXiIe] [FILE]..."),
     cmd!("ln", fileops::ln, "make links between files", "[-sfvn] TARGET [LINK]"),
+    cmd!("locate", findutils::locate, "find files by name in the locate database", "[-icbeA0] [-l N] PATTERN..."),
     cmd!("ls", files::ls, "list directory contents", "[-aAlhdRrtSi1CF] [--color=WHEN] [FILE]..."),
     cmd!("lsblk", sysutil::lsblk, "list block devices", "[-bnl]"),
     cmd!("lscpu", sysutil::lscpu, "display information about the CPU architecture", ""),
@@ -65,6 +80,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("mkdir", fileops::mkdir, "make directories", "[-pv] [-m MODE] DIRECTORY..."),
     cmd!("mkfifo", fileops::mkfifo, "make named pipes", "[-m MODE] NAME..."),
     cmd!("mktemp", fileops::mktemp, "create a temporary file or directory", "[-dqu] [-p DIR] [TEMPLATE]"),
+    cmd!("more", pager::more, "file perusal filter for viewing text", "[-s] [-n LINES] [FILE]..."),
     cmd!("mount", sysutil::mount, "mount a filesystem", "[-t TYPE] [-o OPTIONS] [--bind] SOURCE TARGET"),
     cmd!("mv", fileops::mv, "move (rename) files", "[-finvu] SOURCE... DEST"),
     cmd!("nl", textutils::nl, "number lines of files", "[-b STYLE] [-w N] [FILE]..."),
@@ -79,16 +95,20 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("printf", basic::printf, "format and print data", "FORMAT [ARGUMENT]..."),
     cmd!("ps", procps::ps, "report a snapshot of the current processes", "[-efjH] [aux] [-o FORMAT] [-p PID] [-u USER] [--sort KEY]"),
     cmd!("pwd", basic::pwd, "print the current working directory", "[-LP]"),
+    cmd!("readlink", fileinfo::readlink, "print resolved symbolic links or canonical file names", "[-femnqvz] FILE..."),
+    cmd!("realpath", fileinfo::realpath, "print the resolved path", "[-emsqz] [--relative-to=DIR] FILE..."),
     cmd!("reboot", sysutil::reboot, "reboot the system", ""),
     cmd!("rev", textutils::rev, "reverse lines characterwise", "[FILE]..."),
     cmd!("rm", fileops::rm, "remove files or directories", "[-rfivd] FILE..."),
     cmd!("rmdir", fileops::rmdir, "remove empty directories", "[-pv] DIRECTORY..."),
+    cmd!("sed", sed::sed, "stream editor for filtering and transforming text", "[-nEsiz] [-e SCRIPT] [-f FILE] [FILE]..."),
     cmd!("seq", textutils::seq, "print a sequence of numbers", "[-w] [-s SEP] [FIRST [INCR]] LAST"),
     cmd!("sh", crate::shell::sh_main, "the FastROS shell (POSIX sh)", "[-euxfC] [-c COMMAND [NAME [ARG]...]] [FILE [ARG]...]"),
     cmd!("sha256sum", textutils::sha256sum, "compute and check SHA256 checksums", "[-c] [FILE]..."),
     cmd!("shutdown", sysutil::shutdown, "halt, power off or reboot the machine", "[-hPrHc] [TIME] [MESSAGE]"),
     cmd!("sleep", basic::sleep, "delay for a specified amount of time", "NUMBER[smhd]..."),
     cmd!("sort", textutils::sort, "sort lines of text files", "[-nrufbhVs] [-k KEY] [-t SEP] [FILE]..."),
+    cmd!("stat", fileinfo::stat, "display file or file system status", "[-Lft] [-c FORMAT] FILE..."),
     cmd!("stty", sysutil::stty, "change and print terminal line settings", "[-a] [SETTING]..."),
     cmd!("su", account::su, "run a command with substitute user and group ID", "[-] [-c COMMAND] [-m] [USER]"),
     cmd!("sudo", account::sudo, "execute a command as another user", "[-iklnsSvEK] [-u USER] [COMMAND [ARG]...]"),
@@ -109,6 +129,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("umount", sysutil::umount, "unmount filesystems", "[-lfv] TARGET..."),
     cmd!("uname", basic::uname, "print system information", "[-asnrvmpio]"),
     cmd!("uniq", textutils::uniq, "report or omit repeated lines", "[-cdui] [INPUT [OUTPUT]]"),
+    cmd!("updatedb", findutils::updatedb, "update the locate database", "[-v]"),
     cmd!("uptime", procps::uptime, "tell how long the system has been running", "[-p] [-s]"),
     cmd!("useradd", account::useradd, "create a new user", "[-m] [-d HOME] [-s SHELL] [-u UID] [-g GROUP] [-G GROUPS] [-c COMMENT] LOGIN"),
     cmd!("userdel", account::userdel, "delete a user account", "[-r] [-f] LOGIN"),
@@ -119,8 +140,10 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("wall", sysutil::wall, "write a message to all users", "[MESSAGE]"),
     cmd!("watch", runutil::watch, "execute a program periodically, showing output fullscreen", "[-n SECS] [-tdegx] COMMAND"),
     cmd!("wc", textutils::wc, "print line, word and byte counts", "[-lwcmL] [FILE]..."),
+    cmd!("which", fileinfo::which, "locate a command", "[-a] NAME..."),
     cmd!("who", procps::who, "show who is logged on", "[-abHmqsu] [am i]"),
     cmd!("whoami", sysutil::whoami, "print effective user name", ""),
+    cmd!("xargs", findutils::xargs, "build and execute command lines from standard input", "[-0rtp] [-n N] [-I STR] [-d DELIM] [COMMAND [ARG]...]"),
     cmd!("xxd", textutils::hexdump, "make a hex dump", "[FILE]"),
     cmd!("yes", textutils::yes, "output a string repeatedly", "[STRING]..."),
 ];
