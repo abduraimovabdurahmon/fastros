@@ -10,6 +10,8 @@ pub mod files;
 pub mod findutils;
 pub mod fmtutil;
 pub mod grep;
+pub mod http;
+pub mod net;
 pub mod pager;
 pub mod posixre;
 pub mod procinfo;
@@ -33,6 +35,7 @@ macro_rules! cmd {
 pub static COMMANDS: &[CommandDef] = &[
     cmd!("[", basic::test, "evaluate a conditional expression", "EXPRESSION ]"),
     cmd!("adduser", account::adduser, "add a user and set its password", "USER"),
+    cmd!("arp", net::arp, "manipulate the system ARP cache", "[-n]"),
     cmd!("base64", textutils::base64, "base64 encode/decode data", "[-d] [-w COLS] [FILE]"),
     cmd!("basename", files::basename, "strip directory and suffix from a file name", "NAME [SUFFIX]"),
     cmd!("cat", text::cat, "concatenate files and print them", "[-nbsAE] [FILE]..."),
@@ -42,10 +45,12 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("chpasswd", account::chpasswd, "update passwords in batch mode", "< USER:PASSWORD..."),
     cmd!("clear", basic::clear, "clear the terminal screen", ""),
     cmd!("cp", fileops::cp, "copy files and directories", "[-rapfinvuls] SOURCE... DEST"),
+    cmd!("curl", http::curl, "transfer data from or to a server", "[-sSLIifO] [-X METHOD] [-H HEADER] [-d DATA] [-o FILE] [-w FMT] URL..."),
     cmd!("cut", textutils::cut, "remove sections from each line", "-b|-c|-f LIST [-d DELIM] [FILE]..."),
     cmd!("date", sysutil::date, "print or set the system date and time", "[-uR] [-d STRING] [-s STRING] [-I[FMT]] [+FORMAT]"),
     cmd!("df", sysutil::df, "report file system disk space usage", "[-ahHiTP] [-t TYPE] [-x TYPE] [-B SIZE] [FILE]..."),
     cmd!("diff", diff::diff, "compare files line by line", "[-uqsrNibwa] [-U N] FILE1 FILE2"),
+    cmd!("dig", net::dig, "DNS lookup utility", "[@server] NAME [type]"),
     cmd!("dirname", files::dirname, "strip the last component from a file name", "NAME..."),
     cmd!("dmesg", sysutil::dmesg, "print the kernel ring buffer", "[-TxrctwW] [-l LEVELS]"),
     cmd!("du", fileinfo::du, "estimate file space usage", "[-ashbcxL] [-d N] [FILE]..."),
@@ -57,6 +62,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("find", findutils::find, "search for files in a directory hierarchy", "[-H] [-L] [-P] [PATH...] [EXPRESSION]"),
     cmd!("free", procps::free, "display amount of free and used memory", "[-bkmgh] [-w] [-t] [-s N] [-c N]"),
     cmd!("fsh", crate::shell::sh_main, "the FastROS shell", "[-euxfC] [-c COMMAND [NAME [ARG]...]] [FILE [ARG]...]"),
+    cmd!("fw", net::fw, "manage the system firewall", "[status | allow PROTO PORT | deny PROTO PORT | ban IP | unban IP | bans]"),
     cmd!("gpasswd", account::gpasswd, "administer /etc/group", "[-a USER | -d USER | -M USERS] GROUP"),
     cmd!("grep", grep::grep, "print lines that match patterns", "[OPTION]... PATTERNS [FILE]..."),
     cmd!("groupadd", account::groupadd, "create a new group", "[-g GID] [-f] GROUP"),
@@ -67,9 +73,12 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("halt", sysutil::halt, "halt the system", "[-p]"),
     cmd!("head", textutils::head, "output the first part of files", "[-n NUM] [-c NUM] [FILE]..."),
     cmd!("hexdump", textutils::hexdump, "display file contents in hexadecimal", "[-C] [FILE]..."),
+    cmd!("host", net::host, "resolve a host name", "NAME"),
     cmd!("hostname", sysutil::hostname, "show or set the system host name", "[-sfdiI] [-b] [NAME]"),
     cmd!("htop", top::htop, "interactive process viewer", "[-Ct] [-d DELAY] [-u USER] [-p PID] [-s COLUMN]"),
     cmd!("id", sysutil::id, "print real and effective user and group IDs", "[-ugGnrz] [USER]"),
+    cmd!("ifconfig", net::ifconfig, "configure a network interface", "[INTERFACE]"),
+    cmd!("ip", net::ip, "show / manipulate routing, devices, addresses", "{addr|link|route|neigh} ..."),
     cmd!("kill", procps::kill, "send a signal to a process", "[-s SIGNAL | -SIGNAL] PID... | -l [SIGNAL]"),
     cmd!("killall", procps::killall, "kill processes by name", "[-eIiqrvw] [-s SIGNAL | -SIGNAL] [-u USER] NAME..."),
     cmd!("last", procps::last, "show a listing of last logged in users", "[-n N] [-x] [-f FILE] [USER|TTY]..."),
@@ -86,12 +95,16 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("more", pager::more, "file perusal filter for viewing text", "[-s] [-n LINES] [FILE]..."),
     cmd!("mount", sysutil::mount, "mount a filesystem", "[-t TYPE] [-o OPTIONS] [--bind] SOURCE TARGET"),
     cmd!("mv", fileops::mv, "move (rename) files", "[-finvu] SOURCE... DEST"),
+    cmd!("nc", net::nc, "arbitrary TCP and UDP connections and listens", "[-lukvnz] [-w SECS] [HOST] PORT"),
+    cmd!("netstat", net::netstat, "print network connections and interfaces", "[-tulnpraies]"),
     cmd!("nl", textutils::nl, "number lines of files", "[-b STYLE] [-w N] [FILE]..."),
     cmd!("nohup", runutil::nohup, "run a command immune to hangups", "COMMAND [ARG]..."),
     cmd!("nproc", procps::nproc, "print the number of processing units available", ""),
+    cmd!("nslookup", net::nslookup, "query DNS name servers", "HOST"),
     cmd!("passwd", account::passwd, "change user password", "[-l|-u|-S] [--stdin] [LOGIN]"),
     cmd!("pgrep", procps::pgrep, "look up processes by name and other attributes", "[-flcnoxvia] [-d DELIM] [-P PPID] [-u USER] [-t TTY] PATTERN"),
     cmd!("pidof", procps::pidof, "find the process ID of a running program", "[-sq] [-o PID] NAME..."),
+    cmd!("ping", net::ping, "send ICMP ECHO_REQUEST to network hosts", "[-c COUNT] [-i INT] [-W TIMEOUT] [-s SIZE] [-q] HOST"),
     cmd!("pkill", procps::pkill, "signal processes by name and other attributes", "[-SIGNAL] [-fnoxvie] [-P PPID] [-u USER] [-t TTY] PATTERN"),
     cmd!("poweroff", sysutil::poweroff, "power off the system", ""),
     cmd!("printenv", basic::printenv, "print environment variables", "[NAME]..."),
@@ -104,6 +117,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("rev", textutils::rev, "reverse lines characterwise", "[FILE]..."),
     cmd!("rm", fileops::rm, "remove files or directories", "[-rfivd] FILE..."),
     cmd!("rmdir", fileops::rmdir, "remove empty directories", "[-pv] DIRECTORY..."),
+    cmd!("route", net::route, "show / manipulate the IP routing table", "[-n]"),
     cmd!("sed", sed::sed, "stream editor for filtering and transforming text", "[-nEsiz] [-e SCRIPT] [-f FILE] [FILE]..."),
     cmd!("seq", textutils::seq, "print a sequence of numbers", "[-w] [-s SEP] [FIRST [INCR]] LAST"),
     cmd!("sh", crate::shell::sh_main, "the FastROS shell (POSIX sh)", "[-euxfC] [-c COMMAND [NAME [ARG]...]] [FILE [ARG]...]"),
@@ -111,6 +125,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("shutdown", sysutil::shutdown, "halt, power off or reboot the machine", "[-hPrHc] [TIME] [MESSAGE]"),
     cmd!("sleep", basic::sleep, "delay for a specified amount of time", "NUMBER[smhd]..."),
     cmd!("sort", textutils::sort, "sort lines of text files", "[-nrufbhVs] [-k KEY] [-t SEP] [FILE]..."),
+    cmd!("ss", net::ss, "another utility to investigate sockets", "[-tulnpa]"),
     cmd!("stat", fileinfo::stat, "display file or file system status", "[-Lft] [-c FORMAT] FILE..."),
     cmd!("stty", sysutil::stty, "change and print terminal line settings", "[-a] [SETTING]..."),
     cmd!("su", account::su, "run a command with substitute user and group ID", "[-] [-c COMMAND] [-m] [USER]"),
@@ -145,6 +160,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("wall", sysutil::wall, "write a message to all users", "[MESSAGE]"),
     cmd!("watch", runutil::watch, "execute a program periodically, showing output fullscreen", "[-n SECS] [-tdegx] COMMAND"),
     cmd!("wc", textutils::wc, "print line, word and byte counts", "[-lwcmL] [FILE]..."),
+    cmd!("wget", http::wget, "a non-interactive network downloader", "[-qO FILE] URL..."),
     cmd!("which", fileinfo::which, "locate a command", "[-a] NAME..."),
     cmd!("who", procps::who, "show who is logged on", "[-abHmqsu] [am i]"),
     cmd!("whoami", sysutil::whoami, "print effective user name", ""),

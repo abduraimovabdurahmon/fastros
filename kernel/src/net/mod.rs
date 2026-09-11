@@ -8,6 +8,7 @@
 //! have changed a socket's state.
 
 pub mod device;
+pub mod http;
 pub mod dns;
 pub mod filter;
 pub mod socket;
@@ -184,9 +185,24 @@ pub fn kick() {
 }
 
 /// Poll the host stack now (after queueing data) and wake socket waiters.
+///
+/// Loops while a poll keeps changing state so a loopback exchange (a frame
+/// this host both sends and receives) completes in one call instead of
+/// waiting for the next `knetd` tick: send → deliver → reply → deliver.
 pub fn poll_now() {
     if let Some(s) = STACK.get() {
-        let changed = s.lock().poll();
+        let mut changed = false;
+        // A loopback echo takes several device passes (send → deliver request
+        // → generate reply → deliver reply). The middle passes move a frame
+        // without changing socket state, so poll a few times unconditionally
+        // before trusting the "no change" signal to stop.
+        for i in 0..8 {
+            let c = s.lock().poll();
+            changed |= c;
+            if !c && i >= 3 {
+                break;
+            }
+        }
         if changed {
             SOCK_WQ.wake_all();
         }
