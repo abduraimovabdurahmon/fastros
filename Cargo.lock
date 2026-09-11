@@ -258,6 +258,7 @@ dependencies = [
  "ctr",
  "ed25519-dalek",
  "fastros-alloc",
+ "fastros-archive",
  "fastros-codec",
  "fastros-ext2",
  "fastros-netfilter",

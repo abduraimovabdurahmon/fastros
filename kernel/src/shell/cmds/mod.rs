@@ -1,5 +1,6 @@
 //! Native commands (the contents of `/bin`).
 
+pub mod archive;
 pub mod basic;
 pub mod fileops;
 pub mod files;
@@ -31,6 +32,8 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("echo", basic::echo, "display a line of text", "[-neE] [STRING]..."),
     cmd!("env", basic::env, "print or modify the environment", "[-i] [NAME=VALUE]... [COMMAND [ARG]...]"),
     cmd!("false", basic::false_, "do nothing, unsuccessfully", ""),
+    cmd!("gunzip", archive::gzip::gunzip, "decompress files", "[-cfkNqrtv] [FILE]..."),
+    cmd!("gzip", archive::gzip::gzip, "compress or expand files", "[-cdfklnNqrtv1-9] [-S SUF] [FILE]..."),
     cmd!("head", textutils::head, "output the first part of files", "[-n NUM] [-c NUM] [FILE]..."),
     cmd!("hexdump", textutils::hexdump, "display file contents in hexadecimal", "[-C] [FILE]..."),
     cmd!("ln", fileops::ln, "make links between files", "[-sfvn] TARGET [LINK]"),
@@ -53,6 +56,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("sync", fileops::sync, "write cached data to disk", ""),
     cmd!("tac", textutils::tac, "concatenate and print files in reverse", "[FILE]..."),
     cmd!("tail", textutils::tail, "output the last part of files", "[-n NUM] [-c NUM] [-f] [FILE]..."),
+    cmd!("tar", archive::tar::tar, "an archiving utility", "[-]{c|x|t}[zvpOPkh] [-f ARCHIVE] [-C DIR] [FILE]..."),
     cmd!("tee", textutils::tee, "copy standard input to files and standard output", "[-a] [FILE]..."),
     cmd!("test", basic::test, "evaluate a conditional expression", "EXPRESSION"),
     cmd!("touch", fileops::touch, "change file timestamps / create files", "[-acm] [-d DATE] [-r FILE] FILE..."),
@@ -61,9 +65,12 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("truncate", fileops::truncate, "shrink or extend a file", "-s SIZE FILE..."),
     cmd!("uname", basic::uname, "print system information", "[-asnrvmpio]"),
     cmd!("uniq", textutils::uniq, "report or omit repeated lines", "[-cdui] [INPUT [OUTPUT]]"),
+    cmd!("unzip", archive::zip::unzip, "list, test and extract zip archives", "[-lqoptnj:] FILE[.zip] [MEMBER]... [-d DIR]"),
     cmd!("wc", textutils::wc, "print line, word and byte counts", "[-lwcmL] [FILE]..."),
     cmd!("xxd", textutils::hexdump, "make a hex dump", "[FILE]"),
     cmd!("yes", textutils::yes, "output a string repeatedly", "[STRING]..."),
+    cmd!("zcat", archive::gzip::zcat, "decompress files to standard output", "[-f] [FILE]..."),
+    cmd!("zip", archive::zip::zip, "package and compress files", "[-rjqyD0-9] ZIPFILE FILE..."),
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandDef> {

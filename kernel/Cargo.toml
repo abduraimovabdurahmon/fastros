@@ -17,6 +17,7 @@ fastros-codec = { path = "../lib/codec" }
 fastros-ext2 = { path = "../lib/ext2" }
 fastros-netfilter = { path = "../lib/netfilter" }
 fastros-sh = { path = "../lib/sh" }
+fastros-archive = { path = "../lib/archive" }
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 hmac = { version = "0.12", default-features = false }
 chacha20 = { version = "0.9", default-features = false }
