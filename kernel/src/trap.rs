@@ -102,6 +102,28 @@ fn exception(tf: &mut TrapFrame) {
                 Some((s, off, prot, fb)) => crate::kwarn!("trap", "  cr2 in region {:#x}+{:#x} prot={:#x} file={}", s, off, prot, fb),
                 None => crate::kwarn!("trap", "  cr2 {:#x} unmapped", cr2),
             }
+            // Walk the user frame-pointer chain and name each return address's
+            // region, so a fault deep in a dynamic binary can be traced.
+            let mut bp = tf.rbp as usize;
+            for _ in 0..10 {
+                if bp == 0 || bp & 7 != 0 {
+                    break;
+                }
+                let (Ok(saved), Ok(ret)) = (crate::uaccess::read_obj::<u64>(bp), crate::uaccess::read_obj::<u64>(bp + 8)) else {
+                    break;
+                };
+                if ret == 0 {
+                    break;
+                }
+                match sp.describe(ret as usize) {
+                    Some((s, off, _, _)) => crate::kwarn!("trap", "  bt {:#x} ({:#x}+{:#x})", ret, s, off),
+                    None => crate::kwarn!("trap", "  bt {:#x}", ret),
+                }
+                if saved as usize <= bp {
+                    break;
+                }
+                bp = saved as usize;
+            }
         }
         crate::proc::exit_current(crate::proc::ExitStatus::Signaled(sig));
     }
