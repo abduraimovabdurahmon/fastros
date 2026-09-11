@@ -249,9 +249,17 @@ impl File for PipeEnd {
 
     fn ioctl(&self, req: u32, arg: usize) -> KResult<usize> {
         const FIONREAD: u32 = 0x541B;
+        const FIONBIO: u32 = 0x5421;
         if req == FIONREAD {
             let n = self.pipe.inner.lock().data.len() as u32;
             crate::uaccess::write_obj(arg, &n)?;
+            return Ok(0);
+        }
+        if req == FIONBIO {
+            let on: u32 = crate::uaccess::read_obj(arg)?;
+            let old = self.flags.load(Ordering::Relaxed);
+            let new = if on != 0 { old | flags::O_NONBLOCK } else { old & !flags::O_NONBLOCK };
+            self.flags.store(new, Ordering::Relaxed);
             return Ok(0);
         }
         Err(Errno::ENOTTY)
@@ -329,6 +337,14 @@ impl File for Duplex {
         self.rx.wait_queue()
     }
     fn ioctl(&self, req: u32, arg: usize) -> KResult<usize> {
+        const FIONBIO: u32 = 0x5421;
+        if req == FIONBIO {
+            let on: u32 = crate::uaccess::read_obj(arg)?;
+            let old = self.flags.load(Ordering::Relaxed);
+            let new = if on != 0 { old | flags::O_NONBLOCK } else { old & !flags::O_NONBLOCK };
+            self.flags.store(new, Ordering::Relaxed);
+            return Ok(0);
+        }
         self.rx.ioctl(req, arg)
     }
     fn flags(&self) -> u32 {

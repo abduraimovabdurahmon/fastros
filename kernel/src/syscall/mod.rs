@@ -170,7 +170,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         // rt_sigaction, rt_sigprocmask, sigaltstack, set_robust_list, prlimit64,
         // rseq, prctl, sched_setaffinity, fadvise64: accepted as no-ops so libc
         // starts.
-        13 | 14 | 131 | 273 | 302 | 334 | 157 | 203 | 221 => 0,
+        13 | 14 | 131 | 273 | 334 | 157 | 203 | 221 => 0,
+        97 => ret(proc_sys::getrlimit(a[0] as u32, a[1] as usize)),
+        160 => 0, // setrlimit: accepted, not enforced
+        302 => ret(proc_sys::prlimit64(a[0] as i32, a[1] as u32, a[2] as usize, a[3] as usize)),
 
         // Credential setters: a rootless container already runs under the
         // caller's identity and is sandboxed regardless, so a server dropping

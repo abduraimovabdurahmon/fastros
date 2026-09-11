@@ -209,6 +209,33 @@ pub fn clock_nanosleep(_clk: u32, _flags: i32, req: usize, rem: usize) -> KResul
     nanosleep(req, rem)
 }
 
+/// Resource limits. We enforce none, but programs (nginx) read `RLIMIT_NOFILE`
+/// to size their connection tables, so report a generous, sane value rather
+/// than zero.
+const RLIMIT_NOFILE: u32 = 7;
+fn rlimit_for(resource: u32) -> (u64, u64) {
+    match resource {
+        RLIMIT_NOFILE => (65536, 65536),
+        _ => (u64::MAX, u64::MAX), // RLIM_INFINITY
+    }
+}
+
+pub fn prlimit64(_pid: i32, resource: u32, _new: usize, old: usize) -> KResult<usize> {
+    if old != 0 {
+        let (cur, max) = rlimit_for(resource);
+        uaccess::write_obj(old, &cur)?;
+        uaccess::write_obj(old + 8, &max)?;
+    }
+    Ok(0)
+}
+
+pub fn getrlimit(resource: u32, rlim: usize) -> KResult<usize> {
+    let (cur, max) = rlimit_for(resource);
+    uaccess::write_obj(rlim, &cur)?;
+    uaccess::write_obj(rlim + 8, &max)?;
+    Ok(0)
+}
+
 /// `rt_sigsuspend`: wait until a signal arrives, then return EINTR (its only
 /// return). We don't swap the signal mask (handlers are not yet delivered to
 /// user mode), so this is a plain interruptible wait — enough for a service
