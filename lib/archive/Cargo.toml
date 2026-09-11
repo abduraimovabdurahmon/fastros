@@ -1,0 +1,9 @@
+[package]
+name = "fastros-archive"
+description = "Archive and compression formats for FastROS: gzip, tar, zip (no_std + alloc)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

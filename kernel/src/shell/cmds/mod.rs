@@ -1,6 +1,7 @@
 //! Native commands (the contents of `/bin`).
 
 pub mod account;
+pub mod archive;
 pub mod basic;
 pub mod diff;
 pub mod fileinfo;
@@ -61,6 +62,8 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("groupadd", account::groupadd, "create a new group", "[-g GID] [-f] GROUP"),
     cmd!("groupdel", account::groupdel, "delete a group", "GROUP"),
     cmd!("groups", sysutil::groups, "print the groups a user is in", "[USER]..."),
+    cmd!("gunzip", archive::gzip::gunzip, "decompress files", "[-cfkNqrtv] [FILE]..."),
+    cmd!("gzip", archive::gzip::gzip, "compress or expand files", "[-cdfklnNqrtv1-9] [-S SUF] [FILE]..."),
     cmd!("halt", sysutil::halt, "halt the system", "[-p]"),
     cmd!("head", textutils::head, "output the first part of files", "[-n NUM] [-c NUM] [FILE]..."),
     cmd!("hexdump", textutils::hexdump, "display file contents in hexadecimal", "[-C] [FILE]..."),
@@ -116,6 +119,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("sysctl", sysutil::sysctl, "read or write kernel parameters", "[-anNqe] [KEY[=VALUE]]..."),
     cmd!("tac", textutils::tac, "concatenate and print files in reverse", "[FILE]..."),
     cmd!("tail", textutils::tail, "output the last part of files", "[-n NUM] [-c NUM] [-f] [FILE]..."),
+    cmd!("tar", archive::tar::tar, "an archiving utility", "[-]{c|x|t}[zvpOPkh] [-f ARCHIVE] [-C DIR] [FILE]..."),
     cmd!("tee", textutils::tee, "copy standard input to files and standard output", "[-a] [FILE]..."),
     cmd!("test", basic::test, "evaluate a conditional expression", "EXPRESSION"),
     cmd!("time", runutil::time, "time a simple command", "[-p] COMMAND [ARG]..."),
@@ -129,6 +133,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("umount", sysutil::umount, "unmount filesystems", "[-lfv] TARGET..."),
     cmd!("uname", basic::uname, "print system information", "[-asnrvmpio]"),
     cmd!("uniq", textutils::uniq, "report or omit repeated lines", "[-cdui] [INPUT [OUTPUT]]"),
+    cmd!("unzip", archive::zip::unzip, "list, test and extract zip archives", "[-lqoptnj:] FILE[.zip] [MEMBER]... [-d DIR]"),
     cmd!("updatedb", findutils::updatedb, "update the locate database", "[-v]"),
     cmd!("uptime", procps::uptime, "tell how long the system has been running", "[-p] [-s]"),
     cmd!("useradd", account::useradd, "create a new user", "[-m] [-d HOME] [-s SHELL] [-u UID] [-g GROUP] [-G GROUPS] [-c COMMENT] LOGIN"),
@@ -146,6 +151,8 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("xargs", findutils::xargs, "build and execute command lines from standard input", "[-0rtp] [-n N] [-I STR] [-d DELIM] [COMMAND [ARG]...]"),
     cmd!("xxd", textutils::hexdump, "make a hex dump", "[FILE]"),
     cmd!("yes", textutils::yes, "output a string repeatedly", "[STRING]..."),
+    cmd!("zcat", archive::gzip::zcat, "decompress files to standard output", "[-f] [FILE]..."),
+    cmd!("zip", archive::zip::zip, "package and compress files", "[-rjqyD0-9] ZIPFILE FILE..."),
 ];
 
 /// Run a native command: uniform `CMD --help` / `CMD --version`, then its
