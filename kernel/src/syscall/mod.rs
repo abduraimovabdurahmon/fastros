@@ -172,6 +172,16 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         // starts.
         13 | 14 | 131 | 273 | 302 | 334 | 157 | 203 | 221 => 0,
 
+        // Credential setters: a rootless container already runs under the
+        // caller's identity and is sandboxed regardless, so a server dropping
+        // privileges (nginx worker setgid/setuid/setgroups) succeeds as a no-op
+        // instead of failing and exiting. setuid=105 setgid=106 setpgid=109
+        // setreuid=113 setregid=114 setgroups=116 setresuid=117 setresgid=119
+        // setfsuid=122 setfsgid=123 setsid handled elsewhere.
+        105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 => 0,
+        // getgroups: no supplementary groups.
+        115 => 0,
+
         // ── not implemented ──
         _ => {
             warn_once(nr);
