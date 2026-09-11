@@ -158,24 +158,55 @@ fn parse_list(lines: &[Line], i: &mut usize, base_indent: usize) -> Yaml {
     let mut list = Vec::new();
     while *i < lines.len() {
         let ln = &lines[*i];
-        if ln.indent < base_indent || !(ln.text.trim_start().starts_with("- ") || ln.text.trim() == "-") {
+        if ln.indent != base_indent || !(ln.text.trim_start().starts_with("- ") || ln.text.trim() == "-") {
             break;
         }
-        let item = ln.text.trim_start()[1..].trim();
-        *i += 1;
-        if item.is_empty() {
-            // Nested block under this `-`.
-            if *i < lines.len() && lines[*i].indent > base_indent {
-                let ci = lines[*i].indent;
-                list.push(parse_block(lines, i, ci));
-            }
-        } else if item.contains(':') && !item.contains('=') && parse_inline(item).as_str().is_none() {
-            list.push(Yaml::Scalar(unquote(item)));
-        } else {
-            list.push(parse_inline(item));
+        // Column where the item's content begins (after the dash and spaces).
+        let after = &ln.text[ln.indent..]; // starts with '-'
+        let rest = &after[1..];
+        let content = rest.trim_start();
+        let content_col = ln.indent + 1 + (rest.len() - content.len());
+
+        // Gather this item's lines: the (optional) inline content at
+        // `content_col`, plus every following deeper line — so a `- key: val`
+        // item followed by more keys forms one map.
+        let mut item_lines: Vec<Line> = Vec::new();
+        if !content.is_empty() {
+            item_lines.push(Line { indent: content_col, text: alloc::format!("{}{}", " ".repeat(content_col), content) });
         }
+        *i += 1;
+        while *i < lines.len() && lines[*i].indent > base_indent {
+            let l = &lines[*i];
+            item_lines.push(Line { indent: l.indent, text: l.text.clone() });
+            *i += 1;
+        }
+
+        if item_lines.is_empty() {
+            list.push(Yaml::Scalar(String::new()));
+            continue;
+        }
+        // A single scalar item (no ':' mapping) stays a scalar.
+        if item_lines.len() == 1 && !is_mapping_line(&item_lines[0].text) {
+            list.push(parse_inline(item_lines[0].text.trim()));
+            continue;
+        }
+        let mut j = 0;
+        list.push(parse_block(&item_lines, &mut j, content_col));
     }
     Yaml::List(list)
+}
+
+/// Does a line look like a `key: value` mapping (vs a bare scalar/inline list)?
+fn is_mapping_line(text: &str) -> bool {
+    let t = text.trim();
+    if t.starts_with('[') || t.starts_with('"') || t.starts_with('\'') {
+        return false;
+    }
+    match t.split_once(':') {
+        // "a: b" or "a:" is a mapping; "http://x" (colon then no space) is not.
+        Some((_, rest)) => rest.is_empty() || rest.starts_with(' '),
+        None => false,
+    }
 }
 
 fn parse_inline(s: &str) -> Yaml {

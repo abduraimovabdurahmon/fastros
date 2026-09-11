@@ -193,6 +193,9 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
         "compose" => compose(ctx, &args[1..]),
+        "kube" | "kubectl" | "k" => kube(ctx, &args[1..]),
+        "apply" => kube(ctx, &{ let mut v = alloc::vec!["apply".to_string()]; v.extend_from_slice(&args[1..]); v }),
+        "get" => kube(ctx, &{ let mut v = alloc::vec!["get".to_string()]; v.extend_from_slice(&args[1..]); v }),
         "help" | "-h" | "--help" => usage(ctx),
         other => {
             ctx.eprint(&format!("fastman: unknown command '{other}'\n"));
@@ -574,6 +577,147 @@ fn compose(ctx: &mut Ctx, args: &[String]) -> i32 {
             }
         }
         other => ctx.fail(format!("unknown compose command '{other}' (up|down|ps|logs)")),
+    }
+}
+
+/// `fastman kube <apply -f file | get [pods|deployments|services|all] | delete <name>>`.
+fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut file = None;
+    let mut sub = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" | "--filename" => {
+                i += 1;
+                file = args.get(i).cloned();
+            }
+            s if sub.is_none() && !s.starts_with('-') => sub = Some(s.to_string()),
+            s => rest.push(s.to_string()),
+        }
+        i += 1;
+    }
+    let fc = fs_ctx(ctx);
+    let base = crate::fastman::store::base(&fc);
+    let wdir = format!("{base}/kube/workloads");
+    let sdir = format!("{base}/kube/services");
+    let s = style_of(ctx);
+    match sub.as_deref().unwrap_or("get") {
+        "apply" => {
+            let Some(path) = file else { return ctx.fail("apply requires -f <manifest>") };
+            let src = match crate::fs::ops::read_file(&fc, &path) {
+                Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                Err(e) => return ctx.fail_errno(&path, e),
+            };
+            let m = crate::fastman::kube::parse(&src);
+            if m.workloads.is_empty() && m.services.is_empty() {
+                return ctx.fail(format!("{path}: no Deployment/Pod/Service found"));
+            }
+            let _ = crate::fs::ops::mkdir_all(&fc, &wdir, 0o700);
+            let _ = crate::fs::ops::mkdir_all(&fc, &sdir, 0o700);
+            for w in &m.workloads {
+                if image::resolve(&fc, &w.image).is_none() {
+                    ctx.fail(format!("{}: image '{}' not found", w.name, w.image));
+                    continue;
+                }
+                let rec = format!("{}\n{}\n{}\n", w.kind, w.replicas, w.image);
+                let _ = crate::fs::ops::write_file(&fc, &format!("{wdir}/{}", w.name), rec.as_bytes(), 0o600);
+                for n in 0..w.replicas {
+                    let pod = crate::fastman::kube::pod_name(&w.name, n);
+                    let _ = runtime::remove(&fc, &pod, true);
+                    let opts = crate::fastman::kube::clone_opts(&w.opts, pod.clone());
+                    ctx.flush();
+                    match runtime::run(&fc, &w.image, opts, None) {
+                        Ok(_) => outln!(ctx, "{} {}/{} created", s.green(&w.kind.to_lowercase()), w.name, pod),
+                        Err(e) => {
+                            ctx.fail_errno(&pod, e);
+                        }
+                    }
+                }
+            }
+            for sv in &m.services {
+                let rec = format!("{}\n{}\n{}\n", sv.port, sv.target, sv.selector);
+                let _ = crate::fs::ops::write_file(&fc, &format!("{sdir}/{}", sv.name), rec.as_bytes(), 0o600);
+                outln!(ctx, "{} {} created", s.green("service"), sv.name);
+            }
+            0
+        }
+        "get" => {
+            let what = rest.first().map(|s| s.as_str()).unwrap_or("all");
+            let pods = what == "pods" || what == "po" || what == "all";
+            let deps = what == "deployments" || what == "deploy" || what == "all";
+            let svcs = what == "services" || what == "svc" || what == "all";
+            let workloads = crate::fs::ops::list_dir(&fc, &wdir).unwrap_or_default();
+            if deps {
+                let mut t = Table::new(&["NAME", "KIND", "DESIRED", "READY"]);
+                for e in &workloads {
+                    let rec = crate::fs::ops::read_file(&fc, &format!("{wdir}/{}", e.name)).map(|d| String::from_utf8_lossy(&d).into_owned()).unwrap_or_default();
+                    let mut it = rec.lines();
+                    let kind = it.next().unwrap_or("Deployment").to_string();
+                    let want: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    let ready = (0..want).filter(|n| container::find(&fc, &crate::fastman::kube::pod_name(&e.name, *n)).map(|c| c.live_state() == State::Running).unwrap_or(false)).count();
+                    t.row(alloc::vec![e.name.clone(), kind, want.to_string(), format!("{ready}/{want}")]);
+                }
+                t.render(ctx, &s);
+            }
+            if pods {
+                let mut t = Table::new(&["POD", "STATUS", "IMAGE"]);
+                for e in &workloads {
+                    let rec = crate::fs::ops::read_file(&fc, &format!("{wdir}/{}", e.name)).map(|d| String::from_utf8_lossy(&d).into_owned()).unwrap_or_default();
+                    let mut it = rec.lines();
+                    let _kind = it.next();
+                    let want: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    for n in 0..want {
+                        let pod = crate::fastman::kube::pod_name(&e.name, n);
+                        if let Ok(c) = container::find(&fc, &pod) {
+                            let status = match c.live_state() {
+                                State::Running => s.green("Running"),
+                                State::Exited => s.dim(&format!("Exited ({})", c.exit_code)),
+                                State::Created => s.dim("Pending"),
+                            };
+                            t.row(alloc::vec![pod, status, c.image_key.clone()]);
+                        }
+                    }
+                }
+                t.render(ctx, &s);
+            }
+            if svcs {
+                let mut t = Table::new(&["SERVICE", "PORT", "TARGET", "SELECTOR"]);
+                for e in crate::fs::ops::list_dir(&fc, &sdir).unwrap_or_default() {
+                    let rec = crate::fs::ops::read_file(&fc, &format!("{sdir}/{}", e.name)).map(|d| String::from_utf8_lossy(&d).into_owned()).unwrap_or_default();
+                    let mut it = rec.lines();
+                    let port = it.next().unwrap_or("").to_string();
+                    let target = it.next().unwrap_or("").to_string();
+                    let sel = it.next().unwrap_or("").to_string();
+                    t.row(alloc::vec![e.name.clone(), port, target, sel]);
+                }
+                t.render(ctx, &s);
+            }
+            0
+        }
+        "delete" => {
+            let Some(name) = rest.iter().find(|a| !a.contains('/')).cloned().or_else(|| rest.first().cloned()) else {
+                return ctx.fail("delete requires a name");
+            };
+            // Delete a workload's pods + record, or a service.
+            let rec_path = format!("{wdir}/{name}");
+            if let Ok(d) = crate::fs::ops::read_file(&fc, &rec_path) {
+                let text = String::from_utf8_lossy(&d).into_owned();
+                let want: usize = text.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+                for n in 0..want {
+                    let _ = runtime::remove(&fc, &crate::fastman::kube::pod_name(&name, n), true);
+                }
+                let _ = crate::fs::ops::unlink(&fc, &rec_path);
+                outln!(ctx, "deployment \"{name}\" deleted");
+                return 0;
+            }
+            if crate::fs::ops::unlink(&fc, &format!("{sdir}/{name}")).is_ok() {
+                outln!(ctx, "service \"{name}\" deleted");
+                return 0;
+            }
+            ctx.fail(format!("{name}: not found"))
+        }
+        other => ctx.fail(format!("unknown kube command '{other}' (apply|get|delete)")),
     }
 }
 
