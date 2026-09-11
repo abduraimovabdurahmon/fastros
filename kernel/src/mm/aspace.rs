@@ -279,6 +279,12 @@ impl AddressSpace {
         self.regions.lock().iter().find(|r| r.start <= addr && addr < r.end).cloned()
     }
 
+    /// Human-readable description of the region containing `addr` (for fault
+    /// diagnostics): `(start, offset_within, prot_bits, file_backed)`.
+    pub fn describe(&self, addr: usize) -> Option<(usize, usize, u8, bool)> {
+        self.region_at(addr).map(|r| (r.start, addr - r.start, r.prot.bits(), r.backing.is_some()))
+    }
+
     /// Is every page of `[addr, addr+len)` mapped with at least READ (and
     /// WRITE when `write`)? Used to bounds-check user pointers in syscalls.
     pub fn verify(&self, addr: usize, len: usize, write: bool) -> bool {

@@ -51,6 +51,9 @@ fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, owner: u32, group: u32) -> KRes
     let mut st = Stats::default();
     let mut tr = TarReader::new(src);
     while let Some(entry) = tr.next_entry().map_err(ae)? {
+        // Extracting a large image is a long kernel-side operation; yield
+        // between entries so a big pull never starves the rest of the system.
+        crate::sched::cond_resched();
         let safe = match sanitize(&entry.path) {
             Ok(s) => s,
             Err(_) => {
@@ -102,6 +105,7 @@ fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, owner: u32, group: u32) -> KRes
                     }
                     f.write_all(&buf[..n])?;
                     st.bytes += n as u64;
+                    crate::sched::cond_resched();
                 }
                 let _ = ops::chmod(ctx, &full, mode, true);
                 st.files += 1;

@@ -91,7 +91,18 @@ fn exception(tf: &mut TrapFrame) {
             _ => crate::proc::signal::SIGSEGV,
         };
         let pid = crate::proc::current().pid;
-        crate::kwarn!("trap", "{} in pid {} at rip {:#x} (cr2 {:#x}) -> {}", exception_name(v), pid, tf.rip, cpu::read_cr2(), crate::proc::signal::name(sig));
+        let cr2 = cpu::read_cr2();
+        crate::kwarn!("trap", "{} in pid {} at rip {:#x} (cr2 {:#x}) -> {}", exception_name(v), pid, tf.rip, cr2, crate::proc::signal::name(sig));
+        if let Some(sp) = crate::proc::current_aspace() {
+            match sp.describe(tf.rip as usize) {
+                Some((s, off, prot, fb)) => crate::kwarn!("trap", "  rip in region {:#x}+{:#x} prot={:#x} file={}", s, off, prot, fb),
+                None => crate::kwarn!("trap", "  rip {:#x} in no region", tf.rip),
+            }
+            match sp.describe(cr2 as usize) {
+                Some((s, off, prot, fb)) => crate::kwarn!("trap", "  cr2 in region {:#x}+{:#x} prot={:#x} file={}", s, off, prot, fb),
+                None => crate::kwarn!("trap", "  cr2 {:#x} unmapped", cr2),
+            }
+        }
         crate::proc::exit_current(crate::proc::ExitStatus::Signaled(sig));
     }
     crate::panic::exception(tf, exception_name(v));
