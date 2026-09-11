@@ -9,6 +9,7 @@
 
 pub mod device;
 pub mod http;
+pub mod tls;
 pub mod dns;
 pub mod filter;
 pub mod socket;

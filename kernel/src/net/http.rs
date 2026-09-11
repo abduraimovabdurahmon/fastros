@@ -117,7 +117,28 @@ impl Response {
     }
 }
 
-fn read_line(stream: &TcpStream, buf: &mut Vec<u8>, timeout_ms: u64) -> Result<Vec<u8>, HttpError> {
+/// The byte transport under HTTP: plain TCP or TLS.
+pub enum Conn {
+    Plain(TcpStream),
+    Tls(crate::net::tls::TlsStream),
+}
+
+impl Conn {
+    fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> Result<usize, HttpError> {
+        match self {
+            Conn::Plain(s) => s.read_timeout(buf, Some(timeout_ms)).map_err(HttpError::Io),
+            Conn::Tls(s) => s.read(buf).map_err(HttpError::Io),
+        }
+    }
+    fn write_all(&mut self, data: &[u8]) -> Result<(), HttpError> {
+        match self {
+            Conn::Plain(s) => s.write_all(data).map_err(HttpError::Io),
+            Conn::Tls(s) => s.write_all(data).map_err(HttpError::Io),
+        }
+    }
+}
+
+fn read_line(conn: &mut Conn, buf: &mut Vec<u8>, timeout_ms: u64) -> Result<Vec<u8>, HttpError> {
     // Read a CRLF-terminated line, buffering any overshoot in `buf`.
     loop {
         if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
@@ -126,7 +147,7 @@ fn read_line(stream: &TcpStream, buf: &mut Vec<u8>, timeout_ms: u64) -> Result<V
             return Ok(line);
         }
         let mut tmp = [0u8; 2048];
-        let n = stream.read_timeout(&mut tmp, Some(timeout_ms)).map_err(HttpError::Io)?;
+        let n = conn.read(&mut tmp, timeout_ms)?;
         if n == 0 {
             // EOF without CRLF: return whatever is left.
             if buf.is_empty() {
@@ -140,14 +161,14 @@ fn read_line(stream: &TcpStream, buf: &mut Vec<u8>, timeout_ms: u64) -> Result<V
     }
 }
 
-fn read_exact(stream: &TcpStream, buf: &mut Vec<u8>, want: usize, timeout_ms: u64) -> Result<Vec<u8>, HttpError> {
+fn read_exact(conn: &mut Conn, buf: &mut Vec<u8>, want: usize, timeout_ms: u64) -> Result<Vec<u8>, HttpError> {
     let mut out = Vec::with_capacity(want);
     let take = want.min(buf.len());
     out.extend_from_slice(&buf[..take]);
     buf.drain(..take);
     let mut tmp = [0u8; 8192];
     while out.len() < want {
-        let n = stream.read_timeout(&mut tmp, Some(timeout_ms)).map_err(HttpError::Io)?;
+        let n = conn.read(&mut tmp, timeout_ms)?;
         if n == 0 {
             break;
         }
@@ -162,15 +183,17 @@ fn read_exact(stream: &TcpStream, buf: &mut Vec<u8>, want: usize, timeout_ms: u6
 
 /// Perform one request (no redirect following).
 pub fn fetch(req: &Request) -> Result<Response, HttpError> {
-    if req.url.is_tls() {
-        return Err(HttpError::Tls);
-    }
     let ip = match dns::parse_ipv4(&req.url.host) {
         Some(a) => a,
         None => *dns::resolve(&req.url.host).map_err(|_| HttpError::Dns)?.first().ok_or(HttpError::Dns)?,
     };
     let ep = IpEndpoint::new(IpAddress::Ipv4(ip), req.url.port);
     let stream = TcpStream::connect(ep, req.timeout_ms).map_err(HttpError::Connect)?;
+    let mut conn = if req.url.is_tls() {
+        Conn::Tls(crate::net::tls::connect(stream, &req.url.host, req.timeout_ms).map_err(|_| HttpError::Tls)?)
+    } else {
+        Conn::Plain(stream)
+    };
 
     // Build and send the request.
     let mut head = alloc::format!("{} {} HTTP/1.1\r\n", req.method, req.url.path);
@@ -198,9 +221,9 @@ pub fn fetch(req: &Request) -> Result<Response, HttpError> {
         }
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).map_err(HttpError::Io)?;
+    conn.write_all(head.as_bytes())?;
     if let Some(body) = req.body {
-        stream.write_all(body).map_err(HttpError::Io)?;
+        conn.write_all(body)?;
     }
     // Do not half-close here: sending our FIN before the reply can race the
     // reply on the loopback path. The `Connection: close` header tells the
@@ -208,7 +231,7 @@ pub fn fetch(req: &Request) -> Result<Response, HttpError> {
 
     // Status line.
     let mut buf = Vec::new();
-    let status_line = read_line(&stream, &mut buf, req.timeout_ms)?;
+    let status_line = read_line(&mut conn, &mut buf, req.timeout_ms)?;
     let status_str = String::from_utf8_lossy(&status_line).into_owned();
     let mut parts = status_str.splitn(3, ' ');
     let _http = parts.next().ok_or(HttpError::BadResponse)?;
@@ -220,7 +243,7 @@ pub fn fetch(req: &Request) -> Result<Response, HttpError> {
     header_block.extend_from_slice(b"\r\n");
     let mut headers = Vec::new();
     loop {
-        let line = read_line(&stream, &mut buf, req.timeout_ms)?;
+        let line = read_line(&mut conn, &mut buf, req.timeout_ms)?;
         if line.is_empty() {
             header_block.extend_from_slice(b"\r\n");
             break;
@@ -242,28 +265,28 @@ pub fn fetch(req: &Request) -> Result<Response, HttpError> {
     if !no_body {
         if chunked {
             loop {
-                let size_line = read_line(&stream, &mut buf, req.timeout_ms)?;
+                let size_line = read_line(&mut conn, &mut buf, req.timeout_ms)?;
                 let size_str = String::from_utf8_lossy(&size_line);
                 let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16).map_err(|_| HttpError::BadResponse)?;
                 if size == 0 {
-                    let _ = read_line(&stream, &mut buf, req.timeout_ms); // trailing CRLF / trailers
+                    let _ = read_line(&mut conn, &mut buf, req.timeout_ms); // trailing CRLF / trailers
                     break;
                 }
-                let chunk = read_exact(&stream, &mut buf, size, req.timeout_ms)?;
+                let chunk = read_exact(&mut conn, &mut buf, size, req.timeout_ms)?;
                 body.extend_from_slice(&chunk);
-                let _ = read_line(&stream, &mut buf, req.timeout_ms); // CRLF after chunk
+                let _ = read_line(&mut conn, &mut buf, req.timeout_ms); // CRLF after chunk
                 if crate::proc::interrupted() {
                     break;
                 }
             }
         } else if let Some(len) = content_length {
-            body = read_exact(&stream, &mut buf, len, req.timeout_ms)?;
+            body = read_exact(&mut conn, &mut buf, len, req.timeout_ms)?;
         } else {
             // Read until the server closes.
             body.append(&mut buf);
             let mut tmp = [0u8; 8192];
             loop {
-                let n = stream.read_timeout(&mut tmp, Some(req.timeout_ms)).map_err(HttpError::Io)?;
+                let n = conn.read(&mut tmp, req.timeout_ms)?;
                 if n == 0 {
                     break;
                 }

@@ -490,23 +490,45 @@ fn exec(ctx: &mut Ctx, args: &[String]) -> i32 {
     }
 }
 
+/// Streams registry progress to the caller's terminal.
+struct CliProgress<'a> {
+    ctx: &'a mut Ctx,
+}
+impl crate::fastman::registry::Progress for CliProgress<'_> {
+    fn line(&mut self, msg: &str) {
+        self.ctx.print(msg);
+        self.ctx.print("\n");
+        self.ctx.flush();
+    }
+}
+
 fn pull(ctx: &mut Ctx, args: &[String]) -> i32 {
-    let Some(reference) = args.first() else {
+    let Some(reference) = args.iter().find(|a| !a.starts_with('-')) else {
         return ctx.fail("pull requires an image reference");
     };
     let r = match image::ImageRef::parse(reference) {
         Some(r) => r,
         None => return ctx.fail(format!("invalid reference '{reference}'")),
     };
-    // Registry pull needs a TLS client for Docker Hub / quay; not built yet.
-    // A plain-HTTP local registry and TLS support are the next milestone.
-    ctx.eprint(&format!(
-        "fastman: pulling {} from {} is not available yet — this build has no\n\
-         TLS registry client. Import a rootfs tarball instead:\n    \
-         <build a rootfs.tar.gz>  |  fastman import {}\n",
-        r.key(),
-        r.registry.as_deref().unwrap_or("docker.io"),
-        r.key(),
-    ));
-    1
+    if !crate::net::is_up() {
+        return ctx.fail("no network");
+    }
+    ctx.flush();
+    let result = {
+        let mut prog = CliProgress { ctx };
+        crate::fastman::registry::pull(&r, &mut prog)
+    };
+    let pulled = match result {
+        Ok(p) => p,
+        Err(e) => return ctx.fail(format!("pull {}: {}", r.key(), e.message())),
+    };
+    let fc = fs_ctx(ctx);
+    match image::store_layers(&fc, &r.key(), &pulled.layers, pulled.config) {
+        Ok(img) => {
+            outln!(ctx, "Status: Downloaded newer image for {}", r.key());
+            outln!(ctx, "{}", img.key);
+            0
+        }
+        Err(e) => ctx.fail_errno("store image", e),
+    }
 }

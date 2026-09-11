@@ -191,6 +191,29 @@ pub fn import(ctx: &Ctx, reference: &str, data: &[u8], config: ImageConfig) -> K
     Ok(Image { id, key: r.key(), created: crate::time::unix_now(), size: st.bytes })
 }
 
+/// Create an image from already-downloaded layers (registry pull): extract
+/// each gzipped-tar layer into the rootfs in order, then record the config.
+pub fn store_layers(ctx: &Ctx, reference: &str, layers: &[Vec<u8>], config: ImageConfig) -> KResult<Image> {
+    let r = ImageRef::parse(reference).ok_or(Errno::EINVAL)?;
+    super::store::ensure(ctx)?;
+    let id = new_id();
+    let dir = format!("{}/{id}", store::images_dir(ctx));
+    ops::mkdir(ctx, &dir, 0o700)?;
+    let rootfs = rootfs_path(ctx, &id);
+    ops::mkdir(ctx, &rootfs, 0o755)?;
+    let mut bytes = 0u64;
+    for layer in layers {
+        let st = super::extract::layer(ctx, &rootfs, layer, ctx.cred.uid, ctx.cred.gid)?;
+        bytes += st.bytes;
+    }
+    ops::write_file(ctx, &config_path(ctx, &id), config.encode().as_bytes(), 0o600)?;
+    let mut index = read_index(ctx);
+    index.retain(|(k, _)| *k != r.key());
+    index.push((r.key(), id.clone()));
+    write_index(ctx, &index)?;
+    Ok(Image { id, key: r.key(), created: crate::time::unix_now(), size: bytes })
+}
+
 /// List images, newest first is not tracked yet; index order.
 pub fn list(ctx: &Ctx) -> Vec<Image> {
     read_index(ctx)

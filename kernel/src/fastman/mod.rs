@@ -26,6 +26,8 @@
 pub mod container;
 pub mod extract;
 pub mod image;
+pub mod json;
+pub mod registry;
 pub mod runtime;
 pub mod store;
 
