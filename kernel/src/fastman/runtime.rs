@@ -130,7 +130,7 @@ fn build_fs(ctx: &Ctx, c: &Container) -> KResult<FsContext> {
 
 /// A logger task copies the container's stdout/stderr to its log file and,
 /// for a foreground run, to the caller's terminal.
-fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Option<Arc<dyn File>>) {
+fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Option<Arc<dyn File>>) -> alloc::sync::Arc<crate::sched::Task> {
     crate::sched::spawn("fm-logger", move || {
         let kctx = Ctx { fs: crate::proc::kernel().fs.lock().clone(), cred: crate::fs::perm::Cred::user(uid, gid, Vec::new()) };
         let path = format!("{}/{id}/log", super::store::containers_dir(&kctx));
@@ -153,12 +153,12 @@ fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Opti
                 Err(_) => break,
             }
         }
-    });
+    })
 }
 
 /// Start a created container. Returns its init pid. For a foreground run,
 /// `tee` receives a copy of the output; the caller then waits on the pid.
-pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResult<u32> {
+pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResult<(u32, alloc::sync::Arc<crate::sched::Task>)> {
     let fs = build_fs(ctx, c)?;
     // Resolve the program inside the container.
     let cctx = Ctx { fs: fs.clone(), cred: ctx.cred.clone() };
@@ -167,7 +167,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         return Err(Errno::EINVAL);
     }
     let data = resolve_program(&cctx, &argv[0])?;
-    let (space, frame) = proc::elf::load(&data, &argv, &c.env)?;
+    let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
 
     // stdio: /dev/null in, a pipe out to the logger.
     let (r, w) = pipe::pipe();
@@ -197,7 +197,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
     };
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
-    spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
+    let logger = spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
 
     c.pid = pid;
     c.state = State::Running;
@@ -218,7 +218,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
             let _ = c.save(&kctx);
         }
     });
-    Ok(pid)
+    Ok((pid, logger))
 }
 
 /// Read a program image from the container, following a couple of `PATH`
@@ -240,7 +240,7 @@ fn resolve_program(cctx: &Ctx, prog: &str) -> KResult<Vec<u8>> {
 pub fn run(ctx: &Ctx, image_name: &str, opts: RunOpts, tee: Option<Arc<dyn File>>) -> KResult<(Container, i32)> {
     let detach = opts.detach;
     let mut c = create(ctx, image_name, opts)?;
-    let pid = start(ctx, &mut c, if detach { None } else { tee })?;
+    let (pid, logger) = start(ctx, &mut c, if detach { None } else { tee })?;
     if detach {
         return Ok((c, 0));
     }
@@ -261,6 +261,9 @@ pub fn run(ctx: &Ctx, image_name: &str, opts: RunOpts, tee: Option<Arc<dyn File>
             None => break super::container::load(ctx, &c.id).map(|c| c.exit_code).unwrap_or(0),
         }
     };
+    // Drain the logger so all container output reaches the caller before we
+    // return (and the exec channel closes).
+    logger.join();
     Ok((c, code))
 }
 
@@ -335,7 +338,7 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
     let fs = build_fs(ctx, &c)?;
     let cctx = Ctx { fs: fs.clone(), cred: ctx.cred.clone() };
     let data = resolve_program(&cctx, &argv[0])?;
-    let (space, frame) = proc::elf::load(&data, &argv, &c.env)?;
+    let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
 
     let (r, w) = pipe::pipe();
     let r: Arc<dyn File> = r;
@@ -364,8 +367,9 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
     // Tee exec output straight to the caller (also captured in the log).
-    spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
+    let logger = spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
     let code = child.tasks().into_iter().next().map(|t| t.join()).unwrap_or(0);
+    logger.join();
     let _ = pid;
     Ok(code)
 }

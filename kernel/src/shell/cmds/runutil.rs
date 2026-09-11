@@ -359,7 +359,7 @@ pub fn fexec(ctx: &mut Ctx) -> i32 {
     };
     let argv: Vec<String> = ctx.args[1..].to_vec();
     let envp: Vec<String> = ctx.proc.env.lock().iter().map(|(k, v)| alloc::format!("{k}={v}")).collect();
-    let (space, frame) = match crate::proc::elf::load(&data, &argv, &envp) {
+    let (space, frame) = match crate::proc::elf::load(&ctx.fs(), &data, &argv, &envp) {
         Ok(v) => v,
         Err(e) => return ctx.fail_errno(&path, e),
     };

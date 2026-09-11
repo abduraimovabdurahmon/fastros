@@ -134,3 +134,44 @@ def test_info(g, image):
     out = g.ok("fastman info")
     assert "container engine" in out.lower()
     assert "Rootless" in out and "yes" in out
+
+
+DYN = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv){
+    char *m = malloc(64); strcpy(m, "dynamic libc works");
+    printf("dyn: %s argc=%d\n", m, argc);
+    free(m);
+    return 0;
+}
+"""
+
+
+def test_dynamically_linked_binary(g):
+    """A real dynamically-linked glibc binary (needs ld-linux + libc.so.6 via
+    file-backed mmap) runs in a container — the basis for real Docker images."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.join(d, "r")
+        os.makedirs(os.path.join(root, "bin"))
+        c = os.path.join(d, "dyn.c")
+        open(c, "w").write(DYN)
+        exe = os.path.join(root, "bin", "dyn")
+        subprocess.run(["gcc", "-O2", "-o", exe, c], check=True, capture_output=True)
+        ldd = subprocess.run(["ldd", exe], check=True, capture_output=True, text=True).stdout
+        import re as _re
+        for lib in _re.findall(r"/[^\s]+\.so[^\s]*", ldd):
+            dest = root + lib
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            subprocess.run(["cp", lib, dest], check=True)
+        tar = os.path.join(d, "r.tar.gz")
+        subprocess.run(["tar", "czf", tar, "-C", root, "."], check=True)
+        data = open(tar, "rb").read()
+    b64 = base64.b64encode(data).decode()
+    g.ok("base64 -d | fastman import dyntest:latest", stdin=b64)
+    out, err, st = g.run("fastman run dyntest /bin/dyn x y")
+    assert out.strip() == "dyn: dynamic libc works argc=3", (out, err)
+    assert st == 0
+    g.run("fastman rmi dyntest:latest")

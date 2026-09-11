@@ -30,7 +30,7 @@ fn prot_from(bits: u32) -> Prot {
     p
 }
 
-pub fn mmap(addr: u64, len: usize, prot: u32, flags: u32, fd: i32, _off: u64) -> KResult<usize> {
+pub fn mmap(addr: u64, len: usize, prot: u32, flags: u32, fd: i32, off: u64) -> KResult<usize> {
     let space = proc::current_aspace().ok_or(Errno::ENOMEM)?;
     if len == 0 {
         return Err(Errno::EINVAL);
@@ -38,13 +38,17 @@ pub fn mmap(addr: u64, len: usize, prot: u32, flags: u32, fd: i32, _off: u64) ->
     if flags & (MAP_SHARED | MAP_PRIVATE) == 0 {
         return Err(Errno::EINVAL);
     }
-    // Only anonymous mappings for now; file mappings arrive with the page cache.
-    if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
-        return Err(Errno::ENODEV);
-    }
     let p = prot_from(prot);
     let p = if p == Prot::NONE { Prot::READ } else { p };
-    space.mmap(addr as usize, len, p, flags & MAP_FIXED != 0)
+    let file = if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
+        // Private file mapping (what the dynamic linker uses). A shared file
+        // mapping is treated as private for now (fine for read-only code).
+        let f = proc::current().fds.lock().get(fd)?;
+        Some((f, off))
+    } else {
+        None
+    };
+    space.mmap(addr as usize, len, p, flags & MAP_FIXED != 0, file)
 }
 
 pub fn munmap(addr: usize, len: usize) -> KResult<usize> {

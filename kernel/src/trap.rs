@@ -74,5 +74,17 @@ fn exception(tf: &mut TrapFrame) {
         crate::kerr!("trap", "NMI received (rip {:#x}) — ignoring", tf.rip);
         return;
     }
+    // A fault in a user program kills only that process, never the kernel:
+    // a container segfault must not take the whole system down.
+    if tf.from_user() {
+        let sig = match v {
+            0 | 16 | 19 => crate::proc::signal::SIGFPE,
+            6 => crate::proc::signal::SIGILL,
+            _ => crate::proc::signal::SIGSEGV,
+        };
+        let pid = crate::proc::current().pid;
+        crate::kwarn!("trap", "{} in pid {} at rip {:#x} (cr2 {:#x}) -> {}", exception_name(v), pid, tf.rip, cpu::read_cr2(), crate::proc::signal::name(sig));
+        crate::proc::exit_current(crate::proc::ExitStatus::Signaled(sig));
+    }
     crate::panic::exception(tf, exception_name(v));
 }

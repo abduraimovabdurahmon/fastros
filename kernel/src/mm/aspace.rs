@@ -12,6 +12,7 @@ use super::{align_down, align_up, kspace, PhysAddr, PAGE_SIZE, USER_END, USER_ST
 use crate::arch::paging::{self, flags, MapError};
 use crate::arch::{cpu, trap::TrapFrame};
 use crate::errno::{Errno, KResult};
+use crate::fs::file::File;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use alloc::sync::Arc;
@@ -45,8 +46,21 @@ impl core::ops::BitOr for Prot {
     }
 }
 
-/// One contiguous mapping — a VMA. Anonymous for now (file mappings arrive
-/// with the page cache); every page is private and demand-allocated.
+/// A private, read-on-fault file mapping (MAP_PRIVATE): pages are filled from
+/// the file the first time they fault and stay private thereafter. This is
+/// what the dynamic linker uses to map shared libraries.
+#[derive(Clone)]
+struct FileBacking {
+    file: Arc<dyn File>,
+    /// File offset that maps to `region.start`.
+    offset: u64,
+    /// Bytes of real file content from `region.start`; the rest is a zero
+    /// (bss) tail, as ELF segments and `ld.so` expect.
+    length: u64,
+}
+
+/// One contiguous mapping — a VMA. Either anonymous (demand-zeroed) or backed
+/// by a file (demand-filled, private). Every page is per-process private.
 #[derive(Clone)]
 struct Region {
     start: usize,
@@ -54,6 +68,8 @@ struct Region {
     prot: Prot,
     /// Grows downward on faults just below `start` (the stack).
     grows_down: bool,
+    /// `Some` for a file-backed (MAP_PRIVATE) mapping.
+    backing: Option<FileBacking>,
 }
 
 pub struct AddressSpace {
@@ -124,32 +140,60 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, end) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end, prot, grows_down });
+        regions.push(Region { start, end, prot, grows_down, backing: None });
         Ok(())
     }
 
-    /// Place an anonymous mapping of `len` bytes, honouring a fixed `hint`.
-    pub fn mmap(&self, hint: usize, len: usize, prot: Prot, fixed: bool) -> KResult<usize> {
+    /// Reserve a private, file-backed mapping (used by `mmap` with an fd and
+    /// by the ELF loader for file-mapped segments).
+    fn map_file_region(&self, start: usize, end: usize, prot: Prot, file: Arc<dyn File>, offset: u64, length: u64) -> KResult<()> {
+        let (start, end) = (align_down(start, PAGE_SIZE), align_up(end, PAGE_SIZE));
+        if start < USER_START || end > USER_END || start >= end {
+            return Err(Errno::EINVAL);
+        }
+        let mut regions = self.regions.lock();
+        if Self::overlaps(&regions, start, end) {
+            return Err(Errno::EEXIST);
+        }
+        regions.push(Region { start, end, prot, grows_down: false, backing: Some(FileBacking { file, offset, length }) });
+        Ok(())
+    }
+
+    /// Place a mapping of `len` bytes, honouring a fixed `hint`. When `file`
+    /// is `Some`, the mapping is private and filled from the file at `offset`.
+    pub fn mmap(&self, hint: usize, len: usize, prot: Prot, fixed: bool, file: Option<(Arc<dyn File>, u64)>) -> KResult<usize> {
         let len = align_up(len.max(1), PAGE_SIZE);
+        let place = |this: &Self, start: usize| -> KResult<()> {
+            match &file {
+                Some((f, off)) => this.map_file_region(start, start + len, prot, f.clone(), *off, len as u64),
+                None => this.map_region(start, start + len, prot, false),
+            }
+        };
         if fixed {
             let start = align_down(hint, PAGE_SIZE);
             self.unmap(start, len).ok();
-            self.map_region(start, start + len, prot, false)?;
+            place(self, start)?;
             return Ok(start);
         }
         if hint >= USER_START {
             let start = align_down(hint, PAGE_SIZE);
             if !Self::overlaps(&self.regions.lock(), start, start + len) && start + len <= USER_END {
-                self.map_region(start, start + len, prot, false)?;
+                place(self, start)?;
                 return Ok(start);
             }
         }
         let mut top = self.mmap_top.lock();
         let start = top.checked_sub(len).ok_or(Errno::ENOMEM)?;
         let start = align_down(start, PAGE_SIZE);
-        self.map_region(start, start + len, prot, false)?;
+        place(self, start)?;
         *top = start;
         Ok(start)
+    }
+
+    /// Map `[start, end)` of `file` (from `offset`) with `length` bytes of
+    /// real content and a zero tail — the ELF loader's file-backed segments.
+    pub fn map_segment(&self, start: usize, end: usize, prot: Prot, file: &Arc<dyn File>, offset: u64, length: u64) -> KResult<()> {
+        self.map_file_region(start, end, prot, file.clone(), offset, length)
     }
 
     /// Remove any mapping in `[start, start+len)`, freeing backing pages.
@@ -201,7 +245,7 @@ impl AddressSpace {
             if r.start < start {
                 out.push(Region { end: start, ..r.clone() });
             }
-            out.push(Region { start: start.max(r.start), end: end.min(r.end), prot, grows_down: r.grows_down });
+            out.push(Region { start: start.max(r.start), end: end.min(r.end), prot, grows_down: r.grows_down, backing: r.backing.clone() });
             if end < r.end {
                 out.push(Region { start: end, ..r.clone() });
             }
@@ -329,12 +373,17 @@ impl AddressSpace {
             }
         }
         let phys = frame::alloc_user_page().ok_or(Errno::ENOMEM)?;
-        let mut fl = to_page_flags(r.prot);
-        if !write && r.prot.contains(Prot::WRITE) {
-            // A read fault leaves it writable; nothing shares a fresh page.
+        // File-backed page: fill from the file (zero tail past `length`).
+        if let Some(b) = &r.backing {
+            let page_off = (page - r.start) as u64;
+            if page_off < b.length {
+                let n = (b.length - page_off).min(PAGE_SIZE as u64) as usize;
+                let dst = unsafe { core::slice::from_raw_parts_mut(super::phys_to_virt(phys) as *mut u8, n) };
+                // A short read leaves the rest zero (already zeroed).
+                let _ = b.file.pread(b.offset + page_off, dst);
+            }
         }
-        let _ = fl;
-        fl = to_page_flags(r.prot);
+        let fl = to_page_flags(r.prot);
         unsafe {
             paging::map_4k(self.pml4, page, phys, fl, &mut alloc_table).map_err(map_err)?;
         }
@@ -446,7 +495,7 @@ impl AddressSpace {
             if let Some(r) = regions.iter_mut().find(|r| r.end == cur && r.start >= base && !r.grows_down) {
                 r.end = new;
             } else if !Self::overlaps(&regions, cur, new) {
-                regions.push(Region { start: base.max(cur), end: new, prot: Prot::READ | Prot::WRITE, grows_down: false });
+                regions.push(Region { start: base.max(cur), end: new, prot: Prot::READ | Prot::WRITE, grows_down: false, backing: None });
             } else {
                 return cur;
             }

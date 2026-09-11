@@ -91,7 +91,7 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
     let meta = crate::fs::ops::stat(&ctx, &path, true)?;
     crate::fs::perm::check(&me.cred(), &meta, crate::fs::perm::MAY_EXEC)?;
 
-    let (new_space, new_frame) = proc::elf::load(&data, &argv, &envp)?;
+    let (new_space, new_frame) = proc::elf::load(&ctx, &data, &argv, &envp)?;
     // Point of no return: swap the address space and run the new image.
     me.fds.lock().close_on_exec();
     *me.aspace.lock() = Some(new_space.clone());
