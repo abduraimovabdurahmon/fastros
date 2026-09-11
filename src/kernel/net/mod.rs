@@ -768,3 +768,170 @@ static mut POLL_FN: Option<PollFn> = None;
 pub fn register_poll(f: PollFn) {
     unsafe { POLL_FN = Some(f); }
 }
+
+// ── Client-side TCP connect ───────────────────────────────────────────────────
+
+static mut EPHEMERAL_PORT: u16 = 49152;
+
+fn alloc_ephemeral() -> u16 {
+    unsafe {
+        let p = EPHEMERAL_PORT;
+        EPHEMERAL_PORT = if EPHEMERAL_PORT >= 65534 { 49152 } else { EPHEMERAL_PORT + 1 };
+        p
+    }
+}
+
+/// Open an outgoing TCP connection to peer.
+/// Returns socket fd (state = SYN_SENT). Caller must poll_drivers() in a
+/// loop and check tcp_state_of(fd) == Established before sending data.
+pub fn tcp_connect(peer_ip: [u8; 4], peer_port: u16) -> Option<usize> {
+    let fd = socket::socket(socket::AF_INET, socket::SOCK_STREAM, socket::IPPROTO_TCP)?;
+    let local_port = alloc_ephemeral();
+    let our_ip = primary_ip();
+
+    if let Some(s) = socket::get_mut(fd) {
+        s.local_ip   = our_ip;
+        s.local_port = local_port;
+        s.peer_ip    = peer_ip;
+        s.peer_port  = peer_port;
+        s.snd_nxt    = 0xFA57_0001u32;
+        s.snd_una    = s.snd_nxt;
+        s.tcp_state  = tcp::TcpState::SynSent;
+    } else {
+        socket::close(fd);
+        return None;
+    }
+
+    // Try to send SYN; if ARP is not yet resolved the SYN will be queued
+    // after the ARP reply arrives on the next poll_drivers() call by the caller.
+    tcp_send_syn_fd(fd);
+    Some(fd)
+}
+
+/// Send a TCP SYN for the given socket fd (internal helper).
+fn tcp_send_syn_fd(fd: usize) {
+    let (peer_ip, peer_port, local_port, snd_nxt) = {
+        let s = match socket::get(fd) { Some(s) => s, None => return };
+        (s.peer_ip, s.peer_port, s.local_port, s.snd_nxt)
+    };
+
+    let hop = match route::lookup(&peer_ip) { Some(h) => h, None => return };
+    let nexthop: [u8; 4] = if hop.gateway == [0u8; 4] { peer_ip } else { hop.gateway };
+    let our_ip  = unsafe { DEVS[hop.dev_idx].ip };
+    let our_mac = unsafe { DEVS[hop.dev_idx].mac };
+
+    let dst_mac = match arp::lookup(&nexthop) {
+        Some(m) => m,
+        None => {
+            // Trigger ARP; SYN will be sent by caller after poll_drivers()
+            unsafe {
+                let n = arp::build_request(&mut TX_BUF, &our_mac, &our_ip, &nexthop);
+                raw_send(hop.dev_idx, &TX_BUF[..n]);
+            }
+            return;
+        }
+    };
+
+    let seg_len = tcp::TCP_HLEN as u16;
+    let pseudo  = ip::pseudo_header_acc(&our_ip, &peer_ip, ip::IPPROTO_TCP, seg_len);
+    let mut syn_seg = [0u8; 20];
+    let n = tcp::build(
+        &mut syn_seg, local_port, peer_port,
+        snd_nxt, 0, tcp::TCP_SYN, tcp::TCP_WINDOW_DEFAULT, &[], pseudo,
+    );
+    if n == 0 { return; }
+    unsafe {
+        let frame = build_ip_frame(&mut TX_BUF, &our_mac, &dst_mac,
+                                   &our_ip, &peer_ip, ip::IPPROTO_TCP, &syn_seg[..n]);
+        raw_send(hop.dev_idx, &TX_BUF[..frame]);
+    }
+}
+
+/// Close an established TCP connection (send FIN+ACK).
+pub fn tcp_close(fd: usize) {
+    let state = match socket::get(fd) { Some(s) => s.tcp_state, None => { socket::close(fd); return; } };
+    if !matches!(state, tcp::TcpState::Established | tcp::TcpState::CloseWait) {
+        socket::close(fd);
+        return;
+    }
+
+    let (peer_ip, peer_port, local_port, snd_nxt, rcv_nxt) = {
+        let s = match socket::get_mut(fd) { Some(s) => s, None => { socket::close(fd); return; } };
+        s.tcp_state = tcp::TcpState::FinWait1;
+        (s.peer_ip, s.peer_port, s.local_port, s.snd_nxt, s.rcv_nxt)
+    };
+
+    let hop = match route::lookup(&peer_ip) { Some(h) => h, None => { socket::close(fd); return; } };
+    let nexthop: [u8; 4] = if hop.gateway == [0u8; 4] { peer_ip } else { hop.gateway };
+    let our_ip  = unsafe { DEVS[hop.dev_idx].ip };
+    let our_mac = unsafe { DEVS[hop.dev_idx].mac };
+    let dst_mac = match arp::lookup(&nexthop) { Some(m) => m, None => { socket::close(fd); return; } };
+
+    let seg_len = tcp::TCP_HLEN as u16;
+    let pseudo  = ip::pseudo_header_acc(&our_ip, &peer_ip, ip::IPPROTO_TCP, seg_len);
+    let mut fin_seg = [0u8; 20];
+    let n = tcp::build(
+        &mut fin_seg, local_port, peer_port,
+        snd_nxt, rcv_nxt, tcp::TCP_FIN | tcp::TCP_ACK, tcp::TCP_WINDOW_DEFAULT, &[], pseudo,
+    );
+    if n > 0 {
+        unsafe {
+            let frame = build_ip_frame(&mut TX_BUF, &our_mac, &dst_mac,
+                                       &our_ip, &peer_ip, ip::IPPROTO_TCP, &fin_seg[..n]);
+            raw_send(hop.dev_idx, &TX_BUF[..frame]);
+        }
+        if let Some(s) = socket::get_mut(fd) { s.snd_nxt = s.snd_nxt.wrapping_add(1); }
+    }
+    socket::close(fd);
+}
+
+/// Return the current TCP state of a socket, or Closed if not found.
+pub fn tcp_state_of(fd: usize) -> tcp::TcpState {
+    socket::get(fd).map(|s| s.tcp_state).unwrap_or(tcp::TcpState::Closed)
+}
+
+/// Re-send the SYN for a socket that is still in SYN_SENT state.
+/// Call this in a poll loop when ARP may have just resolved.
+pub fn tcp_retry_syn(fd: usize) {
+    if tcp_state_of(fd) == tcp::TcpState::SynSent {
+        tcp_send_syn_fd(fd);
+    }
+}
+
+/// Drain bytes from a TCP socket's RX buffer.
+pub fn tcp_recv(fd: usize, buf: &mut [u8]) -> usize {
+    match socket::get_mut(fd) { Some(s) => s.rx_pop(buf), None => 0 }
+}
+
+/// Returns how many bytes are in a socket's RX buffer.
+pub fn tcp_rx_available(fd: usize) -> usize {
+    socket::get(fd).map(|s| s.rx_available()).unwrap_or(0)
+}
+
+// ── UDP datagram send ─────────────────────────────────────────────────────────
+
+static mut UDP_TX_SCRATCH: [u8; 576] = [0; 576];
+
+/// Send a raw UDP datagram to peer (no socket binding required for TX).
+pub fn udp_send_to(
+    peer_ip:  &[u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    data:     &[u8],
+) -> bool {
+    if data.len() + udp::UDP_HLEN > 568 { return false; }
+    let our_ip = primary_ip();
+    let pseudo = ip::pseudo_header_acc(
+        &our_ip, peer_ip, ip::IPPROTO_UDP,
+        (udp::UDP_HLEN + data.len()) as u16,
+    );
+    let n = unsafe { udp::build(&mut UDP_TX_SCRATCH, src_port, dst_port, data, pseudo) };
+    if n == 0 { return false; }
+    unsafe { send_ipv4(peer_ip, ip::IPPROTO_UDP, &UDP_TX_SCRATCH[..n]) }
+}
+
+/// Drain bytes from a UDP socket's RX buffer.
+/// Note: rcv_udp() prepends 6 bytes (4=src_ip + 2=src_port) before each datagram.
+pub fn udp_recv(fd: usize, buf: &mut [u8]) -> usize {
+    match socket::get_mut(fd) { Some(s) => s.rx_pop(buf), None => 0 }
+}

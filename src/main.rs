@@ -16,6 +16,7 @@ use core::panic::PanicInfo;
 mod arch;
 mod container;
 mod drivers;
+mod fastman;
 mod fs;
 mod hal;
 mod kernel;
@@ -104,6 +105,9 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── Layer 6: Container runtime ─────────────────────────────────────────
     container::init();
+
+    // ── Layer 6: fastman (container image manager) ─────────────────────────
+    fastman::init();
 
     // ── Layer 7: Orchestration layer ───────────────────────────────────────
     orchestrator::init();
