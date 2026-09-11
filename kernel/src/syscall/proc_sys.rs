@@ -85,14 +85,11 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
         argv.push(path.clone());
     }
     let ctx = crate::fs::ops::Ctx::of(&me);
-    let data = crate::fs::ops::read_file(&ctx, &path)?;
-    if data.len() < 4 || &data[..4] != b"\x7fELF" {
-        // Interpreter scripts (#!) could be handled here later.
-        return Err(Errno::ENOEXEC);
-    }
     // Verify it is executable by this process.
     let meta = crate::fs::ops::stat(&ctx, &path, true)?;
     crate::fs::perm::check(&me.cred(), &meta, crate::fs::perm::MAY_EXEC)?;
+    // Resolve `#!` interpreter scripts, rewriting argv accordingly.
+    let (data, argv) = proc::elf::read_exec(&ctx, &path, &argv)?;
 
     let (new_space, new_frame) = proc::elf::load(&ctx, &data, &argv, &envp)?;
     // Point of no return: swap the address space and run the new image.

@@ -192,6 +192,63 @@ fn build_stack(space: &AddressSpace, obj: &Object, at_base: Option<usize>, argv:
 
 /// Load `data` (a program image) into a new address space, resolving a
 /// dynamic interpreter through `ctx` if the program needs one.
+/// Locate a program: an explicit path (containing `/`) is used as-is, otherwise
+/// it is searched on a small default `PATH` so `sh`/`busybox` resolve without an
+/// absolute path.
+pub fn find_program(ctx: &Ctx, prog: &str) -> KResult<String> {
+    if prog.contains('/') {
+        ops::stat(ctx, prog, true)?;
+        return Ok(String::from(prog));
+    }
+    for dir in ["/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin"] {
+        let p = alloc::format!("{dir}/{prog}");
+        if ops::stat(ctx, &p, true).is_ok() {
+            return Ok(p);
+        }
+    }
+    Err(Errno::ENOENT)
+}
+
+/// Read an executable, following `#!` interpreter scripts (up to a small depth).
+/// Returns the final ELF image and the argv to run it with: for a script the
+/// argv becomes `[interp, optional-arg, script-path, original-args...]`, exactly
+/// as the kernel rewrites it on Linux.
+pub fn read_exec(ctx: &Ctx, path: &str, argv: &[String]) -> KResult<(Vec<u8>, Vec<String>)> {
+    let mut path = String::from(path);
+    let mut argv: Vec<String> = argv.to_vec();
+    for _ in 0..4 {
+        let data = ops::read_file(ctx, &path)?;
+        if data.len() >= 4 && &data[..4] == b"\x7fELF" {
+            return Ok((data, argv));
+        }
+        if data.len() >= 2 && &data[..2] == b"#!" {
+            let end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+            let line = core::str::from_utf8(&data[2..end]).map_err(|_| Errno::ENOEXEC)?.trim();
+            let mut it = line.splitn(2, |c: char| c == ' ' || c == '\t');
+            let interp = it.next().unwrap_or("").trim();
+            if interp.is_empty() {
+                return Err(Errno::ENOEXEC);
+            }
+            let arg = it.next().map(str::trim).filter(|s| !s.is_empty());
+            let script = path.clone();
+            let mut new_argv = Vec::with_capacity(argv.len() + 2);
+            new_argv.push(String::from(interp));
+            if let Some(a) = arg {
+                new_argv.push(String::from(a));
+            }
+            new_argv.push(script);
+            if argv.len() > 1 {
+                new_argv.extend_from_slice(&argv[1..]);
+            }
+            argv = new_argv;
+            path = String::from(interp);
+            continue;
+        }
+        return Err(Errno::ENOEXEC);
+    }
+    Err(Errno::ELOOP)
+}
+
 pub fn load(ctx: &Ctx, data: &[u8], argv: &[String], envp: &[String]) -> KResult<(Arc<AddressSpace>, UserFrame)> {
     let space = AddressSpace::new()?;
     let etype = rd_u16(data, 16);

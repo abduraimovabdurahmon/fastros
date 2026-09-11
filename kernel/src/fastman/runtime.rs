@@ -176,7 +176,8 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
     if argv.is_empty() {
         return Err(Errno::EINVAL);
     }
-    let data = resolve_program(&cctx, &argv[0])?;
+    let real = proc::elf::find_program(&cctx, &argv[0])?;
+    let (data, argv) = proc::elf::read_exec(&cctx, &real, &argv)?;
     let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
 
     // stdio: /dev/null in, a pipe out to the logger.
@@ -229,20 +230,6 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         }
     });
     Ok((pid, logger))
-}
-
-/// Read a program image from the container, following a couple of `PATH`
-/// fallbacks so `sh`/`busybox` are found without an absolute path.
-fn resolve_program(cctx: &Ctx, prog: &str) -> KResult<Vec<u8>> {
-    if prog.contains('/') {
-        return ops::read_file(cctx, prog);
-    }
-    for dir in ["/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin"] {
-        if let Ok(d) = ops::read_file(cctx, &format!("{dir}/{prog}")) {
-            return Ok(d);
-        }
-    }
-    Err(Errno::ENOENT)
 }
 
 /// `fastman run`: create + start. Foreground waits and returns the exit code;
@@ -345,9 +332,14 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
     if argv.is_empty() {
         return Err(Errno::EINVAL);
     }
-    let fs = build_fs(ctx, &c)?;
+    // Reuse the running container's own mount namespace (its overlay), so exec
+    // sees exactly the filesystem the init process sees — a rebuilt overlay
+    // would have a fresh, empty writable layer.
+    let init = proc::find(c.pid).ok_or(Errno::ESRCH)?;
+    let fs = init.fs.lock().clone();
     let cctx = Ctx { fs: fs.clone(), cred: ctx.cred.clone() };
-    let data = resolve_program(&cctx, &argv[0])?;
+    let real = proc::elf::find_program(&cctx, &argv[0])?;
+    let (data, argv) = proc::elf::read_exec(&cctx, &real, &argv)?;
     let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
 
     let (r, w) = pipe::pipe();
