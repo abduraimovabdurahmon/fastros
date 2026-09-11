@@ -209,6 +209,15 @@ pub fn clock_nanosleep(_clk: u32, _flags: i32, req: usize, rem: usize) -> KResul
     nanosleep(req, rem)
 }
 
+/// `rt_sigsuspend`: wait until a signal arrives, then return EINTR (its only
+/// return). We don't swap the signal mask (handlers are not yet delivered to
+/// user mode), so this is a plain interruptible wait — enough for a service
+/// master loop that parks here between events.
+pub fn rt_sigsuspend() -> KResult<usize> {
+    let _ = crate::sched::sleep_ms(1000);
+    Err(Errno::EINTR)
+}
+
 /// `sched_getaffinity(pid, cpusetsize, mask)`: report a single online CPU.
 /// glibc's `get_nprocs()` derives the worker count from this, so a program like
 /// nginx sizes its worker pool from what we return here.

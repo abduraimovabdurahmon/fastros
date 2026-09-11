@@ -269,6 +269,80 @@ impl File for PipeEnd {
     }
 }
 
+/// One end of a `socketpair(2)`: a bidirectional stream built from two pipes
+/// (read from one, write to the other). Used for AF_UNIX SOCK_STREAM pairs,
+/// which servers like nginx use for their master↔worker command channel.
+pub struct Duplex {
+    rx: Arc<PipeEnd>,
+    tx: Arc<PipeEnd>,
+    flags: AtomicU32,
+    ino: u64,
+}
+
+/// A connected pair of duplex stream endpoints.
+pub fn socketpair() -> (Arc<Duplex>, Arc<Duplex>) {
+    let a = Pipe::new();
+    let b = Pipe::new();
+    let e0 = Arc::new(Duplex {
+        rx: a.open(false, false),
+        tx: b.open(true, false),
+        flags: AtomicU32::new(flags::O_RDWR),
+        ino: NEXT_PIPE_INO.fetch_add(1, Ordering::Relaxed),
+    });
+    let e1 = Arc::new(Duplex {
+        rx: b.open(false, false),
+        tx: a.open(true, false),
+        flags: AtomicU32::new(flags::O_RDWR),
+        ino: NEXT_PIPE_INO.fetch_add(1, Ordering::Relaxed),
+    });
+    (e0, e1)
+}
+
+impl File for Duplex {
+    fn read(&self, buf: &mut [u8]) -> KResult<usize> {
+        self.rx.set_flags(self.flags.load(Ordering::Relaxed));
+        self.rx.read(buf)
+    }
+    fn write(&self, buf: &[u8]) -> KResult<usize> {
+        self.tx.set_flags(self.flags.load(Ordering::Relaxed));
+        self.tx.write(buf)
+    }
+    fn stat(&self) -> KResult<Metadata> {
+        let now = Timespec::now();
+        Ok(Metadata { dev: 0, ino: self.ino, kind: FileType::Socket, perm: 0o600, nlink: 1, uid: 0, gid: 0, size: 0, blocks: 0, blksize: PIPE_BUF as u32, rdev: 0, atime: now, mtime: now, ctime: now })
+    }
+    fn poll(&self) -> Poll {
+        let mut p = Poll(0);
+        let r = self.rx.poll();
+        if r.contains(Poll::IN) {
+            p = p | Poll::IN;
+        }
+        if r.contains(Poll::HUP) {
+            p = p | Poll::HUP;
+        }
+        if self.tx.poll().contains(Poll::OUT) {
+            p = p | Poll::OUT;
+        }
+        p
+    }
+    fn wait_queue(&self) -> Option<&WaitQueue> {
+        self.rx.wait_queue()
+    }
+    fn ioctl(&self, req: u32, arg: usize) -> KResult<usize> {
+        self.rx.ioctl(req, arg)
+    }
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+    fn set_flags(&self, f: u32) {
+        let old = self.flags.load(Ordering::Relaxed);
+        self.flags.store((old & !flags::SETFL_MASK) | (f & flags::SETFL_MASK), Ordering::Relaxed);
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl Drop for PipeEnd {
     fn drop(&mut self) {
         {

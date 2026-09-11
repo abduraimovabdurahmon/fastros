@@ -2,7 +2,7 @@
 //! kernel TCP/UDP stack, plus a level-triggered `epoll` implementation.
 
 use crate::errno::{Errno, KResult};
-use crate::fs::file::{File, Poll};
+use crate::fs::file::{flags, File, Poll};
 use crate::net::sockfile::{self, SocketFile};
 use crate::net::{IpAddress, IpEndpoint, SOCK_WQ};
 use crate::proc;
@@ -115,6 +115,26 @@ pub fn accept(fd: i32, addr: usize, addrlen: usize) -> KResult<usize> {
 
 pub fn accept4(fd: i32, addr: usize, addrlen: usize, flags: i32) -> KResult<usize> {
     do_accept(fd, addr, addrlen, flags)
+}
+
+/// `socketpair(2)`: a connected bidirectional stream pair. Callers (nginx's
+/// master↔worker channel, libc) use AF_UNIX SOCK_STREAM; we return a duplex
+/// pipe pair regardless of the address family.
+pub fn socketpair(_domain: i32, ty: i32, _protocol: i32, sv: usize) -> KResult<usize> {
+    let (a, b) = crate::fs::pipe::socketpair();
+    if ty & sockfile::SOCK_NONBLOCK != 0 {
+        a.set_flags(flags::O_NONBLOCK);
+        b.set_flags(flags::O_NONBLOCK);
+    }
+    let cloexec = ty & sockfile::SOCK_CLOEXEC != 0;
+    let t = proc::current();
+    let mut fds = t.fds.lock();
+    let fd0 = fds.alloc(a, cloexec, 0)? as i32;
+    let fd1 = fds.alloc(b, cloexec, 0)? as i32;
+    drop(fds);
+    uaccess::write_obj(sv, &fd0)?;
+    uaccess::write_obj(sv + 4, &fd1)?;
+    Ok(0)
 }
 
 pub fn getsockname(fd: i32, addr: usize, addrlen: usize) -> KResult<usize> {

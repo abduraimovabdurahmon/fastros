@@ -117,6 +117,8 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         54 => ret(net::setsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize, a[4] as usize)),
         55 => ret(net::getsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize, a[4] as usize)),
         288 => ret(net::accept4(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32)),
+        53 => ret(net::socketpair(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize)),
+        130 => ret(proc_sys::rt_sigsuspend()),
         40 => ret(net::sendfile(a[0] as i32, a[1] as i32, a[2] as usize, a[3] as usize)),
         213 => ret(net::epoll_create(a[0] as i32)),
         232 => ret(net::epoll_wait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32)),
