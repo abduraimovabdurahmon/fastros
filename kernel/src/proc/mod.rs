@@ -339,11 +339,19 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
 
 /// Start a user process: spawn a task that enters ring 3 at `frame` under
 /// `aspace`. The task's CR3 is set before it can be scheduled.
-pub fn start_user(mut s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame) -> KResult<Arc<Process>> {
+pub fn start_user(s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame) -> KResult<Arc<Process>> {
+    start_user_with(s, aspace, frame, 0)
+}
+
+/// Like [`start_user`], but the initial task inherits `fs_base` (the thread
+/// pointer). `fork` uses this so the child keeps the parent's TLS; a fresh
+/// `execve`/exec passes 0 (the new program sets it up via `arch_prctl`).
+pub fn start_user_with(mut s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame, fs_base: u64) -> KResult<Arc<Process>> {
     s.aspace = Some(aspace.clone());
     let p = spawn(s, move || unsafe { enter_user(&frame) })?;
     if let Some(t) = p.tasks().into_iter().next() {
         t.cr3.store(aspace.pml4(), core::sync::atomic::Ordering::Release);
+        t.fs_base.store(fs_base, core::sync::atomic::Ordering::Release);
     }
     Ok(p)
 }

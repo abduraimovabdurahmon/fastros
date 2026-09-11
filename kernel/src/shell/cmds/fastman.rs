@@ -386,6 +386,10 @@ fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
     };
     let detach = opts.detach;
     let fc = fs_ctx(ctx);
+    // Distinguish "no such image" from "command not found inside the image".
+    if image::resolve(&fc, &image_name).is_none() {
+        return ctx.fail(format!("Unable to find image '{image_name}' locally (try `fastman pull {image_name}`)"));
+    }
     let tee = if detach { None } else { runtime::caller_stdout(&ctx.proc) };
     ctx.flush();
     match runtime::run(&fc, &image_name, opts, tee) {
@@ -397,7 +401,7 @@ fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
                 code
             }
         }
-        Err(crate::errno::Errno::ENOENT) => ctx.fail(format!("Unable to find image '{image_name}' locally (try `fastman pull {image_name}`)")),
+        Err(crate::errno::Errno::ENOENT) => ctx.fail(format!("exec: command not found in image (cmd resolves to no executable)")),
         Err(e) => ctx.fail_errno("run", e),
     }
 }

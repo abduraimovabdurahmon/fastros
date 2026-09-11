@@ -31,7 +31,10 @@ pub fn fork(frame: &UserFrame) -> KResult<usize> {
     let spawn = Spawn::from_parent(&parent, &parent.comm(), parent.cmdline());
     let mut child_frame = *frame;
     child_frame.rax = 0; // fork returns 0 in the child
-    let child = proc::start_user(spawn, child_space, child_frame)?;
+    // The child inherits the parent's thread pointer (FS base): glibc resumes
+    // right after the fork syscall and immediately reads %fs:0x10 (the TCB).
+    let fs_base = crate::sched::with_current(|t| t.fs_base.load(core::sync::atomic::Ordering::Relaxed));
+    let child = proc::start_user_with(spawn, child_space, child_frame, fs_base)?;
     Ok(child.pid as usize)
 }
 
