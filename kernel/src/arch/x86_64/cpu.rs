@@ -106,13 +106,16 @@ pub fn rflags() -> u64 {
 pub fn irqs_enabled() -> bool {
     rflags() & RFLAGS_IF != 0
 }
+// `cli`/`sti` must be compiler barriers (no `nomem`): otherwise the compiler
+// may move a spinlock's acquire above the `cli` or its release below the
+// `sti`, opening a window where an IRQ handler finds the lock held.
 #[inline]
 pub fn irq_disable() {
-    unsafe { asm!("cli", options(nomem, nostack)) };
+    unsafe { asm!("cli", options(nostack)) };
 }
 #[inline]
 pub fn irq_enable() {
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    unsafe { asm!("sti", options(nostack)) };
 }
 /// Disable interrupts, returning whether they were enabled.
 #[inline]
@@ -131,7 +134,7 @@ pub fn irq_restore(was_enabled: bool) {
 /// the interrupt shadow of `sti` guarantees no IRQ is lost in between).
 #[inline]
 pub fn enable_and_halt() {
-    unsafe { asm!("sti; hlt", options(nomem, nostack)) };
+    unsafe { asm!("sti; hlt", options(nostack)) };
 }
 pub fn halt_forever() -> ! {
     loop {
@@ -345,7 +348,8 @@ impl IrqGuard {
 impl Drop for IrqGuard {
     #[inline]
     fn drop(&mut self) {
-        irq_restore(self.0)
+        // Deferred while a spinlock is still held (see `sync::restore_irqs`).
+        crate::sync::restore_irqs(self.0)
     }
 }
 
