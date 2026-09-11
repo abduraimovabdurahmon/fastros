@@ -6,7 +6,7 @@
 //! runs with the caller's credentials (rootless); no privilege is required.
 
 use super::container::{Container, Port, State, Volume};
-use super::{extract, image};
+use super::image;
 use crate::errno::{Errno, KResult};
 use crate::fs::file::{flags, File};
 use crate::fs::mount::{MountFlags, MountNamespace};
@@ -56,8 +56,9 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
     }
     let dir = format!("{}/{id}", super::store::containers_dir(ctx));
     ops::mkdir(ctx, &dir, 0o700)?;
-    // Writable rootfs = a copy of the read-only image tree (overlay later).
-    extract::copy_tree(ctx, &image::rootfs_path(ctx, &image_id), &format!("{dir}/rootfs"))?;
+    // No up-front copy: the writable rootfs is an overlay built at start time
+    // (read-only image lower + a per-container writable upper), so a container
+    // starts instantly regardless of image size and the image is never mutated.
 
     let mut env = cfg.env.clone();
     // Overrides win over image defaults for the same key.
@@ -88,19 +89,28 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
 }
 
 /// Build the container's isolated mount namespace and filesystem context.
+///
+/// The root is an overlay of the read-only image rootfs (lower) and a fresh
+/// writable tmpfs (upper), so nothing is copied and writes never touch the
+/// image. `/proc`, `/dev`, `/tmp` are container-private mounts; volumes bind
+/// explicit host paths in.
 fn build_fs(ctx: &Ctx, c: &Container) -> KResult<FsContext> {
-    let rootfs = c.rootfs(ctx);
-    // Ensure the standard mount points exist inside the rootfs.
-    for d in ["proc", "dev", "tmp", "sys"] {
-        let _ = ops::mkdir(ctx, &format!("{rootfs}/{d}"), 0o755);
-    }
-    let root_dir = ctx.resolve(&rootfs, true)?;
-    let ns = MountNamespace::with_root(&root_dir, MountFlags::RW);
+    let lower = ctx.resolve(&image::rootfs_path(ctx, &c.image_id), true)?;
+    let upper = crate::fs::tmpfs::TmpFs::new(0);
+    let overlay = crate::fs::overlayfs::OverlayFs::new(lower.inode.clone(), upper);
+    let ns = MountNamespace::new(overlay, "overlay", MountFlags::RW);
     let root = ns.root();
+    // A Ctx pointed at the overlay so ops:: helpers act inside the container.
+    let oc = Ctx { fs: FsContext { ns: ns.clone(), root: root.clone(), cwd: root.clone(), umask: 0o022 }, cred: ctx.cred.clone() };
     let at = |path: &str| -> KResult<crate::fs::path::PathRef> {
         let r = crate::fs::path::Resolver { ns: &ns, root: &root, cwd: &root, cred: &ctx.cred };
         r.resolve(path, true)
     };
+    // Ensure the standard mount points exist in the overlay (created in the
+    // upper layer if the image did not ship them).
+    for d in ["proc", "dev", "tmp", "sys"] {
+        let _ = ops::mkdir(&oc, &format!("/{d}"), 0o755);
+    }
     // Container-private /proc, /dev, /tmp.
     let nodev = MountFlags { nosuid: true, nodev: true, ..MountFlags::RW };
     if let Ok(p) = at("/proc") {
@@ -118,7 +128,7 @@ fn build_fs(ctx: &Ctx, c: &Container) -> KResult<FsContext> {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let _ = ops::mkdir(ctx, &format!("{rootfs}{}", v.container), 0o755);
+        let _ = ops::mkdir(&oc, &v.container, 0o755);
         if let Ok(dst) = at(&v.container) {
             let fl = if v.read_only { MountFlags::RO } else { MountFlags::RW };
             let _ = ns.bind(&dst, &src, fl);

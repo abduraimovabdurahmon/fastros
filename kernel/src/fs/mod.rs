@@ -16,6 +16,7 @@ pub mod ext2fs;
 pub mod file;
 pub mod mount;
 pub mod ops;
+pub mod overlayfs;
 pub mod path;
 pub mod perm;
 pub mod pipe;
