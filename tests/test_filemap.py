@@ -113,3 +113,43 @@ def test_ld_reserve_fixed_relro(g, ldpat_bin):
     g.ok("base64 -d > /tmp/ldp && chmod +x /tmp/ldp", stdin=b64)
     out, err, st = g.run("fexec /tmp/ldp")
     assert "ld-pattern: 11 22 33" in out, out + err
+
+
+# Splitting a file-backed VMA (here via mprotect) must keep each remaining page
+# demand-filling from its OWN file offset. Regression for the bug that broke
+# large dynamic binaries (RELRO mprotect split the data segment; the tail then
+# read from the wrong offset).
+SPLIT = r"""
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#define P 4096
+int main(void){
+    int fd = open("/tmp/mapf3", O_RDWR|O_CREAT|O_TRUNC, 0644);
+    // 8 pages, each filled with its own page number as a byte.
+    for (int i=0;i<8;i++){ char buf[P]; memset(buf,i,P); write(fd,buf,P); }
+    unsigned char *m = mmap(0, 8*P, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (m==MAP_FAILED){ perror("mmap"); return 1; }
+    // Touch nothing in the tail yet. mprotect page 0 read-only -> splits the VMA.
+    mprotect(m, P, PROT_READ);
+    // Now read tail pages for the FIRST time: each must equal its page number.
+    int ok = 1;
+    for (int i=1;i<8;i++){ if (m[i*P] != i){ ok = 0; printf("page %d = %d (want %d)\n", i, m[i*P], i); } }
+    printf("split: %s\n", ok ? "OK" : "WRONG");
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def split_bin():
+    return _compile(SPLIT)
+
+
+def test_filebacked_split_offsets(g, split_bin):
+    b64 = base64.b64encode(split_bin).decode()
+    g.ok("base64 -d > /tmp/split && chmod +x /tmp/split", stdin=b64)
+    out, err, st = g.run("fexec /tmp/split")
+    assert "split: OK" in out, out + err
