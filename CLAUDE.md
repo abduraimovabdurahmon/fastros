@@ -35,6 +35,21 @@ docker compose logs -f                # serial console
 docker run --rm fastros test          # boot smoke test (SSH login round trip)
 ```
 
+Development loop (all in the `fastros-dev` image, see `tools/dev.sh`):
+
+```sh
+tools/dev.sh build                    # cargo build --release (kernel)
+tools/dev.sh unit                     # unit tests of lib/*
+tools/dev.sh up                       # boot the dev VM (container fastros-dev-vm)
+tools/dev.sh ssh 'ls -l /'            # run a command in the guest
+tools/dev.sh test -k grep             # pytest integration tests over SSH
+```
+
+Parallel checkouts (git worktrees) must not share a VM or build dir: export
+`FASTROS_VM=fastros-dev-vm-<name> FASTROS_NET=fastros-dev-net-<name>
+FASTROS_TARGET_VOL=fastros-target-<name>` before calling `tools/dev.sh`.
+Dev containers run with `--cpu-shares 256` so production services keep priority.
+
 Guest: e1000 on QEMU user-net, 10.0.2.15/24, gw 10.0.2.2, DNS 10.0.2.3.
 Guest SSH :22 → container :22 → host `${FASTROS_BIND}:${FASTROS_PORT}` (see `.env`).
 No KVM on this VPS → TCG.

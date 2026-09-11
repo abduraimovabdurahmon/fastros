@@ -14,9 +14,13 @@
 set -eu
 cd "$(dirname "$0")/.."
 IMG=fastros-dev
-VM=fastros-dev-vm
-NET=fastros-dev-net
-VOLS="-v $PWD:/src -v fastros-target:/src/target -v fastros-cargo:/usr/local/cargo/registry"
+# Parallel checkouts (git worktrees) set these to get their own VM and build dir.
+VM=${FASTROS_VM:-fastros-dev-vm}
+NET=${FASTROS_NET:-fastros-dev-net}
+TARGET=${FASTROS_TARGET_VOL:-fastros-target}
+# Dev containers yield the CPU to production services on the same host.
+PRIO="--cpu-shares 256"
+VOLS="$PRIO -v $PWD:/src -v $TARGET:/src/target -v fastros-cargo:/usr/local/cargo/registry"
 KERNEL=/src/target/x86_64-unknown-none/release/fastros
 
 run() { docker run --rm $VOLS "$@"; }
