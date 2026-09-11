@@ -149,6 +149,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
             // set_tid_address: we have no clear_child_tid; return the tid.
             crate::proc::current_tid() as u64
         }
+        202 => ret(proc_sys::futex(a[0] as usize, a[1] as i32, a[2] as u32, a[3] as usize, a[4] as usize, a[5] as u32)),
         228 => ret(proc_sys::clock_gettime(a[0] as u32, a[1] as usize)),
         229 => ret(proc_sys::clock_getres(a[0] as u32, a[1] as usize)),
         230 => ret(proc_sys::clock_nanosleep(a[0] as u32, a[1] as i32, a[2] as usize, a[3] as usize)),

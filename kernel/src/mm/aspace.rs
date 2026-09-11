@@ -351,6 +351,16 @@ impl AddressSpace {
         unsafe { paging::translate(self.pml4, va) }.map(|(p, _)| p)
     }
 
+    /// Physical address backing user virtual address `va`, faulting the page in
+    /// (for a read) first. Used to key futexes by their backing frame so a
+    /// futex in shared memory is matched across processes.
+    pub fn phys_translate(&self, va: usize) -> KResult<u64> {
+        let page = align_down(va, PAGE_SIZE);
+        self.fault_in(page, false)?;
+        let base = self.phys_of(page).ok_or(Errno::EFAULT)?;
+        Ok(base as u64 + (va & (PAGE_SIZE - 1)) as u64)
+    }
+
     /// Ensure the page containing `page` is present (allocating it), for a
     /// read or a write. Used by the kernel to touch user memory directly.
     fn fault_in(&self, page: usize, write: bool) -> KResult<()> {

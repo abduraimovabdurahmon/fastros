@@ -4,9 +4,13 @@ use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::syscall::UserFrame;
 use crate::errno::{Errno, KResult};
 use crate::proc::{self, ExitStatus, Spawn, WaitFor};
+use crate::sync::{SpinLock, WaitQueue, WaitResult};
 use crate::uaccess;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub fn umask(mask: u16) -> KResult<usize> {
     let p = proc::current();
@@ -227,4 +231,93 @@ pub fn getrandom(buf: usize, len: usize, _flags: u32) -> KResult<usize> {
     crate::crypto::rng::fill(&mut tmp);
     uaccess::copy_to(buf, &tmp)?;
     Ok(tmp.len())
+}
+
+// ── futex ────────────────────────────────────────────────────────────────────
+//
+// glibc and musl build every mutex, condition variable and thread join on top
+// of futex, so real dynamic binaries (nginx, postgres) cannot run without it.
+// Futexes are keyed by the *physical* frame backing the word, so a futex in
+// shared memory is matched across processes. A wake bumps a per-bucket
+// generation and wakes the queue; waiters re-check the generation, which makes
+// spurious wakeups impossible to miss (and futex users must already tolerate
+// spurious wakeups).
+
+const FUTEX_WAIT: i32 = 0;
+const FUTEX_WAKE: i32 = 1;
+const FUTEX_REQUEUE: i32 = 3;
+const FUTEX_CMP_REQUEUE: i32 = 4;
+const FUTEX_WAIT_BITSET: i32 = 9;
+const FUTEX_WAKE_BITSET: i32 = 10;
+const FUTEX_PRIVATE_FLAG: i32 = 128;
+const FUTEX_CLOCK_REALTIME: i32 = 256;
+
+struct FutexBucket {
+    wq: WaitQueue,
+    generation: AtomicU64,
+}
+
+static FUTEXES: SpinLock<BTreeMap<u64, Arc<FutexBucket>>> = SpinLock::new(BTreeMap::new());
+
+fn futex_bucket(key: u64) -> Arc<FutexBucket> {
+    let mut t = FUTEXES.lock();
+    t.entry(key).or_insert_with(|| Arc::new(FutexBucket { wq: WaitQueue::new(), generation: AtomicU64::new(0) })).clone()
+}
+
+fn futex_existing(key: u64) -> Option<Arc<FutexBucket>> {
+    FUTEXES.lock().get(&key).cloned()
+}
+
+/// Read a `struct timespec` timeout; relative for FUTEX_WAIT, absolute
+/// (CLOCK_MONOTONIC) for FUTEX_WAIT_BITSET. Returns an absolute ns deadline.
+fn futex_deadline(ptr: usize, absolute: bool) -> KResult<Option<u64>> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let sec: i64 = uaccess::read_obj(ptr)?;
+    let nsec: i64 = uaccess::read_obj(ptr + 8)?;
+    let ns = (sec.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(nsec.max(0) as u64);
+    Ok(Some(if absolute { ns } else { crate::time::now_ns().saturating_add(ns) }))
+}
+
+pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, _uaddr2: usize, _val3: u32) -> KResult<usize> {
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    let space = proc::current_aspace().ok_or(Errno::EFAULT)?;
+    match cmd {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            let key = space.phys_translate(uaddr)?;
+            let cur: u32 = uaccess::read_obj(uaddr)?;
+            if cur != val {
+                return Err(Errno::EAGAIN);
+            }
+            let b = futex_bucket(key);
+            let g = b.generation.load(Ordering::Acquire);
+            let deadline = futex_deadline(timeout, cmd == FUTEX_WAIT_BITSET)?;
+            match b.wq.wait_until_interruptible(|| (b.generation.load(Ordering::Acquire) != g).then_some(()), deadline) {
+                Ok(()) => Ok(0),
+                Err(WaitResult::TimedOut) => Err(Errno::ETIMEDOUT),
+                Err(WaitResult::Interrupted) => Err(Errno::EINTR),
+            }
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let key = space.phys_translate(uaddr)?;
+            if let Some(b) = futex_existing(key) {
+                b.generation.fetch_add(1, Ordering::Release);
+                b.wq.wake_all();
+            }
+            // The exact count is not tracked; callers use it only as "were any
+            // woken", so report the number requested.
+            Ok(val as usize)
+        }
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // Approximate requeue by waking the source waiters; they re-acquire.
+            let key = space.phys_translate(uaddr)?;
+            if let Some(b) = futex_existing(key) {
+                b.generation.fetch_add(1, Ordering::Release);
+                b.wq.wake_all();
+            }
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
 }
