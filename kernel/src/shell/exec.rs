@@ -737,9 +737,13 @@ impl Shell {
             }
         }
         let fds = self.proc.fds.lock().clone();
-        match self.spawn_argv(argv, fds, None, cred) {
+        // Only an interactive shell puts children in their own job group;
+        // commands run by `find -exec`, `xargs`, `env` stay in the caller's
+        // group so terminal ^C reaches them too.
+        let pgid = if self.interactive { None } else { Some(self.pgid()) };
+        match self.spawn_argv(argv, fds, pgid, cred) {
             Ok(child) => {
-                let pg = child.pid;
+                let pg = child.pgid.load(core::sync::atomic::Ordering::Relaxed);
                 self.wait_foreground(&[child], Some(pg))
             }
             Err((st, m)) => {
