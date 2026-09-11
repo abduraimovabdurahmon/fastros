@@ -209,11 +209,26 @@ const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Interest {
     fd: i32,
     events: u32,
     data: u64,
+    /// The open file this interest was registered against. Linux removes a
+    /// descriptor from every epoll set when it is closed; we instead check
+    /// identity here, so a closed (or reused) fd number never matches a stale
+    /// interest — a real client fd that reuses a number a probe left behind can
+    /// still be added.
+    file: alloc::sync::Weak<dyn File>,
+}
+
+impl Interest {
+    /// The registered file, if the fd still refers to the same open file.
+    fn live(&self) -> Option<Arc<dyn File>> {
+        let cur = fdt_get(self.fd).ok()?;
+        let reg = self.file.upgrade()?;
+        Arc::ptr_eq(&reg, &cur).then_some(cur)
+    }
 }
 
 /// A `struct epoll_event` is packed on x86_64: u32 events, then u64 data (12 B).
@@ -294,10 +309,17 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> KResult<usize> {
         match op {
             EPOLL_CTL_ADD => {
                 let (events, data) = read_epoll_event(event)?;
-                if list.iter().any(|i| i.fd == fd) {
-                    return Err(Errno::EEXIST);
+                let cur = fdt_get(fd)?;
+                // EEXIST only if the SAME open file is already registered; a
+                // stale interest left by a since-closed fd of this number is
+                // silently replaced.
+                if let Some(existing) = list.iter().find(|i| i.fd == fd) {
+                    if existing.file.upgrade().is_some_and(|f| Arc::ptr_eq(&f, &cur)) {
+                        return Err(Errno::EEXIST);
+                    }
                 }
-                list.push(Interest { fd, events, data });
+                list.retain(|i| i.fd != fd);
+                list.push(Interest { fd, events, data, file: Arc::downgrade(&cur) });
                 Ok(0)
             }
             EPOLL_CTL_MOD => {
@@ -323,10 +345,9 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> KResult<usize> {
 
 /// Ready events for one interest against its fd's current poll state.
 fn ready_events(it: &Interest) -> u32 {
-    let Ok(f) = fdt_get(it.fd) else {
-        // Linux removes a closed descriptor from every epoll set automatically,
-        // so a gone fd yields no events (rather than a synthesised ERR|HUP that
-        // a poll loop would spin on or mis-handle).
+    // A closed (or reused) fd number no longer matches the registered file, so
+    // it yields no events — Linux auto-removes closed descriptors from epoll.
+    let Some(f) = it.live() else {
         return 0;
     };
     let p = f.poll();
