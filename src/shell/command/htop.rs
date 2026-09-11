@@ -397,6 +397,10 @@ fn redraw(
     draw_fkeys(io, fkey_row, term_cols);
 
     io.move_cursor(0, PROC_ROW0 + (selected.saturating_sub(scroll)) as u16);
+    // Flush the entire frame as a single (or few) TCP write(s).
+    // Without this, each write_at/fill_row made 3 send_to_session calls
+    // → 300+ tiny TCP writes per redraw → silent failures → AES stream desync.
+    io.flush_output();
 }
 
 // ── Title bar (row 0) ─────────────────────────────────────────────────────────

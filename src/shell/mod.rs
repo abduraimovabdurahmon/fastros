@@ -58,6 +58,39 @@ impl ShellIo for VgaKeyboardIo {
     }
 }
 
+// ── SSH output buffer (batches TUI redraws into a few large TCP writes) ──────
+// Without batching, htop sends 300+ tiny SSH packets per redraw → tcp_write
+// failures corrupt the AES-CTR stream → arrow keys/session breaks.
+
+const SSH_OUT_BUF_SIZE: usize = 16384; // 16 KB per session (4 sessions = 64 KB BSS)
+static mut SSH_OUT_BUF: [[u8; SSH_OUT_BUF_SIZE]; 4] = [[0; SSH_OUT_BUF_SIZE]; 4];
+static mut SSH_OUT_LEN: [usize; 4] = [0; 4];
+
+fn ssh_out_push(idx: usize, data: &[u8]) {
+    unsafe {
+        let len = &mut SSH_OUT_LEN[idx];
+        let available = SSH_OUT_BUF_SIZE.saturating_sub(*len);
+        let n = data.len().min(available);
+        SSH_OUT_BUF[idx][*len..*len + n].copy_from_slice(&data[..n]);
+        *len += n;
+    }
+}
+
+/// Flush the per-session output buffer to TCP in ≤1400-byte SSH channel chunks.
+fn ssh_out_flush(idx: usize) {
+    unsafe {
+        let len = SSH_OUT_LEN[idx];
+        if len == 0 { return; }
+        let mut off = 0;
+        while off < len {
+            let chunk = (len - off).min(1400);
+            crate::kernel::net::ssh::send_to_session(idx, &SSH_OUT_BUF[idx][off..off + chunk]);
+            off += chunk;
+        }
+        SSH_OUT_LEN[idx] = 0;
+    }
+}
+
 // ── ANSI helpers for SSH full-screen rendering ────────────────────────────────
 
 // VGA color order: 0=Black,1=Blue,2=Green,3=Cyan,4=Red,5=Magenta,6=Brown,7=LightGray
@@ -198,33 +231,33 @@ impl ShellIo for SshIo {
     fn put_char_at(&mut self, col: u16, row: u16, ch: u8, color: u8) {
         let mut hdr = [0u8; 24];
         let hn = build_ansi_hdr(&mut hdr, col, row, color);
-        crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
-        crate::kernel::net::ssh::send_to_session(self.0, &[ch]);
-        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
+        ssh_out_push(self.0, &hdr[..hn]);
+        ssh_out_push(self.0, &[ch]);
+        ssh_out_push(self.0, b"\x1b[0m");
     }
 
     fn write_at(&mut self, col: u16, row: u16, s: &[u8], color: u8) {
         if s.is_empty() { return; }
         let mut hdr = [0u8; 24];
         let hn = build_ansi_hdr(&mut hdr, col, row, color);
-        crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
-        crate::kernel::net::ssh::send_to_session(self.0, s);
-        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
+        ssh_out_push(self.0, &hdr[..hn]);
+        ssh_out_push(self.0, s);
+        ssh_out_push(self.0, b"\x1b[0m");
     }
 
     fn fill_row(&mut self, row: u16, ch: u8, color: u8) {
         let cols = self.screen_cols() as usize;
         let mut hdr = [0u8; 24];
         let hn = build_ansi_hdr(&mut hdr, 0, row, color);
-        crate::kernel::net::ssh::send_to_session(self.0, &hdr[..hn]);
+        ssh_out_push(self.0, &hdr[..hn]);
         let chunk = [ch; 64];
         let mut sent = 0;
         while sent < cols {
             let n = (cols - sent).min(64);
-            crate::kernel::net::ssh::send_to_session(self.0, &chunk[..n]);
+            ssh_out_push(self.0, &chunk[..n]);
             sent += n;
         }
-        crate::kernel::net::ssh::send_to_session(self.0, b"\x1b[0m");
+        ssh_out_push(self.0, b"\x1b[0m");
     }
 
     fn move_cursor(&mut self, col: u16, row: u16) {
@@ -236,7 +269,11 @@ impl ShellIo for SshIo {
         buf[n] = b';'; n += 1;
         n += ansi_u16(&mut buf[n..], col + 1);
         buf[n] = b'H'; n += 1;
-        crate::kernel::net::ssh::send_to_session(self.0, &buf[..n]);
+        ssh_out_push(self.0, &buf[..n]);
+    }
+
+    fn flush_output(&mut self) {
+        ssh_out_flush(self.0);
     }
 
     fn enter_altscreen(&mut self) {

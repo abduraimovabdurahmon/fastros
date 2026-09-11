@@ -77,6 +77,10 @@ pub trait ShellIo {
     /// Exit alternate screen + show cursor. No-op by default.
     fn exit_altscreen(&mut self) {}
 
+    /// Flush any pending buffered output to the underlying transport.
+    /// No-op by default (VGA writes are unbuffered).
+    fn flush_output(&mut self) {}
+
     /// Screen width in columns.
     fn screen_cols(&self) -> u16 { 80 }
 
