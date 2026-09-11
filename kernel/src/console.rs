@@ -79,6 +79,7 @@ pub fn start_getty() {
             ctty: Some(tty.clone()),
             uts: kernel.uts.clone(),
             container: None,
+            ignored: 0,
         };
         let u = user.clone();
         if let Ok(p) = crate::proc::spawn(spawn, move || crate::shell::login_shell_main(u)) {

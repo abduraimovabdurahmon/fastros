@@ -678,55 +678,73 @@ impl Shell {
         }
     }
 
+    /// Start an already-expanded command line as a child of this shell's
+    /// process without waiting: natives and scripts run directly, builtins
+    /// and functions in a subshell. `Err((status, message))` when nothing
+    /// could be started (127 not found, 126 not executable).
+    pub fn spawn_argv(&mut self, argv: Vec<String>, fds: FdTable, pgid: Option<Pid>, cred: Option<crate::fs::perm::Cred>) -> Result<Arc<Process>, (i32, String)> {
+        let Some(name) = argv.first().cloned() else { return Err((0, String::new())) };
+        let with_cred = |mut s: Spawn| {
+            if let Some(c) = &cred {
+                s.cred = c.clone();
+            }
+            s
+        };
+        match self.resolve(&name) {
+            Target::Native(def) => {
+                let s = with_cred(self.spawn_opts(def.name, argv.clone(), &[], fds, pgid));
+                proc::spawn(s, move || {
+                    let mut ctx = super::ctx::Ctx::new(proc::current(), argv);
+                    cmds::invoke(def, &mut ctx)
+                })
+                .map_err(|e| (126, alloc::format!("{name}: {e}")))
+            }
+            Target::Script(path) => {
+                let saved = self.proc.cred();
+                if let Some(c) = &cred {
+                    // Scripts inherit the credentials through the spawn below.
+                    *self.proc.cred.lock() = c.clone();
+                }
+                let r = self.spawn_script(&path, argv, &[], fds, pgid);
+                *self.proc.cred.lock() = saved;
+                r.map_err(|m| (126, m))
+            }
+            Target::Builtin(_) | Target::Function(_) => {
+                let words = argv.iter().map(|a| fastros_sh::quote(a)).collect::<Vec<_>>().join(" ");
+                let list = fastros_sh::parse(&words).map_err(|e| (2, e.msg))?;
+                let saved = self.proc.cred();
+                if let Some(c) = &cred {
+                    *self.proc.cred.lock() = c.clone();
+                }
+                let r = self.spawn_subshell(Command::Group { body: alloc::boxed::Box::new(list), redirs: Vec::new() }, fds, pgid, &name);
+                *self.proc.cred.lock() = saved;
+                r.map_err(|e| (126, alloc::format!("fork: {e}")))
+            }
+            Target::NotFound => Err((127, alloc::format!("{name}: command not found"))),
+            Target::NotExecutable(p, e) => Err((126, alloc::format!("{p}: {e}"))),
+        }
+    }
+
     /// Run an already-expanded command line as a foreground child of this
     /// shell's process, optionally with different credentials (`sudo`).
     pub fn run_argv_with(&mut self, argv: Vec<String>, cred: Option<crate::fs::perm::Cred>) -> i32 {
         let Some(name) = argv.first().cloned() else { return 0 };
+        if cred.is_none() {
+            match self.resolve(&name) {
+                Target::Builtin(b) => return (b.run)(self, &argv),
+                Target::Function(f) => return self.call_function(&f, &argv),
+                _ => {}
+            }
+        }
         let fds = self.proc.fds.lock().clone();
-        let spawned = match self.resolve(&name) {
-            Target::Builtin(b) if cred.is_none() => return (b.run)(self, &argv),
-            Target::Function(f) if cred.is_none() => return self.call_function(&f, &argv),
-            Target::Native(def) => {
-                let mut s = self.spawn_opts(def.name, argv.clone(), &[], fds, None);
-                if let Some(c) = cred {
-                    s.cred = c;
-                }
-                proc::spawn(s, move || {
-                    let mut ctx = super::ctx::Ctx::new(proc::current(), argv);
-                    let code = (def.main)(&mut ctx);
-                    ctx.flush();
-                    code
-                })
-                .map_err(|e| alloc::format!("{name}: {e}"))
-            }
-            Target::Script(path) => {
-                let saved = self.proc.cred();
-                if let Some(c) = cred {
-                    // Scripts inherit the credentials through the spawn below.
-                    *self.proc.cred.lock() = c;
-                }
-                let r = self.spawn_script(&path, argv, &[], fds, None);
-                *self.proc.cred.lock() = saved;
-                r
-            }
-            Target::Builtin(_) | Target::Function(_) => Err(alloc::format!("{name}: cannot run a shell builtin or function this way")),
-            Target::NotFound => {
-                self.err(&alloc::format!("{name}: command not found\n"));
-                return 127;
-            }
-            Target::NotExecutable(p, e) => {
-                self.err(&alloc::format!("{p}: {e}\n"));
-                return 126;
-            }
-        };
-        match spawned {
+        match self.spawn_argv(argv, fds, None, cred) {
             Ok(child) => {
                 let pg = child.pid;
                 self.wait_foreground(&[child], Some(pg))
             }
-            Err(m) => {
+            Err((st, m)) => {
                 self.err(&alloc::format!("{m}\n"));
-                126
+                st
             }
         }
     }
@@ -883,9 +901,7 @@ impl Shell {
         let s = self.spawn_opts(def.name, argv.clone(), assigns, fds, pgid);
         proc::spawn(s, move || {
             let mut ctx = super::ctx::Ctx::new(proc::current(), argv);
-            let code = (def.main)(&mut ctx);
-            ctx.flush();
-            code
+            cmds::invoke(def, &mut ctx)
         })
     }
 

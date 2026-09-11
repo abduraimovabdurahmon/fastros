@@ -39,6 +39,7 @@ pub const BUILTINS: &[Builtin] = &[
     b("false", inline_native, false),
     b("fg", fg, false),
     b("hash", colon, false),
+    b("help", help, false),
     b("history", history, false),
     b("jobs", jobs, false),
     b("kill", kill, false),
@@ -79,9 +80,84 @@ fn err(sh: &Shell, cmd: &str, msg: &str) -> i32 {
 fn inline_native(sh: &mut Shell, argv: &[String]) -> i32 {
     let Some(def) = super::cmds::find(&argv[0]) else { return 127 };
     let mut ctx = super::ctx::Ctx::new(sh.proc.clone(), argv.to_vec());
-    let code = (def.main)(&mut ctx);
-    ctx.flush();
-    code
+    super::cmds::invoke(def, &mut ctx)
+}
+
+/// One-line synopsis of each builtin (for `help`).
+fn builtin_synopsis(name: &str) -> &'static str {
+    match name {
+        "." | "source" => "source FILE [ARGS]          run commands from FILE in this shell",
+        ":" => ":                           null command, always succeeds",
+        "alias" => "alias [NAME[=VALUE] ...]    define or display aliases",
+        "bg" => "bg [JOB]                    resume a job in the background",
+        "break" => "break [N]                   exit N enclosing loops",
+        "cd" => "cd [DIR]                    change the working directory",
+        "command" => "command [-v] NAME [ARG...]  run a command, bypassing functions",
+        "continue" => "continue [N]                resume the next loop iteration",
+        "eval" => "eval [ARG ...]              run the arguments as shell code",
+        "exec" => "exec COMMAND [ARG...]       replace the shell with a command",
+        "exit" | "logout" => "exit [N]                    exit the shell with status N",
+        "export" => "export [NAME[=VALUE] ...]   mark variables for the environment",
+        "fg" => "fg [JOB]                    move a job to the foreground",
+        "help" => "help [NAME ...]             show help on builtins and commands",
+        "history" => "history [-c] [N]            show or clear the command history",
+        "jobs" => "jobs                        list the shell's jobs",
+        "kill" => "kill [-SIG] PID|%JOB ...    send a signal to processes or jobs",
+        "local" => "local NAME[=VALUE] ...      define function-local variables",
+        "read" => "read [-r] [-p PROMPT] NAME  read a line into variables",
+        "readonly" => "readonly NAME[=VALUE] ...   make variables read-only",
+        "return" => "return [N]                  return from a function",
+        "set" => "set [-euxfC] [ARG ...]      set options and positional parameters",
+        "shift" => "shift [N]                   shift positional parameters",
+        "trap" => "trap [ACTION] [SIGNAL ...]  run ACTION when a signal arrives",
+        "type" => "type NAME ...               describe how a name is interpreted",
+        "umask" => "umask [-S] [MODE]           show or set the file creation mask",
+        "unalias" => "unalias [-a] NAME ...       remove aliases",
+        "unset" => "unset [-fv] NAME ...        remove variables or functions",
+        "wait" => "wait [PID|%JOB ...]         wait for background jobs",
+        "hash" => "hash                        (no-op: commands are not cached)",
+        _ => "",
+    }
+}
+
+fn help(sh: &mut Shell, argv: &[String]) -> i32 {
+    if argv.len() > 1 {
+        let mut st = 0;
+        for topic in &argv[1..] {
+            if find(topic).is_some() {
+                let syn = builtin_synopsis(topic);
+                sh.out(&alloc::format!("{topic}: {}\n", if syn.is_empty() { topic.as_str() } else { syn }));
+            } else if let Some(def) = super::cmds::find(topic) {
+                sh.out(&alloc::format!("{}: {} {}\n    {}\n", def.name, def.name, def.usage, def.about));
+            } else {
+                sh.err(&alloc::format!("fsh: help: no help topics match `{topic}'.  Try `help help'.\n"));
+                st = 1;
+            }
+        }
+        return st;
+    }
+    let mut s = alloc::format!("FastROS fsh, version {} (x86_64-fastros)\n", crate::VERSION);
+    s.push_str("These shell commands are defined internally.  Type `help' to see this list.\n");
+    s.push_str("Type `help name' to find out more about the function `name'.\n");
+    s.push_str("Every program in /bin also accepts `--help'.\n\n");
+    let mut names: Vec<&str> = names().collect();
+    names.sort_unstable();
+    names.dedup();
+    for n in names {
+        let syn = builtin_synopsis(n);
+        if !syn.is_empty() {
+            s.push_str(&alloc::format!(" {syn}\n"));
+        }
+    }
+    s.push_str("\nPrograms in /bin:\n");
+    let cols = sh.tty().map(|t| t.winsize().cols as usize).filter(|&c| c > 0).unwrap_or(80);
+    let items: Vec<(String, usize)> = super::cmds::all().iter().map(|c| (String::from(c.name), c.name.len())).collect();
+    for line in super::cmds::fmtutil::columns(&items, cols) {
+        s.push_str(&line);
+        s.push('\n');
+    }
+    sh.out(&s);
+    0
 }
 
 /// `kill` as a builtin so job specs work: `%N`, `%%`, `%+`, `%-` become the
@@ -863,6 +939,16 @@ fn trap(sh: &mut Shell, argv: &[String]) -> i32 {
             "0" | "EXIT" => "EXIT".to_string(),
             s => crate::proc::signal::parse(s).map(crate::proc::signal::name).unwrap_or_else(|| s.to_string()),
         };
+        // `trap '' SIG` is SIG_IGN: the process ignores it, and so do the
+        // commands it starts (the disposition is inherited).
+        if let Some(n) = crate::proc::signal::parse(&name).filter(|&n| (1..=64).contains(&n)) {
+            let bit = 1u64 << (n - 1);
+            if action.is_empty() {
+                sh.proc.ignored.fetch_or(bit, Ordering::Relaxed);
+            } else {
+                sh.proc.ignored.fetch_and(!bit, Ordering::Relaxed);
+            }
+        }
         if action == "-" {
             sh.traps.remove(&name);
         } else {

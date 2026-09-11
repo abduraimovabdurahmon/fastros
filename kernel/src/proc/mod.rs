@@ -22,7 +22,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use fdtable::FdTable;
 
 pub type Pid = u32;
@@ -90,6 +90,13 @@ pub struct Process {
     pub start_ns: u64,
     /// Container this process belongs to (None = host).
     pub container: SpinLock<Option<String>>,
+    /// Signals set to SIG_IGN (bit n-1 for signal n); inherited by children,
+    /// as ignored dispositions survive fork and exec on Linux.
+    pub ignored: AtomicU64,
+    /// CPU time of the process when it exited.
+    pub cpu_at_exit: AtomicU64,
+    /// CPU time of reaped children and their descendants (cutime).
+    pub children_cpu: AtomicU64,
 }
 
 static PROCS: SpinLock<BTreeMap<Pid, Arc<Process>>> = SpinLock::new(BTreeMap::new());
@@ -146,6 +153,9 @@ impl Process {
         if signal::ignored_by_default(sig) {
             return;
         }
+        if sig != signal::SIGKILL && sig != signal::SIGSTOP && (1..=64).contains(&sig) && self.ignored.load(Ordering::Relaxed) & (1 << (sig - 1)) != 0 {
+            return;
+        }
         for t in self.tasks.lock().iter() {
             t.send_signal(sig);
         }
@@ -187,6 +197,9 @@ pub fn init(ns: Arc<MountNamespace>) {
             ctty: SpinLock::new(None),
             start_ns: 0,
             container: SpinLock::new(None),
+            ignored: AtomicU64::new(0),
+            cpu_at_exit: AtomicU64::new(0),
+            children_cpu: AtomicU64::new(0),
         })
     });
 }
@@ -227,6 +240,8 @@ pub struct Spawn {
     pub ctty: Option<Arc<Tty>>,
     pub uts: Arc<Uts>,
     pub container: Option<String>,
+    /// Ignored signals (SIG_IGN), normally the parent's.
+    pub ignored: u64,
 }
 
 impl Spawn {
@@ -245,6 +260,7 @@ impl Spawn {
             ctty: parent.ctty.lock().clone(),
             uts: parent.uts.clone(),
             container: parent.container.lock().clone(),
+            ignored: parent.ignored.load(Ordering::Relaxed),
         }
     }
 }
@@ -282,6 +298,9 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         ctty: SpinLock::new(s.ctty),
         start_ns: crate::time::now_ns(),
         container: SpinLock::new(s.container),
+        ignored: AtomicU64::new(s.ignored),
+        cpu_at_exit: AtomicU64::new(0),
+        children_cpu: AtomicU64::new(0),
     });
     PROCS.lock().insert(pid, p.clone());
     s.parent.children.lock().push(p.clone());
@@ -305,6 +324,7 @@ pub fn exit_current(status: ExitStatus) -> ! {
         }
         _ => status,
     };
+    me.cpu_at_exit.store(me.cpu_ns(), Ordering::Relaxed);
     me.fds.lock().clear();
     *me.ctty.lock() = None;
     *me.exit.lock() = Some(status);
@@ -358,6 +378,8 @@ pub fn wait(parent: &Arc<Process>, which: WaitFor, nohang: bool) -> KResult<Opti
             let c = kids.remove(i);
             drop(kids);
             PROCS.lock().remove(&c.pid);
+            let spent = c.cpu_at_exit.load(Ordering::Relaxed) + c.children_cpu.load(Ordering::Relaxed);
+            parent.children_cpu.fetch_add(spent, Ordering::Relaxed);
             return Ok(Some((c.pid, c.exit_status().expect("zombie"))));
         }
         Ok(None)

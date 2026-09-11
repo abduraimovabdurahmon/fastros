@@ -7,6 +7,7 @@ pub mod files;
 pub mod fmtutil;
 pub mod procinfo;
 pub mod procps;
+pub mod runutil;
 pub mod sysutil;
 pub mod text;
 pub mod textutils;
@@ -67,6 +68,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("mount", sysutil::mount, "mount a filesystem", "[-t TYPE] [-o OPTIONS] [--bind] SOURCE TARGET"),
     cmd!("mv", fileops::mv, "move (rename) files", "[-finvu] SOURCE... DEST"),
     cmd!("nl", textutils::nl, "number lines of files", "[-b STYLE] [-w N] [FILE]..."),
+    cmd!("nohup", runutil::nohup, "run a command immune to hangups", "COMMAND [ARG]..."),
     cmd!("nproc", procps::nproc, "print the number of processing units available", ""),
     cmd!("passwd", account::passwd, "change user password", "[-l|-u|-S] [--stdin] [LOGIN]"),
     cmd!("pgrep", procps::pgrep, "look up processes by name and other attributes", "[-flcnoxvia] [-d DELIM] [-P PPID] [-u USER] [-t TTY] PATTERN"),
@@ -96,6 +98,8 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("tail", textutils::tail, "output the last part of files", "[-n NUM] [-c NUM] [-f] [FILE]..."),
     cmd!("tee", textutils::tee, "copy standard input to files and standard output", "[-a] [FILE]..."),
     cmd!("test", basic::test, "evaluate a conditional expression", "EXPRESSION"),
+    cmd!("time", runutil::time, "time a simple command", "[-p] COMMAND [ARG]..."),
+    cmd!("timeout", runutil::timeout, "run a command with a time limit", "[-s SIGNAL] [-k DURATION] [--preserve-status] DURATION COMMAND [ARG]..."),
     cmd!("top", top::top, "display processes", "[-bci] [-d SECS] [-n N] [-p PID] [-u USER] [-o FIELD]"),
     cmd!("touch", fileops::touch, "change file timestamps / create files", "[-acm] [-d DATE] [-r FILE] FILE..."),
     cmd!("tr", textutils::tr, "translate or delete characters", "[-dsc] SET1 [SET2]"),
@@ -113,12 +117,42 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("vmstat", procps::vmstat, "report virtual memory statistics", "[DELAY [COUNT]]"),
     cmd!("w", procps::w, "show who is logged on and what they are doing", "[-hs] [USER]"),
     cmd!("wall", sysutil::wall, "write a message to all users", "[MESSAGE]"),
+    cmd!("watch", runutil::watch, "execute a program periodically, showing output fullscreen", "[-n SECS] [-tdegx] COMMAND"),
     cmd!("wc", textutils::wc, "print line, word and byte counts", "[-lwcmL] [FILE]..."),
     cmd!("who", procps::who, "show who is logged on", "[-abHmqsu] [am i]"),
     cmd!("whoami", sysutil::whoami, "print effective user name", ""),
     cmd!("xxd", textutils::hexdump, "make a hex dump", "[FILE]"),
     cmd!("yes", textutils::yes, "output a string repeatedly", "[STRING]..."),
 ];
+
+/// Run a native command: uniform `CMD --help` / `CMD --version`, then its
+/// main function, then flush its output.
+pub fn invoke(def: &CommandDef, ctx: &mut super::ctx::Ctx) -> i32 {
+    // Commands whose POSIX behaviour treats these words as operands.
+    const LITERAL: &[&str] = &["echo", "printf", "test", "[", "true", "false", "sh", "fsh", "kill"];
+    if ctx.args.len() == 2 && !LITERAL.contains(&def.name) {
+        match ctx.args[1].as_str() {
+            "--help" => {
+                let mut about: alloc::string::String = def.about.into();
+                if let Some(first) = about.get(..1) {
+                    about = alloc::format!("{}{}.", first.to_uppercase(), &about[1..]);
+                }
+                ctx.print(&alloc::format!("Usage: {} {}\n{}\n", def.name, def.usage, about));
+                ctx.flush();
+                return 0;
+            }
+            "--version" => {
+                ctx.print(&alloc::format!("{} (FastROS) {}\n", def.name, crate::VERSION));
+                ctx.flush();
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    let code = (def.main)(ctx);
+    ctx.flush();
+    code
+}
 
 pub fn find(name: &str) -> Option<&'static CommandDef> {
     COMMANDS.iter().find(|c| c.name == name)

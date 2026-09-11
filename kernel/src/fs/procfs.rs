@@ -738,6 +738,7 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
     // are charged to the kernel (see /proc/meminfo Slab).
     let stack_bytes = (nthreads * crate::sched::KSTACK_PAGES * crate::mm::PAGE_SIZE) as u64;
     let (utime, stime) = if kthread { (0, ticks(cpu_ns)) } else { (ticks(cpu_ns), 0) };
+    let cutime = p.as_ref().map(|p| ticks(p.children_cpu.load(Ordering::Relaxed))).unwrap_or(0);
     let state = state_letter(pid);
     let mut s = String::new();
     match f {
@@ -746,7 +747,7 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
             let (vsize, rss) = if kthread { (0, 0) } else { (stack_bytes, stack_bytes / 4096) };
             let _ = writeln!(
                 s,
-                "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} {flags} 0 0 0 0 {utime} {stime} 0 0 20 0 {nthreads} 0 {} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+                "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} {flags} 0 0 0 0 {utime} {stime} {cutime} 0 20 0 {nthreads} 0 {} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
                 ticks(start_ns)
             );
         }
