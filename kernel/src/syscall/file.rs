@@ -296,6 +296,93 @@ pub fn access(path: usize, mode: u32) -> KResult<usize> {
     Ok(0)
 }
 
+pub fn faccessat(dirfd: i32, path: usize, mode: u32) -> KResult<usize> {
+    let full = at_path(dirfd, &user_path(path)?)?;
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    ops::access(&ctx, &full, mode)?;
+    Ok(0)
+}
+
+// ── ownership ──────────────────────────────────────────────────────────────
+
+pub fn chown(path: usize, uid: u32, gid: u32, follow: bool) -> KResult<usize> {
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    let (u, g) = (opt_id(uid), opt_id(gid));
+    ops::chown(&ctx, &user_path(path)?, u, g, follow)?;
+    Ok(0)
+}
+
+pub fn fchown(fd: i32, uid: u32, gid: u32) -> KResult<usize> {
+    let f = fdt_get(fd)?;
+    // Ownership only applies to inode-backed files; ignore it for pipes/sockets.
+    let Some(path) = f.path() else { return Ok(0) };
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    ops::chown(&ctx, &path.path(), opt_id(uid), opt_id(gid), true)?;
+    Ok(0)
+}
+
+pub fn fchownat(dirfd: i32, path: usize, uid: u32, gid: u32, flags: i32) -> KResult<usize> {
+    let pathstr = user_path(path)?;
+    if pathstr.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return fchown(dirfd, uid, gid);
+    }
+    let full = at_path(dirfd, &pathstr)?;
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    ops::chown(&ctx, &full, opt_id(uid), opt_id(gid), flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    Ok(0)
+}
+
+/// `chown`'s convention: `-1` (0xffffffff) means "leave this id unchanged".
+fn opt_id(id: u32) -> Option<u32> {
+    if id == u32::MAX {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+// ── statfs ─────────────────────────────────────────────────────────────────
+
+/// Linux x86_64 `struct statfs` (120 bytes).
+fn write_statfs(buf: usize, s: &crate::fs::StatFs) -> KResult<()> {
+    let mut out = [0u8; 120];
+    let mut put = |off: usize, v: u64| out[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    put(0, s.fs_type);
+    put(8, s.block_size);
+    put(16, s.blocks);
+    put(24, s.blocks_free);
+    put(32, s.blocks_avail);
+    put(40, s.files);
+    put(48, s.files_free);
+    // 56: f_fsid (8 bytes, left zero)
+    put(64, s.name_max);
+    put(72, s.block_size); // f_frsize
+    uaccess::copy_to(buf, &out)?;
+    Ok(())
+}
+
+pub fn statfs(path: usize, buf: usize) -> KResult<usize> {
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    let (s, _) = ops::statfs(&ctx, &user_path(path)?)?;
+    write_statfs(buf, &s)?;
+    Ok(0)
+}
+
+pub fn fstatfs(fd: i32, buf: usize) -> KResult<usize> {
+    let f = fdt_get(fd)?;
+    let path = f.path().ok_or(Errno::EBADF)?;
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    let (s, _) = ops::statfs(&ctx, &path.path())?;
+    write_statfs(buf, &s)?;
+    Ok(0)
+}
+
 // ── directory / namespace operations ───────────────────────────────────────
 
 pub fn getcwd(buf: usize, len: usize) -> KResult<usize> {

@@ -209,6 +209,20 @@ pub fn clock_nanosleep(_clk: u32, _flags: i32, req: usize, rem: usize) -> KResul
     nanosleep(req, rem)
 }
 
+/// `sched_getaffinity(pid, cpusetsize, mask)`: report a single online CPU.
+/// glibc's `get_nprocs()` derives the worker count from this, so a program like
+/// nginx sizes its worker pool from what we return here.
+pub fn sched_getaffinity(_pid: i32, cpusetsize: usize, mask: usize) -> KResult<usize> {
+    let n = cpusetsize.min(128);
+    if n == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut buf = alloc::vec![0u8; n];
+    buf[0] = 0x01; // CPU 0 online
+    uaccess::copy_to(mask, &buf)?;
+    Ok(n)
+}
+
 /// Linux `struct sysinfo` (partial: the fields programs actually read).
 pub fn sysinfo(info: usize) -> KResult<usize> {
     let m = crate::mm::stats();

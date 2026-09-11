@@ -74,6 +74,14 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         20 => ret(file::writev(a[0] as i32, a[1] as usize, a[2] as usize)),
         21 => ret(file::access(a[0] as usize, a[1] as u32)),
         22 => ret(file::pipe(a[0] as usize, 0)),
+        92 => ret(file::chown(a[0] as usize, a[1] as u32, a[2] as u32, true)),
+        94 => ret(file::chown(a[0] as usize, a[1] as u32, a[2] as u32, false)),
+        93 => ret(file::fchown(a[0] as i32, a[1] as u32, a[2] as u32)),
+        260 => ret(file::fchownat(a[0] as i32, a[1] as usize, a[2] as u32, a[3] as u32, a[4] as i32)),
+        137 => ret(file::statfs(a[0] as usize, a[1] as usize)),
+        138 => ret(file::fstatfs(a[0] as i32, a[1] as usize)),
+        269 => ret(file::faccessat(a[0] as i32, a[1] as usize, a[2] as u32)),
+        439 => ret(file::faccessat(a[0] as i32, a[1] as usize, a[2] as u32)),
         32 => ret(file::dup(a[0] as i32)),
         33 => ret(file::dup2(a[0] as i32, a[1] as i32)),
         72 => ret(file::fcntl(a[0] as i32, a[1] as u32, a[2] as usize)),
@@ -150,15 +158,17 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
             crate::proc::current_tid() as u64
         }
         202 => ret(proc_sys::futex(a[0] as usize, a[1] as i32, a[2] as u32, a[3] as usize, a[4] as usize, a[5] as u32)),
+        204 => ret(proc_sys::sched_getaffinity(a[0] as i32, a[1] as usize, a[2] as usize)),
         228 => ret(proc_sys::clock_gettime(a[0] as u32, a[1] as usize)),
         229 => ret(proc_sys::clock_getres(a[0] as u32, a[1] as usize)),
         230 => ret(proc_sys::clock_nanosleep(a[0] as u32, a[1] as i32, a[2] as usize, a[3] as usize)),
         231 => proc_sys::exit(a[0] as i32, true),
         318 => ret(proc_sys::getrandom(a[0] as usize, a[1] as usize, a[2] as u32)),
 
-        // rt_sigaction, rt_sigprocmask, sigaltstack, set_robust_list,
-        // prlimit64, rseq, prctl: accepted as no-ops so libc starts.
-        13 | 14 | 131 | 273 | 302 | 334 | 157 => 0,
+        // rt_sigaction, rt_sigprocmask, sigaltstack, set_robust_list, prlimit64,
+        // rseq, prctl, sched_setaffinity, fadvise64: accepted as no-ops so libc
+        // starts.
+        13 | 14 | 131 | 273 | 302 | 334 | 157 | 203 | 221 => 0,
 
         // ── not implemented ──
         _ => {
