@@ -377,7 +377,14 @@ pub fn exit_current(code: i32) -> ! {
 /// Pick the next task and switch to it.
 pub fn schedule() {
     let held = crate::sync::spinlocks_held();
-    assert!(held == 0, "schedule() called with {held} spinlock(s) held");
+    if held != 0 {
+        let mut sites = alloc::string::String::new();
+        crate::sync::each_held_site(|loc| {
+            use core::fmt::Write;
+            let _ = write!(sites, " {}:{}", loc.file(), loc.line());
+        });
+        panic!("schedule() with {held} spinlock(s) held; held at:{sites}");
+    }
     let irq = cpu::irq_save();
     let now = crate::time::now_ns();
     let (prev_rsp, next_rsp) = {

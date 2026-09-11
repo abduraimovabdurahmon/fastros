@@ -33,6 +33,33 @@ static HELD: AtomicUsize = AtomicUsize::new(0);
 /// come back only when the last spinlock is released. Task switches happen
 /// only with no spinlock held, so this flag never crosses tasks.
 static PENDING_IRQ_ENABLE: AtomicBool = AtomicBool::new(false);
+/// Sites of the currently-held spinlocks (up to 8), so the "schedule with a
+/// spinlock held" panic can name the culprit regardless of release order.
+static HELD_SITES: [AtomicPtr<Location<'static>>; 8] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 8];
+
+fn held_push(loc: &'static Location<'static>) -> usize {
+    for (i, slot) in HELD_SITES.iter().enumerate() {
+        if slot.compare_exchange(core::ptr::null_mut(), loc as *const _ as *mut _, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            return i;
+        }
+    }
+    usize::MAX
+}
+fn held_pop(slot: usize) {
+    if slot < HELD_SITES.len() {
+        HELD_SITES[slot].store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+}
+
+/// Call `f` with each currently-held spinlock's source location.
+pub fn each_held_site(mut f: impl FnMut(&'static Location<'static>)) {
+    for slot in &HELD_SITES {
+        let p = slot.load(Ordering::Relaxed);
+        if !p.is_null() {
+            f(unsafe { &*p });
+        }
+    }
+}
 
 pub fn spinlocks_held() -> usize {
     HELD.load(Ordering::Relaxed)
@@ -80,7 +107,8 @@ impl<T: ?Sized> SpinLock<T> {
         }
         self.owner.store(Location::caller() as *const _ as *mut _, Ordering::Relaxed);
         HELD.fetch_add(1, Ordering::Relaxed);
-        SpinGuard { lock: self, irq }
+        let site = held_push(Location::caller());
+        SpinGuard { lock: self, irq, site }
     }
 
     #[inline]
@@ -91,7 +119,7 @@ impl<T: ?Sized> SpinLock<T> {
             return None;
         }
         HELD.fetch_add(1, Ordering::Relaxed);
-        Some(SpinGuard { lock: self, irq })
+        Some(SpinGuard { lock: self, irq, site: usize::MAX })
     }
 
     pub fn is_locked(&self) -> bool {
@@ -117,6 +145,7 @@ impl<T: ?Sized> SpinLock<T> {
 pub struct SpinGuard<'a, T: ?Sized> {
     lock: &'a SpinLock<T>,
     irq: bool,
+    site: usize,
 }
 
 impl<T: ?Sized> Deref for SpinGuard<'_, T> {
@@ -140,6 +169,7 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
         self.lock.owner.store(core::ptr::null_mut(), Ordering::Relaxed);
+        held_pop(self.site);
         self.lock.locked.store(false, Ordering::Release);
         let left = HELD.fetch_sub(1, Ordering::Relaxed) - 1;
         if left > 0 {
