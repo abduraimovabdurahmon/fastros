@@ -192,6 +192,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "logs" => logs(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
+        "compose" => compose(ctx, &args[1..]),
         "help" | "-h" | "--help" => usage(ctx),
         other => {
             ctx.eprint(&format!("fastman: unknown command '{other}'\n"));
@@ -221,6 +222,12 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  exec <container> <cmd>     run a command in a container");
     outln!(ctx, "  stop <container>           stop a container");
     outln!(ctx, "  rm [-f] <container>        remove a container");
+    outln!(ctx);
+    outln!(ctx, "{}", s.bold("Compose (multi-container stacks):"));
+    outln!(ctx, "  compose [-f file] up       start all services in a compose file");
+    outln!(ctx, "  compose [-f file] ps       list the stack's containers");
+    outln!(ctx, "  compose [-f file] logs <svc>  show a service's output");
+    outln!(ctx, "  compose [-f file] down     stop and remove the stack");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("run options:"));
     outln!(ctx, "  -d                 detached (background)");
@@ -431,6 +438,157 @@ fn ps(ctx: &mut Ctx, args: &[String]) -> i32 {
     }
     t.render(ctx, &s);
     0
+}
+
+/// `fastman compose [-f file] [-p project] <up [-d]|down|ps|logs [svc]>`.
+fn compose(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut file = None;
+    let mut project = None;
+    let mut sub = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" | "--file" => {
+                i += 1;
+                file = args.get(i).cloned();
+            }
+            "-p" | "--project-name" => {
+                i += 1;
+                project = args.get(i).cloned();
+            }
+            s if sub.is_none() && !s.starts_with('-') => sub = Some(s.to_string()),
+            s => rest.push(s.to_string()),
+        }
+        i += 1;
+    }
+    let sub = sub.unwrap_or_else(|| "up".to_string());
+    let fc = fs_ctx(ctx);
+
+    // Locate the compose file (explicit, then the usual defaults).
+    let path = file.or_else(|| {
+        ["fastman-compose.yaml", "fastman-compose.yml", "docker-compose.yaml", "docker-compose.yml", "compose.yaml"]
+            .iter()
+            .find(|p| crate::fs::ops::stat(&fc, p, true).is_ok())
+            .map(|p| p.to_string())
+    });
+    let project = project.unwrap_or_else(|| String::from("fastman"));
+
+    // `down`/`ps`/`logs` only need the project prefix; `up` needs the file.
+    let prefix = format!("{project}_");
+    match sub.as_str() {
+        "up" => {
+            let Some(path) = path else {
+                return ctx.fail("no compose file (looked for fastman-compose.yaml / docker-compose.yml)");
+            };
+            let src = match crate::fs::ops::read_file(&fc, &path) {
+                Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                Err(e) => return ctx.fail_errno(&path, e),
+            };
+            let stack = match crate::fastman::compose::parse(&project, &src) {
+                Ok(s) => s,
+                Err(_) => return ctx.fail(format!("{path}: invalid compose file")),
+            };
+            let s = style_of(ctx);
+            for svc in &stack.services {
+                // Auto-pull a missing image if the network is up.
+                if image::resolve(&fc, &svc.image).is_none() {
+                    if crate::net::is_up() {
+                        if let Some(r) = image::ImageRef::parse(&svc.image) {
+                            outln!(ctx, "{} Pulling {}", s.dim(&svc.name), svc.image);
+                            ctx.flush();
+                            let res = {
+                                let mut prog = CliProgress { ctx };
+                                crate::fastman::registry::pull(&r, &mut prog)
+                            };
+                            if let Ok(p) = res {
+                                let _ = image::store_layers(&fc, &r.key(), &p.layers, p.config);
+                            }
+                        }
+                    }
+                    if image::resolve(&fc, &svc.image).is_none() {
+                        ctx.fail(format!("{}: image '{}' not found", svc.name, svc.image));
+                        continue;
+                    }
+                }
+                let cname = svc.opts.name.clone().unwrap_or_else(|| format!("{prefix}{}", svc.name));
+                // Idempotent up: remove a previous instance of the same service.
+                let _ = runtime::remove(&fc, &cname, true);
+                let mut opts = clone_opts(&svc.opts);
+                opts.detach = true;
+                ctx.flush();
+                match runtime::run(&fc, &svc.image, opts, None) {
+                    Ok((c, _)) => outln!(ctx, "{} {} {}", s.green("Started"), svc.name, short(&c.id)),
+                    Err(e) => {
+                        ctx.fail_errno(&svc.name, e);
+                    }
+                }
+            }
+            0
+        }
+        "down" | "stop" | "rm" => {
+            let fc = fs_ctx(ctx);
+            let mut names: Vec<String> = container::list(&fc).into_iter().filter(|c| c.name.starts_with(&prefix)).map(|c| c.name).collect();
+            names.sort();
+            if names.is_empty() {
+                outln!(ctx, "No containers for project {project}");
+                return 0;
+            }
+            for name in &names {
+                let _ = runtime::stop(&fc, name, crate::proc::signal::SIGTERM);
+                match runtime::remove(&fc, name, true) {
+                    Ok(()) => outln!(ctx, "Removed {name}"),
+                    Err(e) => {
+                        ctx.fail_errno(name, e);
+                    }
+                }
+            }
+            0
+        }
+        "ps" => {
+            let fc = fs_ctx(ctx);
+            let s = style_of(ctx);
+            let mut t = Table::new(&["NAME", "IMAGE", "STATUS", "PORTS"]);
+            for c in container::list(&fc).into_iter().filter(|c| c.name.starts_with(&prefix)) {
+                let status = match c.live_state() {
+                    State::Running => s.green("Up"),
+                    State::Exited => s.dim(&format!("Exited ({})", c.exit_code)),
+                    State::Created => s.dim("Created"),
+                };
+                let ports = c.ports.iter().map(|p| format!("0.0.0.0:{}->{}", p.host, p.container)).collect::<Vec<_>>().join(", ");
+                t.row(alloc::vec![c.name.clone(), c.image_key.clone(), status, ports]);
+            }
+            t.render(ctx, &s);
+            0
+        }
+        "logs" => {
+            let fc = fs_ctx(ctx);
+            let svc = rest.first().cloned().unwrap_or_default();
+            let name = format!("{prefix}{svc}");
+            match runtime::logs(&fc, &name) {
+                Ok(data) => {
+                    ctx.write(&data);
+                    0
+                }
+                Err(e) => ctx.fail_errno(&name, e),
+            }
+        }
+        other => ctx.fail(format!("unknown compose command '{other}' (up|down|ps|logs)")),
+    }
+}
+
+/// Deep-copy RunOpts (it is not Clone: it owns Vecs the runtime consumes).
+fn clone_opts(o: &RunOpts) -> RunOpts {
+    RunOpts {
+        name: o.name.clone(),
+        cmd: o.cmd.clone(),
+        env: o.env.clone(),
+        workdir: o.workdir.clone(),
+        ports: o.ports.clone(),
+        volumes: o.volumes.clone(),
+        network: o.network.clone(),
+        detach: o.detach,
+    }
 }
 
 fn stop(ctx: &mut Ctx, args: &[String]) -> i32 {

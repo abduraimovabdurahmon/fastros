@@ -23,6 +23,7 @@
 //! <base>/containers/<id>/log      combined stdout/stderr
 //! ```
 
+pub mod compose;
 pub mod container;
 pub mod extract;
 pub mod image;
