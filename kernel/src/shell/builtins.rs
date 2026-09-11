@@ -41,6 +41,7 @@ pub const BUILTINS: &[Builtin] = &[
     b("hash", colon, false),
     b("history", history, false),
     b("jobs", jobs, false),
+    b("kill", kill, false),
     b("local", local, false),
     b("logout", exit, true),
     b("printf", inline_native, false),
@@ -81,6 +82,56 @@ fn inline_native(sh: &mut Shell, argv: &[String]) -> i32 {
     let code = (def.main)(&mut ctx);
     ctx.flush();
     code
+}
+
+/// `kill` as a builtin so job specs work: `%N`, `%%`, `%+`, `%-` become the
+/// job's process group (`-PGID`), then the native `kill` does the rest.
+fn kill(sh: &mut Shell, argv: &[String]) -> i32 {
+    if argv.get(1).is_some_and(|a| a == "-l" || a == "-L" || a == "--list" || a == "--table") {
+        return inline_native(sh, argv);
+    }
+    let mut args = alloc::vec![argv[0].clone()];
+    let mut rest = argv[1..].iter();
+    // Options first (`-9`, `-s TERM`, `-l`), then `--`, then the targets, so
+    // a translated `-PGID` is never mistaken for a signal number.
+    let mut targets: Vec<&String> = Vec::new();
+    while let Some(a) = rest.next() {
+        if a == "--" {
+            targets.extend(rest.by_ref());
+            break;
+        }
+        if a == "-s" || a == "-n" {
+            args.push(a.clone());
+            if let Some(v) = rest.next() {
+                args.push(v.clone());
+            }
+        } else if a.starts_with('-') && targets.is_empty() && a.len() > 1 {
+            args.push(a.clone());
+        } else {
+            targets.push(a);
+            targets.extend(rest.by_ref());
+            break;
+        }
+    }
+    if !targets.is_empty() {
+        args.push(String::from("--"));
+    }
+    for a in targets {
+        let Some(spec) = a.strip_prefix('%') else {
+            args.push(a.clone());
+            continue;
+        };
+        let job = match spec {
+            "" | "%" | "+" => sh.jobs.last(),
+            "-" => sh.jobs.len().checked_sub(2).and_then(|i| sh.jobs.get(i)),
+            n => n.parse::<usize>().ok().and_then(|id| sh.jobs.iter().find(|j| j.id == id)),
+        };
+        match job {
+            Some(j) => args.push(alloc::format!("-{}", j.pgid)),
+            None => return err(sh, "kill", &alloc::format!("{a}: no such job")),
+        }
+    }
+    inline_native(sh, &args)
 }
 
 fn colon(_: &mut Shell, _: &[String]) -> i32 {
@@ -712,10 +763,7 @@ fn fg(sh: &mut Shell, argv: &[String]) -> i32 {
                     last = s.shell_code();
                     break;
                 }
-                Err(Errno::EINTR) => {
-                    crate::sched::with_current(|t| t.clear_signals());
-                    continue;
-                }
+                Err(Errno::EINTR) if crate::proc::absorb_signals() => continue,
                 _ => break,
             }
         }
@@ -752,7 +800,8 @@ fn wait(sh: &mut Shell, argv: &[String]) -> i32 {
                     last = s.shell_code();
                     break;
                 }
-                Err(Errno::EINTR) => return 130,
+                // A signal ends `wait` at once; the trap runs before the next command.
+                Err(Errno::EINTR) => return 128 + crate::sched::with_current(|t| t.pending_signals()).trailing_zeros() as i32 + 1,
                 _ => {
                     last = 127;
                     break;

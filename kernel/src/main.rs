@@ -45,6 +45,7 @@ mod tty;
 mod uaccess;
 mod usermode;
 mod users;
+mod utmp;
 
 use arch::cpu;
 

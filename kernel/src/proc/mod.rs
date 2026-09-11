@@ -427,6 +427,21 @@ pub fn interrupted() -> bool {
     sched::with_current(|t| t.signal_pending())
 }
 
+/// Discard the signals that interrupted a wait the caller wants to resume
+/// (^C aimed at a foreground child, SIGCHLD...). Returns false when SIGKILL
+/// is pending: it cannot be absorbed and the caller must unwind.
+pub fn absorb_signals() -> bool {
+    sched::with_current(|t| {
+        t.clear_signals();
+        !t.kill_pending()
+    })
+}
+
+/// SIGKILL is pending for the current task.
+pub fn killed() -> bool {
+    sched::with_current(|t| t.kill_pending())
+}
+
 /// Kernel-thread tids (tasks with no process), for `ps`.
 pub fn kernel_threads() -> Vec<Arc<Task>> {
     sched::all_tasks().into_iter().filter(|t| t.owner.load(Ordering::Relaxed) == 0).collect()

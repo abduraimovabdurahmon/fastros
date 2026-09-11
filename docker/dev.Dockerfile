@@ -27,3 +27,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN rustup toolchain install && rustc --version && cargo --version
+
+# Terminal emulator for screen-level tests of full-screen programs (top,
+# htop, less): the harness renders the guest's output like a real xterm.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-pyte \
+ && rm -rf /var/lib/apt/lists/*

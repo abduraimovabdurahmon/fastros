@@ -229,6 +229,17 @@ pub fn parse_size(s: &str) -> Option<u64> {
     num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
+/// A block size as `df -B` prints it in its header: `4K`, `1M`, `512`.
+pub fn human_block_size(b: u64) -> String {
+    const U: [(u64, &str); 4] = [(1 << 40, "T"), (1 << 30, "G"), (1 << 20, "M"), (1 << 10, "K")];
+    for (size, u) in U {
+        if b >= size && b % size == 0 {
+            return alloc::format!("{}{}", b / size, u);
+        }
+    }
+    b.to_string()
+}
+
 /// Process C-style escapes (`echo -e`, `printf %b`). Returns (text, stop):
 /// `\c` stops all further output.
 pub fn unescape(s: &str) -> (String, bool) {

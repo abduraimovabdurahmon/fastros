@@ -11,6 +11,8 @@ pub fn main() {
     crate::proc::init(ns.clone());
     crate::fs::boot::populate(&ns);
     crate::fs::bcache::start_flusher();
+    crate::utmp::boot();
+    crate::power::init();
 
     crate::firewall::init();
     crate::net::init();

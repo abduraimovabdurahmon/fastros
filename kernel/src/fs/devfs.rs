@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 static DEVFS: Once<Arc<TmpFs>> = Once::new();
 
 pub fn create() -> Arc<TmpFs> {
-    let fs = TmpFs::new(0);
+    let fs = TmpFs::named(0, "devtmpfs");
     let root: Arc<dyn Inode> = fs.root_node();
     let chr = |name: &str, maj: u32, min: u32, perm: u16, gid: u32| {
         let _ = root.create(name, FileType::CharDevice, perm, 0, gid, makedev(maj, min));

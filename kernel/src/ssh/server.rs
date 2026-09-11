@@ -876,7 +876,7 @@ impl Conn {
             s.process = Some(p.clone());
         }
         if let (Some(n), true) = (pts, interactive) {
-            super::register_session(super::SessionInfo {
+            crate::utmp::login(crate::utmp::Session {
                 user: user.name.clone(),
                 tty: alloc::format!("pts/{n}"),
                 from: self.peer.addr.to_string(),
@@ -889,7 +889,7 @@ impl Conn {
         let task = p.tasks().into_iter().next();
         crate::sched::spawn("sshd-wait", move || {
             let code = task.map(|t| t.join()).unwrap_or(0);
-            super::unregister_session(p.pid);
+            crate::utmp::logout(p.pid);
             chan.send_exit_status(code);
             chan.send_eof();
             chan.send_close();

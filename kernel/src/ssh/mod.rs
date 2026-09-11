@@ -5,10 +5,9 @@ pub mod transport;
 pub mod wire;
 
 use crate::fs::ops::{self, Ctx};
-use crate::sync::{Once, SpinLock};
+use crate::sync::Once;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use fastros_codec::{base64, hex};
 use transport::HostKey;
 
@@ -129,32 +128,6 @@ pub fn host_key() -> Arc<HostKey> {
 pub fn fingerprint(blob: &[u8]) -> String {
     let d = crate::crypto::sha256(blob);
     alloc::format!("SHA256:{}", base64::encode_nopad(&d))
-}
-
-/// A logged-in session (for `who`, `w`, `users`).
-#[derive(Clone, Debug)]
-pub struct SessionInfo {
-    pub user: String,
-    pub tty: String,
-    pub from: String,
-    pub login_unix: u64,
-    pub pid: u32,
-}
-
-static SESSIONS: SpinLock<Vec<SessionInfo>> = SpinLock::new(Vec::new());
-
-pub fn register_session(s: SessionInfo) {
-    SESSIONS.lock().push(s);
-}
-
-pub fn unregister_session(pid: u32) {
-    SESSIONS.lock().retain(|s| s.pid != pid);
-}
-
-pub fn sessions() -> Vec<SessionInfo> {
-    let mut v = SESSIONS.lock().clone();
-    v.retain(|s| crate::proc::find(s.pid).is_some_and(|p| !p.is_zombie()));
-    v
 }
 
 /// Start the listener task.

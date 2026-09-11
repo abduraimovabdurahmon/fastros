@@ -136,6 +136,57 @@ class Pty:
         self.chan.close()
 
 
+class Term:
+    """An interactive pty rendered by a VT emulator: the screen a user sees.
+    Needed for full-screen programs, where raw output is a stream of cursor
+    moves and partial redraws."""
+
+    def __init__(self, client, cols=100, rows=30):
+        import pyte
+        self.chan = client.invoke_shell(term="xterm-256color", width=cols, height=rows)
+        self.chan.settimeout(30)
+        self.screen = pyte.Screen(cols, rows)
+        self.stream = pyte.ByteStream(self.screen)
+
+    def pump(self, secs=0.3):
+        """Feed everything that arrives within `secs` to the emulator."""
+        deadline = time.time() + secs
+        while time.time() < deadline:
+            if self.chan.recv_ready():
+                self.stream.feed(self.chan.recv(65536))
+            else:
+                time.sleep(0.02)
+
+    def text(self):
+        return "\n".join(line.rstrip() for line in self.screen.display)
+
+    def wait_for(self, pattern, timeout=20):
+        rx = re.compile(pattern)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.pump(0.1)
+            if rx.search(self.text()):
+                return self.text()
+        raise TimeoutError(f"waiting for {pattern!r}; screen:\n{self.text()}")
+
+    def send(self, s):
+        self.chan.send(s)
+
+    def line(self, n):
+        return self.screen.display[n].rstrip()
+
+    def close(self):
+        self.chan.close()
+
+
+@pytest.fixture
+def term(client):
+    t = Term(client)
+    t.wait_for(r"(?m)[#$]$")
+    yield t
+    t.close()
+
+
 @pytest.fixture(scope="session")
 def client():
     c = connect()

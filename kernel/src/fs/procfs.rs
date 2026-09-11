@@ -675,6 +675,21 @@ fn gen_sys(f: &str) -> KResult<String> {
     })
 }
 
+/// Linux `dev_t` of a terminal, as `/proc/<pid>/stat` field 7 reports it.
+pub fn tty_devno(name: &str) -> u64 {
+    if let Some(n) = name.strip_prefix("pts/").and_then(|n| n.parse::<u32>().ok()) {
+        return super::makedev(136, n);
+    }
+    if let Some(n) = name.strip_prefix("ttyS").and_then(|n| n.parse::<u32>().ok()) {
+        return super::makedev(4, 64 + n);
+    }
+    match name {
+        "console" => super::makedev(5, 1),
+        "tty" => super::makedev(5, 0),
+        _ => 0,
+    }
+}
+
 fn state_letter(pid: u32) -> char {
     if let Some(p) = proc::find(pid) {
         if p.is_zombie() {
@@ -715,21 +730,23 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
         .as_ref()
         .map(|p| (p.ppid.load(Ordering::Relaxed), p.pgid.load(Ordering::Relaxed), p.sid.load(Ordering::Relaxed)))
         .unwrap_or((0, 0, 0));
-    let tty_nr = p
-        .as_ref()
-        .and_then(|p| p.ctty.lock().clone())
-        .and_then(|t| t.name.strip_prefix("pts/").and_then(|n| n.parse::<u32>().ok()))
-        .map(|n| super::makedev(136, n) as i64)
-        .unwrap_or(0);
+    let ctty = p.as_ref().and_then(|p| p.ctty.lock().clone());
+    let tty_nr = ctty.as_ref().map(|t| tty_devno(&t.name) as i64).unwrap_or(0);
+    let tpgid = ctty.as_ref().map(|t| t.fg_pgrp() as i64).filter(|&g| g != 0).unwrap_or(-1);
+    let nthreads = p.as_ref().map(|p| p.tasks().len().max(1)).unwrap_or(1);
+    // Native programs' private memory is their kernel stack(s); heap objects
+    // are charged to the kernel (see /proc/meminfo Slab).
+    let stack_bytes = (nthreads * crate::sched::KSTACK_PAGES * crate::mm::PAGE_SIZE) as u64;
+    let (utime, stime) = if kthread { (0, ticks(cpu_ns)) } else { (ticks(cpu_ns), 0) };
     let state = state_letter(pid);
     let mut s = String::new();
     match f {
         "stat" => {
             let flags: u32 = if kthread { 0x0020_0040 } else { 0x0040_0100 };
+            let (vsize, rss) = if kthread { (0, 0) } else { (stack_bytes, stack_bytes / 4096) };
             let _ = writeln!(
                 s,
-                "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} -1 {flags} 0 0 0 0 {} 0 0 0 20 0 1 0 {} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0",
-                ticks(cpu_ns),
+                "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} {flags} 0 0 0 0 {utime} {stime} 0 0 20 0 {nthreads} 0 {} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
                 ticks(start_ns)
             );
         }
@@ -753,7 +770,16 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
             let g: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
             let _ = writeln!(s, "Groups:\t{}", g.join(" "));
             let _ = writeln!(s, "NSpid:\t{pid}\nNSpgid:\t{pgid}\nNSsid:\t{sid}");
-            let _ = writeln!(s, "VmRSS:\t       0 kB\nThreads:\t1");
+            if !kthread {
+                let k = stack_bytes / 1024;
+                for field in ["VmPeak", "VmSize", "VmHWM", "VmRSS"] {
+                    let _ = writeln!(s, "{field}:\t{k:>8} kB");
+                }
+                let _ = writeln!(s, "RssAnon:\t{:>8} kB\nRssFile:\t{:>8} kB\nRssShmem:\t{:>8} kB", k, 0, 0);
+                let _ = writeln!(s, "VmData:\t{:>8} kB\nVmStk:\t{:>8} kB\nVmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, k, 0, 0);
+                let _ = writeln!(s, "VmSwap:\t{:>8} kB", 0);
+            }
+            let _ = writeln!(s, "Threads:\t{nthreads}");
             let _ = writeln!(s, "Seccomp:\t0\nNoNewPrivs:\t0");
             let _ = writeln!(s, "voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0");
         }
@@ -779,7 +805,10 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
                 }
             }
         }
-        "statm" => s.push_str("0 0 0 0 0 0 0\n"),
+        "statm" => {
+            let pages = if kthread { 0 } else { stack_bytes / 4096 };
+            let _ = writeln!(s, "{pages} {pages} 0 0 0 {pages} 0");
+        }
         "io" => s.push_str("rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n"),
         "mounts" => {
             if let Some(p) = &p {

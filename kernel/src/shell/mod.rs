@@ -12,6 +12,7 @@ pub mod ctx;
 pub mod exec;
 pub mod history;
 pub mod readline;
+pub mod tui;
 
 use crate::fs::file::File;
 use crate::proc::{Pid, Process};
@@ -56,6 +57,9 @@ pub enum Flow {
     Continue(u32),
     Return,
     Exit,
+    /// ^C killed a foreground job of an interactive shell: abandon the rest
+    /// of the command line and go back to the prompt.
+    Interrupt,
 }
 
 #[derive(Clone)]
@@ -80,6 +84,9 @@ pub struct Shell {
     pub exit_code: i32,
     pub history: history::History,
     pub traps: BTreeMap<String, String>,
+    /// Signals that arrived while waiting for a foreground child; acted on
+    /// (trap or default action) once the child is gone, as bash does.
+    pub deferred_signals: u64,
     /// Set by `exec` without a command: keep the current redirections.
     pub keep_redirs: bool,
 }
@@ -111,6 +118,7 @@ impl Shell {
             exit_code: 0,
             history: history::History::new(),
             traps: BTreeMap::new(),
+            deferred_signals: 0,
             keep_redirs: false,
         };
         sh.set_default("PATH", "/bin:/usr/local/bin", true);
@@ -273,6 +281,74 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// The exit status of a shell process that ran `st` last: settle
+    /// deferred signals, run the EXIT trap, honour `exit N`.
+    pub fn finish(&mut self, st: i32) -> i32 {
+        if self.flow == Flow::Normal {
+            self.handle_signals();
+        }
+        self.run_exit_trap();
+        if self.flow == Flow::Exit {
+            self.exit_code
+        } else {
+            st
+        }
+    }
+
+    /// A signal interrupted a non-interactive shell waiting for a child.
+    /// Trapped signals and SIGINT/SIGQUIT (cooperative exit) are deferred
+    /// until the child is done; any other fatal signal ends the shell now
+    /// (flow = Exit) and this returns true.
+    pub fn fatal_while_waiting(&mut self) -> bool {
+        use crate::proc::signal::{ignored_by_default, name, SIGINT, SIGKILL, SIGQUIT};
+        let pending = crate::sched::with_current(|t| t.pending_signals());
+        for sig in 1..=64u32 {
+            if pending & (1 << (sig - 1)) == 0 || ignored_by_default(sig) {
+                continue;
+            }
+            if sig != SIGKILL && (sig == SIGINT || sig == SIGQUIT || self.traps.contains_key(&name(sig))) {
+                self.deferred_signals |= 1 << (sig - 1);
+                continue;
+            }
+            self.flow = Flow::Exit;
+            self.exit_code = 128 + sig as i32;
+            return true;
+        }
+        false
+    }
+
+    /// Act on signals sent to the shell itself: run the trap if one is set;
+    /// otherwise a non-interactive shell takes the default action (exit with
+    /// 128+sig) while an interactive one ignores them, like bash.
+    pub fn handle_signals(&mut self) {
+        let pending = crate::sched::with_current(|t| t.pending_signals()) | core::mem::take(&mut self.deferred_signals);
+        if pending == 0 {
+            return;
+        }
+        for sig in 1..=64u32 {
+            if pending & (1 << (sig - 1)) == 0 || sig == crate::proc::signal::SIGKILL {
+                continue;
+            }
+            crate::sched::with_current(|t| t.clear_signal(sig));
+            if let Some(action) = self.traps.get(&crate::proc::signal::name(sig)).cloned() {
+                if !action.is_empty() {
+                    let saved = self.status;
+                    self.run_source(&action);
+                    self.status = saved;
+                }
+                continue;
+            }
+            if crate::proc::signal::ignored_by_default(sig) || self.interactive || matches!(sig, crate::proc::signal::SIGTSTP | crate::proc::signal::SIGTTIN | crate::proc::signal::SIGTTOU | crate::proc::signal::SIGSTOP) {
+                continue;
+            }
+            self.flow = Flow::Exit;
+            self.exit_code = 128 + sig as i32;
+            return;
+        }
+    }
+}
+
 fn old_is_exported(sh: &Shell, k: &str) -> bool {
     sh.vars.get(k).is_some_and(|v| v.exported)
 }
@@ -300,15 +376,26 @@ pub fn run_argv(
 
 /// Entry point of a login shell process (SSH session, console).
 pub fn login_shell_main(user: crate::users::User) -> i32 {
+    user_shell(&user, true, None)
+}
+
+/// A shell for `user` in the current process: interactive, or running
+/// `command` (`su -c`, `sudo -s CMD`). A login shell (`login`) starts in the
+/// home directory and reads the profiles. The caller has already given the
+/// process `user`'s credentials and environment (login, `su`, `sudo -i`).
+pub fn user_shell(user: &crate::users::User, login: bool, command: Option<String>) -> i32 {
     let proc = crate::proc::current();
-    let mut sh = Shell::new(proc, true);
-    sh.login = true;
-    sh.arg0 = String::from("-fsh");
+    let interactive = command.is_none();
+    let mut sh = Shell::new(proc, interactive);
+    sh.login = login;
+    if login {
+        sh.arg0 = String::from("-fsh");
+    }
     let _ = sh.set_var("HOME", &user.home, true);
     let _ = sh.set_var("USER", &user.name, true);
     let _ = sh.set_var("LOGNAME", &user.name, true);
     let _ = sh.set_var("SHELL", "/bin/sh", true);
-    if sh.var("TERM").is_none() {
+    if interactive && sh.var("TERM").is_none() {
         let _ = sh.set_var("TERM", "xterm-256color", true);
     }
     let hostname = sh.proc.uts.hostname.lock().clone();
@@ -319,17 +406,125 @@ pub fn login_shell_main(user: crate::users::User) -> i32 {
         "\\[\\e[1;32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\$ "
     };
     sh.set_default("PS1", ps1, false);
-    if crate::fs::ops::chdir(&sh.proc, &user.home).is_err() {
+    if login && crate::fs::ops::chdir(&sh.proc, &user.home).is_err() {
         let _ = crate::fs::ops::chdir(&sh.proc, "/");
     }
     let pwd = sh.proc.fs.lock().cwd.path();
     let _ = sh.set_var("PWD", &pwd, true);
     sh.sync_env();
-    sh.source_if_exists("/etc/profile");
-    let home_profile = alloc::format!("{}/.profile", user.home);
-    sh.source_if_exists(&home_profile);
-    sh.history.load(&sh.proc, &alloc::format!("{}/.fsh_history", user.home));
-    sh.interactive_loop()
+    if login {
+        sh.source_if_exists("/etc/profile");
+        let home_profile = alloc::format!("{}/.profile", user.home);
+        sh.source_if_exists(&home_profile);
+    }
+    match command {
+        Some(src) => {
+            let code = sh.run_source(&src);
+            sh.finish(code)
+        }
+        None => {
+            sh.history.load(&sh.proc, &alloc::format!("{}/.fsh_history", user.home));
+            sh.interactive_loop()
+        }
+    }
+}
+
+/// `sh` / `fsh`: the shell as a command.
+///
+/// `sh -c CMD [NAME [ARG...]]`, `sh FILE [ARG...]`, `sh -s [ARG...]` (script
+/// on stdin), or an interactive shell when stdin is a terminal. Options
+/// `-e -u -x -f -C` as in POSIX, `-i` forces interactive, `-l` login.
+pub fn sh_main(ctx: &mut ctx::Ctx) -> i32 {
+    let args = ctx.args.clone();
+    let mut opts = Opts::default();
+    let (mut command, mut from_stdin, mut force_i, mut login) = (None::<String>, false, false, false);
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !(a.starts_with('-') || a.starts_with('+')) || a.len() < 2 {
+            break;
+        }
+        let on = a.starts_with('-');
+        for c in a[1..].chars() {
+            match c {
+                'c' => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(src) => command = Some(src.clone()),
+                        None => {
+                            ctx.eprint("sh: -c: option requires an argument\n");
+                            return 2;
+                        }
+                    }
+                }
+                's' => from_stdin = true,
+                'i' => force_i = true,
+                'l' => login = true,
+                'e' => opts.errexit = on,
+                'u' => opts.nounset = on,
+                'x' => opts.xtrace = on,
+                'f' => opts.noglob = on,
+                'C' => opts.noclobber = on,
+                _ => {
+                    ctx.eprint(&alloc::format!("sh: -{c}: invalid option\nUsage: sh [-eux] [-c command [name [arg...]]] [file [arg...]]\n"));
+                    return 2;
+                }
+            }
+        }
+        i += 1;
+    }
+    ctx.flush();
+    let rest: Vec<String> = args[i.min(args.len())..].to_vec();
+    let proc = crate::proc::current();
+    let user = crate::users::by_uid(proc.cred().euid);
+    if let Some(src) = command {
+        let mut sh = Shell::new(proc, false);
+        sh.opts = opts;
+        sh.arg0 = rest.first().cloned().unwrap_or_else(|| String::from("sh"));
+        sh.args = rest.get(1..).map(|v| v.to_vec()).unwrap_or_default();
+        let st = sh.run_source(&src);
+        return sh.finish(st);
+    }
+    if !from_stdin {
+        if let Some(file) = rest.first() {
+            let fs = crate::fs::ops::Ctx::of(&proc);
+            let data = match crate::fs::ops::read_file(&fs, file) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.eprint(&alloc::format!("sh: {file}: {e}\n"));
+                    return if e == crate::errno::Errno::ENOENT { 127 } else { 126 };
+                }
+            };
+            let mut sh = Shell::new(proc, false);
+            sh.opts = opts;
+            sh.arg0 = file.clone();
+            sh.args = rest[1..].to_vec();
+            let st = sh.run_source(&String::from_utf8_lossy(&data));
+            return sh.finish(st);
+        }
+    }
+    let tty = ctx.stdin_tty().is_some();
+    if (tty && !from_stdin) || force_i {
+        let Some(u) = user else { return 1 };
+        return user_shell(&u, login, None);
+    }
+    let data = match ctx.read_input("-") {
+        Ok(d) => d,
+        Err(e) => {
+            ctx.eprint(&alloc::format!("sh: stdin: {e}\n"));
+            return 2;
+        }
+    };
+    let mut sh = Shell::new(proc, false);
+    sh.opts = opts;
+    sh.arg0 = String::from("sh");
+    sh.args = rest;
+    let st = sh.run_source(&String::from_utf8_lossy(&data));
+    sh.finish(st)
 }
 
 /// Run one command string (SSH `exec`, `sh -c`).
@@ -347,16 +542,11 @@ pub fn command_main(src: String, user: crate::users::User) -> i32 {
     sh.sync_env();
     sh.source_if_exists("/etc/profile");
     let code = sh.run_source(&src);
-    sh.run_exit_trap();
-    if sh.flow == Flow::Exit {
-        sh.exit_code
-    } else {
-        code
-    }
+    sh.finish(code)
 }
 
 impl Shell {
-    fn interactive_loop(&mut self) -> i32 {
+    pub(crate) fn interactive_loop(&mut self) -> i32 {
         let mut editor = readline::Editor::new();
         loop {
             self.report_jobs();
@@ -403,11 +593,14 @@ impl Shell {
             };
             self.history.push(&expanded);
             let _ = self.history.save(&self.proc);
-            crate::sched::with_current(|t| t.clear_signals());
+            if !crate::proc::absorb_signals() {
+                break;
+            }
             self.run_source(&expanded);
             if self.flow == Flow::Exit {
                 break;
             }
+            // Break/Continue outside loops, Interrupt: back to the prompt.
             self.flow = Flow::Normal;
         }
         self.run_exit_trap();

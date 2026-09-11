@@ -319,6 +319,13 @@ impl Shell {
                 match proc::wait(&self.proc, WaitFor::Pid(c.pid), false) {
                     Ok(Some((_, st))) => {
                         last = st.shell_code();
+                        // bash's "cooperative exit": ^C that killed a
+                        // foreground job abandons the whole command line.
+                        if let ExitStatus::Signaled(proc::signal::SIGINT | proc::signal::SIGQUIT) = st {
+                            if self.interactive && self.flow == Flow::Normal {
+                                self.flow = Flow::Interrupt;
+                            }
+                        }
                         if let ExitStatus::Signaled(sig) = st {
                             if sig != proc::signal::SIGINT && sig != proc::signal::SIGPIPE && core::ptr::eq(c.as_ref(), children.last().map(|x| x.as_ref()).unwrap_or(c)) {
                                 self.err(&alloc::format!("{}\n", proc::signal::describe(sig)));
@@ -327,10 +334,18 @@ impl Shell {
                         break;
                     }
                     Ok(None) => continue,
-                    // ^C reaches the foreground group, not us; keep waiting.
+                    // ^C reaches the whole foreground group: keep waiting for
+                    // the child; a script acts on the signal afterwards.
                     Err(Errno::EINTR) => {
-                        crate::sched::with_current(|t| t.clear_signals());
-                        continue;
+                        if !self.interactive && self.fatal_while_waiting() {
+                            // Default disposition: the shell dies now; the
+                            // child keeps running, as on Linux.
+                            return self.exit_code;
+                        }
+                        if crate::proc::absorb_signals() {
+                            continue;
+                        }
+                        break;
                     }
                     Err(_) => break,
                 }
@@ -349,6 +364,14 @@ impl Shell {
     // ── single commands ─────────────────────────────────────────────────
 
     pub fn run_command(&mut self, c: &Command) -> i32 {
+        if crate::proc::killed() {
+            // SIGKILL: stop at the next command, whatever the script does.
+            self.flow = Flow::Exit;
+            self.exit_code = 128 + crate::proc::signal::SIGKILL as i32;
+        }
+        if self.flow == Flow::Normal {
+            self.handle_signals();
+        }
         if self.flow != Flow::Normal {
             return self.status;
         }
@@ -892,12 +915,7 @@ impl Shell {
             sub.funcs.clear();
             sub.aliases.clear();
             let st = sub.run_source(&text);
-            sub.run_exit_trap();
-            if sub.flow == Flow::Exit {
-                sub.exit_code
-            } else {
-                st
-            }
+            sub.finish(st)
         })
         .map_err(|e| alloc::format!("fork: {e}"))
     }
@@ -909,6 +927,7 @@ impl Shell {
         s.flow = Flow::Normal;
         s.history = super::history::History::new();
         s.traps.clear();
+        s.deferred_signals = 0;
         s
     }
 
@@ -922,12 +941,7 @@ impl Shell {
                 Command::Subshell { body, redirs } => sub.with_redirs(redirs, |sh| sh.run_list(body)),
                 other => sub.run_command(other),
             };
-            sub.run_exit_trap();
-            if sub.flow == Flow::Exit {
-                sub.exit_code
-            } else {
-                st
-            }
+            sub.finish(st)
         })
     }
 

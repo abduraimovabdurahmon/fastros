@@ -84,9 +84,17 @@ pub fn start_getty() {
         if let Ok(p) = crate::proc::spawn(spawn, move || crate::shell::login_shell_main(u)) {
             tty.set_session(p.pid);
             tty.set_fg_pgrp(p.pid);
+            crate::utmp::login(crate::utmp::Session {
+                user: user.name.clone(),
+                tty: tty.name.clone(),
+                from: String::new(),
+                login_unix: crate::time::unix_now(),
+                pid: p.pid,
+            });
             if let Some(t) = p.tasks().into_iter().next() {
                 t.join();
             }
+            crate::utmp::logout(p.pid);
         }
     });
 }

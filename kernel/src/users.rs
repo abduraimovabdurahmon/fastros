@@ -235,7 +235,7 @@ fn days_since_epoch() -> u64 {
     crate::time::unix_now() / 86400
 }
 
-pub fn set_password(name: &str, password: &str) -> KResult<()> {
+fn set_password_unlocked(name: &str, password: &str) -> KResult<()> {
     if by_name(name).is_none() {
         return Err(Errno::ENOENT);
     }
@@ -249,7 +249,7 @@ pub fn set_password(name: &str, password: &str) -> KResult<()> {
     write_lines(SHADOW, &lines, 0o600)
 }
 
-pub fn lock_password(name: &str, lock: bool) -> KResult<()> {
+fn lock_password_unlocked(name: &str, lock: bool) -> KResult<()> {
     let mut lines = read_lines(SHADOW);
     let l = lines.iter_mut().find(|l| l.split(':').next() == Some(name)).ok_or(Errno::ENOENT)?;
     let mut f: Vec<String> = l.split(':').map(|s| s.to_string()).collect();
@@ -304,7 +304,7 @@ fn next_free(used: impl Iterator<Item = u32>, from: u32) -> u32 {
     cand
 }
 
-pub fn add_group(name: &str, gid: Option<u32>) -> KResult<u32> {
+fn add_group_unlocked(name: &str, gid: Option<u32>) -> KResult<u32> {
     if !valid_name(name) {
         return Err(Errno::EINVAL);
     }
@@ -323,7 +323,7 @@ pub fn add_group(name: &str, gid: Option<u32>) -> KResult<u32> {
     Ok(gid)
 }
 
-pub fn del_group(name: &str) -> KResult<()> {
+fn del_group_unlocked(name: &str) -> KResult<()> {
     let g = group_by_name(name).ok_or(Errno::ENOENT)?;
     if users().iter().any(|u| u.gid == g.gid) {
         return Err(Errno::EBUSY); // primary group of a user
@@ -332,7 +332,7 @@ pub fn del_group(name: &str) -> KResult<()> {
     write_lines(GROUP, &lines, 0o644)
 }
 
-pub fn add_to_group(user: &str, group: &str) -> KResult<()> {
+fn add_to_group_unlocked(user: &str, group: &str) -> KResult<()> {
     let mut lines = read_lines(GROUP);
     let l = lines.iter_mut().find(|l| l.split(':').next() == Some(group)).ok_or(Errno::ENOENT)?;
     let mut g = parse_group(l).ok_or(Errno::EINVAL)?;
@@ -343,7 +343,7 @@ pub fn add_to_group(user: &str, group: &str) -> KResult<()> {
     write_lines(GROUP, &lines, 0o644)
 }
 
-pub fn remove_from_groups(user: &str) -> KResult<()> {
+fn remove_from_groups_unlocked(user: &str) -> KResult<()> {
     let lines: Vec<String> = read_lines(GROUP)
         .into_iter()
         .map(|l| match parse_group(&l) {
@@ -357,7 +357,7 @@ pub fn remove_from_groups(user: &str) -> KResult<()> {
     write_lines(GROUP, &lines, 0o644)
 }
 
-pub fn add_user(n: &NewUser) -> KResult<User> {
+fn add_user_unlocked(n: &NewUser) -> KResult<User> {
     if !valid_name(n.name) {
         return Err(Errno::EINVAL);
     }
@@ -374,7 +374,7 @@ pub fn add_user(n: &NewUser) -> KResult<User> {
         Some(g) => g,
         None => match group_by_name(n.name) {
             Some(g) => g.gid,
-            None => add_group(n.name, Some(uid)).or_else(|_| add_group(n.name, None))?,
+            None => add_group_unlocked(n.name, Some(uid)).or_else(|_| add_group_unlocked(n.name, None))?,
         },
     };
     let home = n.home.map(|h| h.to_string()).unwrap_or_else(|| format!("/home/{}", n.name));
@@ -386,7 +386,7 @@ pub fn add_user(n: &NewUser) -> KResult<User> {
     sh.push(format!("{}:!:{}:0:99999:7:::", u.name, days_since_epoch()));
     write_lines(SHADOW, &sh, 0o600)?;
     for g in &n.extra_groups {
-        add_to_group(&u.name, g)?;
+        add_to_group_unlocked(&u.name, g)?;
     }
     if n.create_home {
         let ctx = root_ctx();
@@ -403,7 +403,7 @@ pub fn add_user(n: &NewUser) -> KResult<User> {
     Ok(u)
 }
 
-pub fn del_user(name: &str, remove_home: bool) -> KResult<()> {
+fn del_user_unlocked(name: &str, remove_home: bool) -> KResult<()> {
     let u = by_name(name).ok_or(Errno::ENOENT)?;
     if u.uid == 0 {
         return Err(Errno::EPERM);
@@ -412,15 +412,109 @@ pub fn del_user(name: &str, remove_home: bool) -> KResult<()> {
     write_lines(PASSWD, &p, 0o644)?;
     let s: Vec<String> = read_lines(SHADOW).into_iter().filter(|l| l.split(':').next() != Some(name)).collect();
     write_lines(SHADOW, &s, 0o600)?;
-    remove_from_groups(name)?;
+    remove_from_groups_unlocked(name)?;
     // The user's private group goes too when nobody else uses it.
     if let Some(g) = group_by_name(name) {
         if g.gid == u.gid && g.members.is_empty() {
-            let _ = del_group(name);
+            let _ = del_group_unlocked(name);
         }
     }
     if remove_home {
         crate::fs::ops::remove_tree(&root_ctx(), &u.home)?;
+    }
+    Ok(())
+}
+
+// ── serialized entry points ────────────────────────────────────────────────
+//
+// Every change to passwd/group/shadow is a read-modify-write of whole files;
+// one lock orders them so concurrent `useradd`s cannot lose each other's
+// lines. (Readers need no lock: files are replaced atomically by rename.)
+
+static DB_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+pub fn set_password(name: &str, password: &str) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    set_password_unlocked(name, password)
+}
+
+pub fn lock_password(name: &str, lock: bool) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    lock_password_unlocked(name, lock)
+}
+
+pub fn add_group(name: &str, gid: Option<u32>) -> KResult<u32> {
+    let _g = DB_LOCK.lock();
+    add_group_unlocked(name, gid)
+}
+
+pub fn del_group(name: &str) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    del_group_unlocked(name)
+}
+
+pub fn add_to_group(user: &str, group: &str) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    add_to_group_unlocked(user, group)
+}
+
+pub fn remove_from_group(user: &str, group: &str) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    let mut lines = read_lines(GROUP);
+    let l = lines.iter_mut().find(|l| l.split(':').next() == Some(group)).ok_or(Errno::ENOENT)?;
+    let mut g = parse_group(l).ok_or(Errno::EINVAL)?;
+    if !g.members.iter().any(|m| m == user) {
+        return Err(Errno::ESRCH);
+    }
+    g.members.retain(|m| m != user);
+    *l = format!("{}:x:{}:{}", g.name, g.gid, g.members.join(","));
+    write_lines(GROUP, &lines, 0o644)
+}
+
+pub fn remove_from_groups(user: &str) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    remove_from_groups_unlocked(user)
+}
+
+pub fn add_user(n: &NewUser) -> KResult<User> {
+    let _g = DB_LOCK.lock();
+    add_user_unlocked(n)
+}
+
+pub fn del_user(name: &str, remove_home: bool) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    del_user_unlocked(name, remove_home)
+}
+
+/// Rewrite `name`'s passwd entry through `f` (usermod, chsh, chfn).
+pub fn modify_user(name: &str, f: impl FnOnce(&mut User) -> KResult<()>) -> KResult<User> {
+    let _g = DB_LOCK.lock();
+    let mut lines = read_lines(PASSWD);
+    let idx = lines.iter().position(|l| l.split(':').next() == Some(name)).ok_or(Errno::ENOENT)?;
+    let mut u = parse_user(&lines[idx]).ok_or(Errno::EINVAL)?;
+    f(&mut u)?;
+    if u.name != name && lines.iter().any(|l| l.split(':').next() == Some(u.name.as_str())) {
+        return Err(Errno::EEXIST);
+    }
+    if [&u.gecos, &u.home, &u.shell].iter().any(|v| v.contains(':') || v.contains('\n')) {
+        return Err(Errno::EINVAL);
+    }
+    lines[idx] = format!("{}:x:{}:{}:{}:{}:{}", u.name, u.uid, u.gid, u.gecos, u.home, u.shell);
+    write_lines(PASSWD, &lines, 0o644)?;
+    Ok(u)
+}
+
+/// Replace `user`'s supplementary groups with exactly `groups`.
+pub fn set_groups(user: &str, groups: &[String]) -> KResult<()> {
+    let _g = DB_LOCK.lock();
+    for g in groups {
+        if group_by_name(g).is_none() {
+            return Err(Errno::ENOENT);
+        }
+    }
+    remove_from_groups_unlocked(user)?;
+    for g in groups {
+        add_to_group_unlocked(user, g)?;
     }
     Ok(())
 }

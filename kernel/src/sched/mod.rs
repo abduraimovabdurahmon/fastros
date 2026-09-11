@@ -27,6 +27,9 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64,
 
 pub type Tid = u32;
 
+/// Pending-signal bit of SIGKILL.
+const KILL_BIT: u64 = 1 << (crate::proc::signal::SIGKILL - 1);
+
 /// Kernel stack size per task.
 pub const KSTACK_PAGES: usize = 16;
 /// Time slice before `cond_resched` / user preemption hands the CPU on.
@@ -134,8 +137,19 @@ impl Task {
             }
         }
     }
+    /// Discard pending signals, except SIGKILL, which can never be discarded.
     pub fn clear_signals(&self) {
-        self.signals.store(0, Ordering::Release);
+        self.signals.fetch_and(KILL_BIT, Ordering::AcqRel);
+    }
+    /// Discard one pending signal (SIGKILL cannot be discarded).
+    pub fn clear_signal(&self, sig: u32) {
+        if (1..=64).contains(&sig) && sig != crate::proc::signal::SIGKILL {
+            self.signals.fetch_and(!(1 << (sig - 1)), Ordering::AcqRel);
+        }
+    }
+    /// SIGKILL is pending: whatever the task is doing must unwind and exit.
+    pub fn kill_pending(&self) -> bool {
+        self.signals.load(Ordering::Acquire) & KILL_BIT != 0
     }
     pub fn has_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)

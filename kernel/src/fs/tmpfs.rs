@@ -26,6 +26,8 @@ pub struct TmpFs {
     dev: u64,
     root: Arc<TmpNode>,
     shared: Arc<Shared>,
+    /// `tmpfs`, or `devtmpfs` for /dev.
+    type_name: &'static str,
 }
 
 struct Shared {
@@ -67,11 +69,15 @@ pub struct TmpNode {
 impl TmpFs {
     /// `limit` in bytes (0 = unlimited).
     pub fn new(limit: u64) -> Arc<TmpFs> {
+        Self::named(limit, "tmpfs")
+    }
+    /// A tmpfs reporting another type name (`devtmpfs`).
+    pub fn named(limit: u64, type_name: &'static str) -> Arc<TmpFs> {
         let dev = NEXT_DEV.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared { dev, next_ino: AtomicU64::new(2), used: AtomicU64::new(0), limit, inodes: AtomicU64::new(1) });
         let root = TmpNode::new(&shared, 1, FileType::Directory, 0o755, 0, 0, 0, Data::Dir(BTreeMap::new()));
         root.meta.lock().nlink = 2;
-        Arc::new(TmpFs { dev, root, shared })
+        Arc::new(TmpFs { dev, root, shared, type_name })
     }
     pub fn root_node(&self) -> Arc<TmpNode> {
         self.root.clone()
@@ -83,7 +89,7 @@ impl FileSystem for TmpFs {
         self.root.clone()
     }
     fn fs_type(&self) -> &'static str {
-        "tmpfs"
+        self.type_name
     }
     fn dev(&self) -> u64 {
         self.dev

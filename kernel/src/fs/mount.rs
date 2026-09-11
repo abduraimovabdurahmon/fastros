@@ -101,15 +101,33 @@ impl MountNamespace {
         Ok(())
     }
 
+    /// Bind mount: make the subtree at `src` visible at `at` as well.
+    pub fn bind(&self, at: &PathRef, src: &PathRef, flags: MountFlags) -> KResult<()> {
+        if !at.inode.is_dir() || !src.inode.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let m = Arc::new(Mount {
+            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
+            root: src.inode.clone(),
+            fs: src.mount.fs.clone(),
+            source: src.mount.source.clone(),
+            flags: SpinLock::new(flags),
+            parent: Some((at.mount.id, at.inode.id())),
+            point: Some(at.clone()),
+        });
+        self.mounts.lock().push(m);
+        Ok(())
+    }
+
     /// Detach the filesystem mounted at `at` (which must be a mount root).
     pub fn umount(&self, at: &PathRef) -> KResult<Arc<Mount>> {
         let mut mounts = self.mounts.lock();
         let idx = mounts.iter().position(|m| m.id == at.mount.id).ok_or(Errno::EINVAL)?;
-        if mounts[idx].parent.is_none() {
-            return Err(Errno::EBUSY); // the namespace root
-        }
         if !Arc::ptr_eq(&mounts[idx].root, &at.inode) {
             return Err(Errno::EINVAL); // not a mount point
+        }
+        if mounts[idx].parent.is_none() {
+            return Err(Errno::EBUSY); // the namespace root
         }
         let id = mounts[idx].id;
         if mounts.iter().any(|m| m.parent.is_some_and(|(p, _)| p == id)) {

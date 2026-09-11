@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub mod consts {
     // c_iflag
@@ -173,6 +173,8 @@ pub struct Tty {
     fg_pgrp: AtomicU32,
     session: AtomicU32,
     hung_up: AtomicBool,
+    /// Monotonic time of the last input byte (`w`/`who -u` idle time).
+    last_input_ns: AtomicU64,
 }
 
 const MAX_LINE: usize = 4095;
@@ -190,6 +192,7 @@ impl Tty {
             fg_pgrp: AtomicU32::new(0),
             session: AtomicU32::new(0),
             hung_up: AtomicBool::new(false),
+            last_input_ns: AtomicU64::new(crate::time::now_ns()),
         })
     }
 
@@ -265,6 +268,11 @@ impl Tty {
         self.read_wq.wake_all();
     }
 
+    /// Nanoseconds since the last input byte.
+    pub fn idle_ns(&self) -> u64 {
+        crate::time::now_ns().saturating_sub(self.last_input_ns.load(Ordering::Relaxed))
+    }
+
     pub fn is_hung_up(&self) -> bool {
         self.hung_up.load(Ordering::Acquire)
     }
@@ -333,6 +341,7 @@ impl Tty {
 
     /// Feed bytes typed on the terminal.
     pub fn receive(&self, data: &[u8]) {
+        self.last_input_ns.store(crate::time::now_ns(), Ordering::Relaxed);
         let t = self.termios();
         for &b in data {
             self.receive_byte(&t, b);
@@ -700,4 +709,16 @@ pub fn alloc_pty(driver: Arc<dyn TtyDriver>, ws: WinSize) -> (u32, Arc<Tty>) {
 /// Live pseudo-terminals (for `who`, /dev/pts).
 pub fn ptys() -> Vec<Arc<Tty>> {
     PTS.lock().iter().filter_map(|w| w.as_ref().and_then(|w| w.upgrade())).collect()
+}
+
+/// Every live terminal: the console and the pseudo-terminals.
+pub fn all() -> Vec<Arc<Tty>> {
+    let mut v: Vec<Arc<Tty>> = crate::console::tty().into_iter().collect();
+    v.extend(ptys());
+    v
+}
+
+/// A live terminal by name (`console`, `pts/3`).
+pub fn by_name(name: &str) -> Option<Arc<Tty>> {
+    all().into_iter().find(|t| t.name == name)
 }

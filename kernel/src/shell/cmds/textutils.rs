@@ -943,9 +943,7 @@ pub fn tee(ctx: &mut Ctx) -> i32 {
                     let _ = f.write_all(&buf[..n]);
                 }
             }
-            Err(Errno::EINTR) if p.has('i') => {
-                crate::sched::with_current(|t| t.clear_signals());
-            }
+            Err(Errno::EINTR) if p.has('i') && crate::proc::absorb_signals() => {}
             Err(_) => break,
         }
     }

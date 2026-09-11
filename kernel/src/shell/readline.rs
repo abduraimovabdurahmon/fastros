@@ -538,7 +538,9 @@ fn read_byte(tty: &Arc<Tty>) -> Option<u8> {
             Ok(1) => return Some(b[0]),
             Ok(_) => return None, // hangup / EOF
             Err(Errno::EINTR) => {
-                crate::sched::with_current(|t| t.clear_signals());
+                if !crate::proc::absorb_signals() {
+                    return None;
+                }
                 continue;
             }
             Err(_) => return None,
@@ -652,7 +654,9 @@ fn plain_read_line(sh: &Shell, stdin: &Arc<dyn File>, prompt: &str) -> Option<St
                 break;
             }
             Err(Errno::EINTR) => {
-                crate::sched::with_current(|t| t.clear_signals());
+                if !crate::proc::absorb_signals() {
+                    return None;
+                }
             }
             Err(_) => return None,
         }
