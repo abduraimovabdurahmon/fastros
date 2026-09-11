@@ -155,6 +155,10 @@ pub fn copy_tree(ctx: &Ctx, from: &str, to: &str) -> KResult<()> {
         Err(e) => return Err(e),
     }
     for e in ops::list_dir(ctx, from)? {
+        // Copying a whole image tree is a long, kernel-side operation: yield
+        // between entries so a big image (nginx, postgres) never starves the
+        // rest of the system while a container starts.
+        crate::sched::cond_resched();
         let src = format!("{from}/{}", e.name);
         let dst = format!("{to}/{}", e.name);
         let m = match ops::stat(ctx, &src, false) {
@@ -172,15 +176,33 @@ pub fn copy_tree(ctx: &Ctx, from: &str, to: &str) -> KResult<()> {
                 }
             }
             FileType::Regular => {
-                if let Ok(bytes) = ops::read_file(ctx, &src) {
-                    let _ = ops::write_file(ctx, &dst, &bytes, m.perm);
-                }
+                copy_file(ctx, &src, &dst, m.perm)?;
             }
             _ => {
                 let _ = ops::mknod(ctx, &dst, m.kind, m.perm, m.rdev);
             }
         }
         let _ = ops::chown(ctx, &dst, Some(m.uid), Some(m.gid), m.kind != FileType::Symlink);
+    }
+    Ok(())
+}
+
+/// Stream one regular file in fixed chunks, yielding between them, so a large
+/// file is copied without loading it all into RAM and without starving the CPU.
+fn copy_file(ctx: &Ctx, src: &str, dst: &str, perm: u16) -> KResult<()> {
+    let input = match ops::open(ctx, src, flags::O_RDONLY, 0) {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    let output = ops::open(ctx, dst, flags::O_WRONLY | flags::O_CREAT | flags::O_TRUNC, perm)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        (*output).write_all(&buf[..n])?;
+        crate::sched::cond_resched();
     }
     Ok(())
 }
