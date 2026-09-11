@@ -176,8 +176,15 @@ pub fn fcntl(fd: i32, cmd: u32, arg: usize) -> KResult<usize> {
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
     const F_DUPFD_CLOEXEC: u32 = 1030;
+    const F_SETOWN: u32 = 8;
+    const F_GETOWN: u32 = 9;
+    const F_SETSIG: u32 = 10;
+    const F_GETSIG: u32 = 11;
     let p = proc::current();
     match cmd {
+        // Signal-driven I/O ownership: SIGIO is not delivered, but accept the
+        // calls (servers arm them on their channel fds) so they proceed.
+        F_SETOWN | F_SETSIG | F_GETOWN | F_GETSIG => Ok(0),
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let f = fdt_get(fd)?;
             let nfd = p.fds.lock().alloc(f, cmd == F_DUPFD_CLOEXEC, arg)?;
@@ -199,6 +206,25 @@ pub fn fcntl(fd: i32, cmd: u32, arg: usize) -> KResult<usize> {
 
 pub fn ioctl(fd: i32, req: u32, arg: usize) -> KResult<usize> {
     fdt_get(fd)?.ioctl(req, arg)
+}
+
+/// `io_setup(2)`: hand back an AIO context id. We do not run real kernel AIO,
+/// but a server that only *initialises* an AIO context at startup (nginx with
+/// its default config, which serves via sendfile, not aio) must not fail here.
+pub fn io_setup(_nr_events: u32, _ctxp: usize) -> KResult<usize> {
+    // No kernel AIO: report it unavailable so nginx disables its aio path
+    // (non-fatal) rather than setting up an aio eventfd it then mishandles.
+    Err(Errno::ENOSYS)
+}
+
+pub fn io_destroy(_ctx: usize) -> KResult<usize> {
+    Ok(0)
+}
+
+pub fn eventfd(initval: u32, flags: u32) -> KResult<usize> {
+    let ev = crate::fs::eventfd::EventFd::new(initval, flags);
+    let cloexec = flags & crate::fs::eventfd::EFD_CLOEXEC != 0;
+    Ok(proc::current().fds.lock().alloc(ev, cloexec, 0)? as usize)
 }
 
 pub fn pipe(fds: usize, flags: u32) -> KResult<usize> {

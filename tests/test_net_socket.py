@@ -103,3 +103,50 @@ def test_loopback_tcp_epoll(g, sock_bin):
     assert "epoll ready: 1" in out, out + err
     assert "done" in out, out + err
     assert st == 0
+
+
+SPAIR = r"""
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <unistd.h>
+int main(void){
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)){ perror("socketpair"); return 1; }
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {0}; ev.events = EPOLLIN; ev.data.fd = sv[0];
+    epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &ev);
+    struct epoll_event out[4];
+    // Both ends open: sv[0] must NOT be reported HUP/readable (no data written).
+    int r = epoll_wait(ep, out, 4, 300);
+    printf("both-open ready=%d rev=%#x\n", r, r>0?out[0].events:0);
+    // Write on sv[1]; sv[0] must become readable (EPOLLIN).
+    write(sv[1], "x", 1);
+    r = epoll_wait(ep, out, 4, 1000);
+    printf("after-write ready=%d rev=%#x\n", r, r>0?out[0].events:0);
+    // Close sv[1]; sv[0] must now report HUP.
+    close(sv[1]);
+    r = epoll_wait(ep, out, 4, 1000);
+    printf("peer-closed ready=%d rev=%#x\n", r, r>0?out[0].events:0);
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def spair_bin():
+    return _compile(SPAIR)
+
+
+def test_socketpair_epoll(g, spair_bin):
+    b64 = base64.b64encode(spair_bin).decode()
+    g.ok("base64 -d > /tmp/spair && chmod +x /tmp/spair", stdin=b64)
+    out, err, st = g.run("fexec /tmp/spair")
+    # Both ends open: no spurious HUP.
+    assert "both-open ready=0" in out, out + err
+    # A write wakes the read end.
+    assert "after-write ready=1" in out, out + err
+    # Only after the peer closes should HUP appear (0x10); the unread byte also
+    # keeps EPOLLIN set, so 0x11 (IN|HUP) is the correct combined result.
+    tail = out.split("peer-closed")[1][:40]
+    assert "ready=1" in tail and "0x1" in tail, out + err

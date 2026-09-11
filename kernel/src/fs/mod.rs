@@ -12,6 +12,7 @@
 pub mod bcache;
 pub mod boot;
 pub mod devfs;
+pub mod eventfd;
 pub mod ext2fs;
 pub mod file;
 pub mod mount;

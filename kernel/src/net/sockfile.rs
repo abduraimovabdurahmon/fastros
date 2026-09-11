@@ -316,7 +316,9 @@ impl File for SocketFile {
     fn ioctl(&self, req: u32, arg: usize) -> KResult<usize> {
         const FIONBIO: u32 = 0x5421;
         const FIONREAD: u32 = 0x541B;
+        const FIOASYNC: u32 = 0x5452;
         match req {
+            FIOASYNC => Ok(0), // SIGIO not delivered; accept so servers proceed
             FIONBIO => {
                 let on: u32 = crate::uaccess::read_obj(arg)?;
                 let old = self.flags.load(Ordering::Relaxed);

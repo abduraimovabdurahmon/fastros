@@ -250,6 +250,7 @@ impl File for PipeEnd {
     fn ioctl(&self, req: u32, arg: usize) -> KResult<usize> {
         const FIONREAD: u32 = 0x541B;
         const FIONBIO: u32 = 0x5421;
+        const FIOASYNC: u32 = 0x5452;
         if req == FIONREAD {
             let n = self.pipe.inner.lock().data.len() as u32;
             crate::uaccess::write_obj(arg, &n)?;
@@ -260,6 +261,11 @@ impl File for PipeEnd {
             let old = self.flags.load(Ordering::Relaxed);
             let new = if on != 0 { old | flags::O_NONBLOCK } else { old & !flags::O_NONBLOCK };
             self.flags.store(new, Ordering::Relaxed);
+            return Ok(0);
+        }
+        if req == FIOASYNC {
+            // Signal-driven I/O (SIGIO) is not delivered, but accept the request
+            // so servers that arm it on their channel fds proceed.
             return Ok(0);
         }
         Err(Errno::ENOTTY)

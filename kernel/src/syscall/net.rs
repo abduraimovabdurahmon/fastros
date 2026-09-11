@@ -324,7 +324,10 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> KResult<usize> {
 /// Ready events for one interest against its fd's current poll state.
 fn ready_events(it: &Interest) -> u32 {
     let Ok(f) = fdt_get(it.fd) else {
-        return (EPOLLERR | EPOLLHUP) & (it.events | EPOLLERR | EPOLLHUP);
+        // Linux removes a closed descriptor from every epoll set automatically,
+        // so a gone fd yields no events (rather than a synthesised ERR|HUP that
+        // a poll loop would spin on or mis-handle).
+        return 0;
     };
     let p = f.poll();
     let mut r = 0u32;

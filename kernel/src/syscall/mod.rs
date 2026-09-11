@@ -102,6 +102,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         262 => ret(file::newfstatat(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32)),
         292 => ret(file::dup3(a[0] as i32, a[1] as i32, a[2] as u32)),
         293 => ret(file::pipe(a[0] as usize, a[1] as u32)),
+        206 => ret(file::io_setup(a[0] as u32, a[1] as usize)),
+        207 => ret(file::io_destroy(a[0] as usize)),
+        284 => ret(file::eventfd(a[0] as u32, 0)),
+        290 => ret(file::eventfd(a[0] as u32, a[1] as u32)),
 
         // ── sockets ──
         41 => ret(net::socket(a[0] as i32, a[1] as i32, a[2] as i32)),
