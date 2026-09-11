@@ -59,6 +59,21 @@ struct FileBacking {
     length: u64,
 }
 
+impl FileBacking {
+    /// The backing for a sub-region starting `delta` bytes into this one: the
+    /// file offset advances and the real-content length shrinks (the rest is
+    /// the zero/bss tail). Splitting a file-backed VMA (unmap/mprotect) must use
+    /// this, or the tail would demand-fill from the wrong file offset.
+    fn shifted(&self, delta: usize) -> FileBacking {
+        FileBacking { file: self.file.clone(), offset: self.offset + delta as u64, length: self.length.saturating_sub(delta as u64) }
+    }
+}
+
+/// Shift an optional file backing by `delta` bytes (no-op for anonymous VMAs).
+fn shift_backing(b: &Option<FileBacking>, delta: usize) -> Option<FileBacking> {
+    b.as_ref().map(|fb| fb.shifted(delta))
+}
+
 /// One contiguous mapping — a VMA. Either anonymous (demand-zeroed) or backed
 /// by a file (demand-filled, private). Every page is per-process private.
 #[derive(Clone)]
@@ -210,7 +225,7 @@ impl AddressSpace {
                 out.push(Region { end: start, ..r.clone() });
             }
             if end < r.end {
-                out.push(Region { start: end, ..r.clone() });
+                out.push(Region { start: end, backing: shift_backing(&r.backing, end - r.start), ..r.clone() });
             }
         }
         *regions = out;
@@ -245,9 +260,10 @@ impl AddressSpace {
             if r.start < start {
                 out.push(Region { end: start, ..r.clone() });
             }
-            out.push(Region { start: start.max(r.start), end: end.min(r.end), prot, grows_down: r.grows_down, backing: r.backing.clone() });
+            let mid_start = start.max(r.start);
+            out.push(Region { start: mid_start, end: end.min(r.end), prot, grows_down: r.grows_down, backing: shift_backing(&r.backing, mid_start - r.start) });
             if end < r.end {
-                out.push(Region { start: end, ..r.clone() });
+                out.push(Region { start: end, backing: shift_backing(&r.backing, end - r.start), ..r.clone() });
             }
         }
         *regions = out;
