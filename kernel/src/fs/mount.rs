@@ -75,6 +75,25 @@ impl MountNamespace {
         Arc::new(MountNamespace { id: NEXT_NS_ID.fetch_add(1, Ordering::Relaxed), mounts: SpinLock::new(alloc::vec![m]), root })
     }
 
+    /// A namespace whose root is the directory `dir` (a subtree of some other
+    /// namespace): the container-rootfs case. The root mount reuses `dir`'s
+    /// filesystem but presents `dir`'s inode as `/`; the caller then mounts
+    /// `/proc`, `/dev`, `/tmp` inside it. The chroot boundary is enforced by
+    /// the resolver (`..` cannot climb above the namespace root).
+    pub fn with_root(dir: &PathRef, flags: MountFlags) -> Arc<MountNamespace> {
+        let m = Arc::new(Mount {
+            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
+            root: dir.inode.clone(),
+            fs: dir.mount.fs.clone(),
+            source: dir.mount.source.clone(),
+            flags: SpinLock::new(flags),
+            parent: None,
+            point: None,
+        });
+        let root = Arc::new(PathNode { mount: m.clone(), inode: dir.inode.clone(), name: String::new(), parent: None });
+        Arc::new(MountNamespace { id: NEXT_NS_ID.fetch_add(1, Ordering::Relaxed), mounts: SpinLock::new(alloc::vec![m]), root })
+    }
+
     pub fn root(&self) -> PathRef {
         self.root.clone()
     }

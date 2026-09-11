@@ -61,6 +61,17 @@ pub fn parse(s: &str) -> Option<u32> {
     NAMES.iter().position(|&n| !n.is_empty() && n == bare).map(|i| i as u32)
 }
 
+/// Signals whose default action stops the process (we treat stop as a no-op
+/// for now — no job control for user containers yet).
+pub fn stops_by_default(sig: u32) -> bool {
+    matches!(sig, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+}
+
+/// Would this signal, with no handler installed, terminate the process?
+pub fn terminates_by_default(sig: u32) -> bool {
+    sig != 0 && !ignored_by_default(sig) && !stops_by_default(sig)
+}
+
 /// Signals whose default action is to ignore them.
 pub fn ignored_by_default(sig: u32) -> bool {
     matches!(sig, SIGCHLD | SIGWINCH | SIGURG | SIGCONT)

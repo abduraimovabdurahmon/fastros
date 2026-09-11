@@ -484,6 +484,31 @@ pub fn signal_current(sig: u32) {
     }
 }
 
+/// On the way back to ring 3, act on a pending signal that has no user
+/// handler: a fatal default action terminates the process. (User-installed
+/// handlers are not supported yet, so every non-ignored signal is fatal.)
+/// Called from the syscall and interrupt return paths.
+pub fn deliver_user_signals() {
+    // Only meaningful for user processes.
+    if current_aspace().is_none() {
+        return;
+    }
+    let pending = sched::with_current(|t| t.pending_signals());
+    if pending == 0 {
+        return;
+    }
+    for sig in 1..=64u32 {
+        if pending & (1 << (sig - 1)) == 0 {
+            continue;
+        }
+        if signal::terminates_by_default(sig) {
+            exit_current(ExitStatus::Signaled(sig));
+        }
+        // Ignored / stop signals: consume them so they don't spin.
+        sched::with_current(|t| t.clear_signal(sig));
+    }
+}
+
 /// Did the current task receive a signal that should stop its work?
 pub fn interrupted() -> bool {
     sched::with_current(|t| t.signal_pending())

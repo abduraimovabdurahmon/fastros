@@ -26,6 +26,7 @@ mod crypto;
 mod device;
 mod drivers;
 mod errno;
+mod fastman;
 mod firewall;
 mod fs;
 mod init;

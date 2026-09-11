@@ -4,6 +4,7 @@ pub mod account;
 pub mod archive;
 pub mod basic;
 pub mod diff;
+pub mod fastman;
 pub mod fileinfo;
 pub mod fileops;
 pub mod files;
@@ -58,6 +59,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("egrep", grep::egrep, "search with extended regular expressions (grep -E)", "PATTERNS [FILE]..."),
     cmd!("env", basic::env, "print or modify the environment", "[-i] [NAME=VALUE]... [COMMAND [ARG]...]"),
     cmd!("false", basic::false_, "do nothing, unsuccessfully", ""),
+    cmd!("fastman", fastman::fastman, "manage containers and images (Docker + Kubernetes)", "<command> [options]"),
     cmd!("fexec", runutil::fexec, "run a native (Linux ABI) ELF program", "PATH [ARG]..."),
     cmd!("fgrep", grep::fgrep, "search for fixed strings (grep -F)", "PATTERNS [FILE]..."),
     cmd!("find", findutils::find, "search for files in a directory hierarchy", "[-H] [-L] [-P] [PATH...] [EXPRESSION]"),

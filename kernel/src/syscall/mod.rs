@@ -29,6 +29,24 @@ pub fn dispatch(frame: &mut UserFrame) {
     let a = frame.args();
     let r = handle(nr, a, frame);
     frame.rax = r;
+    // A signal that arrived during the call (or the EINTR it caused) may be
+    // fatal with no handler: act on it before returning to ring 3.
+    proc::deliver_user_signals();
+}
+
+/// Log each unimplemented syscall number at most once (a tight loop calling a
+/// missing syscall must not flood the kernel ring buffer).
+fn warn_once(nr: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    if nr >= 512 {
+        return;
+    }
+    let (word, bit) = (nr as usize / 64, nr % 64);
+    let old = SEEN[word].fetch_or(1 << bit, Ordering::Relaxed);
+    if old & (1 << bit) == 0 {
+        crate::kdebug!("syscall", "unimplemented syscall {nr} (pid {})", proc::current().pid);
+    }
 }
 
 fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
@@ -105,6 +123,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         }
         228 => ret(proc_sys::clock_gettime(a[0] as u32, a[1] as usize)),
         229 => ret(proc_sys::clock_getres(a[0] as u32, a[1] as usize)),
+        230 => ret(proc_sys::clock_nanosleep(a[0] as u32, a[1] as i32, a[2] as usize, a[3] as usize)),
         231 => proc_sys::exit(a[0] as i32, true),
         318 => ret(proc_sys::getrandom(a[0] as usize, a[1] as usize, a[2] as u32)),
 
@@ -114,7 +133,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
 
         // ── not implemented ──
         _ => {
-            crate::kdebug!("syscall", "unimplemented syscall {nr} from pid {}", proc::current().pid);
+            warn_once(nr);
             (-(Errno::ENOSYS as i32 as i64)) as u64
         }
     }

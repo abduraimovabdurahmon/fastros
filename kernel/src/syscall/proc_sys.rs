@@ -199,6 +199,12 @@ pub fn nanosleep(req: usize, rem: usize) -> KResult<usize> {
     }
 }
 
+/// `clock_nanosleep(clockid, flags, req, rem)`. TIMER_ABSTIME is treated as a
+/// relative sleep of the given duration (close enough for libc `sleep`).
+pub fn clock_nanosleep(_clk: u32, _flags: i32, req: usize, rem: usize) -> KResult<usize> {
+    nanosleep(req, rem)
+}
+
 /// Linux `struct sysinfo` (partial: the fields programs actually read).
 pub fn sysinfo(info: usize) -> KResult<usize> {
     let m = crate::mm::stats();

@@ -35,6 +35,11 @@ pub fn dispatch(tf: &mut TrapFrame) {
     } else {
         SPURIOUS.fetch_add(1, Ordering::Relaxed);
     }
+    // Returning to ring 3? Deliver any pending fatal signal (e.g. a timer
+    // tick that noticed a SIGTERM/SIGKILL sent to this container).
+    if tf.from_user() {
+        crate::proc::deliver_user_signals();
+    }
 }
 
 fn irq(line: u8) {
