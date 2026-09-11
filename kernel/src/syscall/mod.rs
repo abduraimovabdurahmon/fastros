@@ -8,6 +8,7 @@
 
 mod file;
 mod mem;
+mod net;
 mod proc_sys;
 
 use crate::arch::x86_64::syscall::UserFrame;
@@ -87,6 +88,27 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         262 => ret(file::newfstatat(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32)),
         292 => ret(file::dup3(a[0] as i32, a[1] as i32, a[2] as u32)),
         293 => ret(file::pipe(a[0] as usize, a[1] as u32)),
+
+        // ── sockets ──
+        41 => ret(net::socket(a[0] as i32, a[1] as i32, a[2] as i32)),
+        42 => ret(net::connect(a[0] as i32, a[1] as usize, a[2] as usize)),
+        43 => ret(net::accept(a[0] as i32, a[1] as usize, a[2] as usize)),
+        44 => ret(net::sendto(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32, a[4] as usize, a[5] as usize)),
+        45 => ret(net::recvfrom(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32, a[4] as usize, a[5] as usize)),
+        48 => ret(net::shutdown(a[0] as i32, a[1] as i32)),
+        49 => ret(net::bind(a[0] as i32, a[1] as usize, a[2] as usize)),
+        50 => ret(net::listen(a[0] as i32, a[1] as i32)),
+        51 => ret(net::getsockname(a[0] as i32, a[1] as usize, a[2] as usize)),
+        52 => ret(net::getpeername(a[0] as i32, a[1] as usize, a[2] as usize)),
+        54 => ret(net::setsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize, a[4] as usize)),
+        55 => ret(net::getsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize, a[4] as usize)),
+        288 => ret(net::accept4(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32)),
+        40 => ret(net::sendfile(a[0] as i32, a[1] as i32, a[2] as usize, a[3] as usize)),
+        213 => ret(net::epoll_create(a[0] as i32)),
+        232 => ret(net::epoll_wait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32)),
+        233 => ret(net::epoll_ctl(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize)),
+        281 => ret(net::epoll_wait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32)),
+        291 => ret(net::epoll_create1(a[0] as i32)),
 
         // ── memory ──
         9 => ret(mem::mmap(a[0], a[1] as usize, a[2] as u32, a[3] as u32, a[4] as i32, a[5])),

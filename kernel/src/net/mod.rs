@@ -13,6 +13,7 @@ pub mod tls;
 pub mod dns;
 pub mod filter;
 pub mod socket;
+pub mod sockfile;
 
 use crate::drivers::net::e1000;
 use crate::sync::{Mutex, Once, WaitQueue};

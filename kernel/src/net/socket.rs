@@ -99,6 +99,48 @@ impl TcpStream {
         Ok(n)
     }
 
+    /// Non-blocking read: `EAGAIN` if no data is available yet.
+    pub fn try_read(&self, buf: &mut [u8]) -> KResult<usize> {
+        let mut st = stack().lock();
+        let s = st.sockets.get_mut::<tcp::Socket>(self.h);
+        if s.can_recv() {
+            let n = s.recv_slice(buf).map_err(|_| Errno::ECONNRESET)?;
+            drop(st);
+            poll_now();
+            return Ok(n);
+        }
+        if !s.may_recv() {
+            return Ok(0);
+        }
+        Err(Errno::EAGAIN)
+    }
+
+    /// Non-blocking write: `EAGAIN` if the send buffer is full.
+    pub fn try_write(&self, data: &[u8]) -> KResult<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let mut st = stack().lock();
+        let s = st.sockets.get_mut::<tcp::Socket>(self.h);
+        if !s.may_send() {
+            return Err(Errno::EPIPE);
+        }
+        if s.can_send() {
+            let n = s.send_slice(data).map_err(|_| Errno::EPIPE)?;
+            drop(st);
+            poll_now();
+            return Ok(n);
+        }
+        Err(Errno::EAGAIN)
+    }
+
+    /// Can a write make progress right now (poll: writable)?
+    pub fn can_write(&self) -> bool {
+        let st = stack().lock();
+        let s = st.sockets.get::<tcp::Socket>(self.h);
+        s.can_send() || !s.may_send()
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> KResult<usize> {
         self.read_timeout(buf, None)
     }
@@ -249,6 +291,42 @@ impl TcpListener {
     }
 }
 
+impl TcpListener {
+    /// Is a connection ready to accept right now?
+    pub fn pending(&self) -> bool {
+        let handles = self.backlog.lock().clone();
+        let st = stack().lock();
+        handles.iter().any(|&h| {
+            let s = st.sockets.get::<tcp::Socket>(h);
+            matches!(s.state(), tcp::State::Established | tcp::State::CloseWait) && s.remote_endpoint().is_some()
+        })
+    }
+
+    /// Non-blocking accept: `None` if no connection is waiting.
+    pub fn try_accept(&self) -> Option<(TcpStream, IpEndpoint)> {
+        let handles = self.backlog.lock().clone();
+        let picked = {
+            let st = stack().lock();
+            handles.iter().find_map(|&h| {
+                let s = st.sockets.get::<tcp::Socket>(h);
+                match s.state() {
+                    tcp::State::Established | tcp::State::CloseWait => s.remote_endpoint().map(|p| (h, p)),
+                    _ => None,
+                }
+            })
+        };
+        let (h, peer) = picked?;
+        let mut st = stack().lock();
+        let mut fresh = new_tcp_socket();
+        let _ = fresh.listen(IpListenEndpoint { addr: None, port: self.port });
+        let nh = st.sockets.add(fresh);
+        if let Some(slot) = self.backlog.lock().iter_mut().find(|x| **x == h) {
+            *slot = nh;
+        }
+        Some((TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false) }, peer))
+    }
+}
+
 impl Drop for TcpListener {
     fn drop(&mut self) {
         let hs = core::mem::take(&mut *self.backlog.lock());
@@ -303,6 +381,21 @@ impl UdpSocket {
                 deadline(timeout_ms),
             )
             .map_err(|e| if e == WaitResult::TimedOut { Errno::EAGAIN } else { Errno::EINTR })
+    }
+}
+
+impl UdpSocket {
+    pub fn can_recv(&self) -> bool {
+        stack().lock().sockets.get::<udp::Socket>(self.h).can_recv()
+    }
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> KResult<(usize, IpEndpoint)> {
+        let mut st = stack().lock();
+        let s = st.sockets.get_mut::<udp::Socket>(self.h);
+        if s.can_recv() {
+            s.recv_slice(buf).map(|(n, meta)| (n, meta.endpoint)).map_err(|_| Errno::EAGAIN)
+        } else {
+            Err(Errno::EAGAIN)
+        }
     }
 }
 
