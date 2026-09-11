@@ -1,0 +1,27 @@
+# docker compose up -d --build     boot FastROS
+# ssh root@localhost -p 2323       the FastROS shell (password: root)
+# docker compose logs -f           serial console / kernel log
+# docker compose down              power off
+#
+# The only thing kept on the host is ./disk/data.img — the guest's persistent
+# disk (same file the native `make disk` used). Delete the folder to start fresh.
+#
+# Settings come from the environment or a .env file next to this one:
+#   FASTROS_BIND=0.0.0.0           publish SSH to the network (default 127.0.0.1)
+#   FASTROS_PORT=2323              host port for SSH
+#   FASTROS_RESTART=unless-stopped come back after a host reboot (default: no)
+#   FASTROS_MEM=256M  FASTROS_ACCEL=auto|kvm|tcg
+
+services:
+  fastros:
+    build: .
+    image: fastros:latest
+    init: true
+    restart: ${FASTROS_RESTART:-no}
+    ports:
+      - "${FASTROS_BIND:-127.0.0.1}:${FASTROS_PORT:-2323}:22"
+    volumes:
+      - ./disk:/var/lib/fastros
+    environment:
+      FASTROS_MEM: ${FASTROS_MEM:-256M}
+      FASTROS_ACCEL: ${FASTROS_ACCEL:-auto}

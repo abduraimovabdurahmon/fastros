@@ -1,0 +1,8 @@
+/target
+/out
+/disk
+/.git
+/.claude
+*.log
+*.ppm
+.env
