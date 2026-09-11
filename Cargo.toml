@@ -1,11 +1,15 @@
-[package]
-name = "fastros"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["kernel", "lib/*"]
+# `cargo test` from the repo root runs the host-testable libraries only;
+# the kernel is built from kernel/ (its .cargo/config.toml selects the
+# bare-metal target).
+default-members = ["lib/*"]
 
-[[bin]]
-name = "fastros"
-path = "src/main.rs"
+[workspace.package]
+edition = "2021"
+version = "0.2.0"
+license = "MIT"
 
 [profile.dev]
 panic = "abort"
@@ -13,12 +17,8 @@ opt-level = 1
 
 [profile.release]
 panic = "abort"
-opt-level = 2
-
-[dependencies]
-ed25519-dalek    = { version = "1.0.1", default-features = false, features = ["u64_backend"] }
-curve25519-dalek = { version = "3.2.1", default-features = false, features = ["u64_backend"] }
-sha2             = { version = "0.10",  default-features = false }
-hmac             = { version = "0.12",  default-features = false }
-aes-soft         = { version = "0.6",   default-features = false }
-cipher-02        = { package = "cipher", version = "0.2", default-features = false }
+opt-level = 3
+debug = 1
+# Integer overflow is a bug, not a wrap-around: trap on it in every build.
+overflow-checks = true
+codegen-units = 16

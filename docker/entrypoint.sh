@@ -1,10 +1,10 @@
 #!/bin/sh
 # Boot the FastROS kernel in QEMU inside the container.
 #
-# The guest gets an e1000 NIC on QEMU user networking (10.0.2.15, gateway
-# 10.0.2.2) and its SSH server (guest port 22) is forwarded to container
-# port 22 — publish that one to reach the shell. Serial goes to stdout, so
-# `docker logs` shows the boot log.
+# The guest gets an e1000 NIC on QEMU user networking (10.0.2.15 via DHCP,
+# gateway 10.0.2.2) and its SSH server (guest port 22) is forwarded to
+# container port 22 — publish that one to reach the shell. Serial goes to
+# stdout, so `docker logs` shows the kernel log.
 #
 # Modes (first argument):
 #   run    boot and keep running                                  [default]
@@ -14,12 +14,16 @@
 #
 # Environment:
 #   FASTROS_KERNEL   kernel ELF to boot            (default: the one baked into the image)
-#   FASTROS_DISK     persistent disk image, created (64 MB) if missing
+#   FASTROS_DISK     persistent disk image, created sparse if missing
 #                    (default: /var/lib/fastros/data.img — mount a folder there)
-#   FASTROS_MEM      guest RAM                     (default: 256M)
+#   FASTROS_DISK_SIZE  size of a new disk          (default: 8G, sparse)
+#   FASTROS_MEM      guest RAM                     (default: 1G)
 #   FASTROS_ACCEL    auto | kvm | tcg              (default: auto — KVM when usable)
 #   FASTROS_TIMEOUT  seconds `test` may take       (default: 120)
 #   QEMU_EXTRA_ARGS  extra QEMU flags, word-split
+#
+# `docker stop` asks the guest to power off (ACPI power button) so it can
+# write back its caches; QEMU is killed only if that takes over 20 s.
 
 set -eu
 
@@ -38,16 +42,15 @@ fi
 
 disk=${FASTROS_DISK:-/var/lib/fastros/data.img}
 if [ ! -f "$disk" ]; then
-    # Blank disk: the kernel formats it on first boot (diskfs).
+    # Blank sparse disk: the kernel formats it (ext2) on first boot.
     mkdir -p "$(dirname "$disk")"
-    truncate -s 64M "$disk"
+    truncate -s "${FASTROS_DISK_SIZE:-8G}" "$disk"
     # Hand it to whoever owns the mounted folder, not to the container's root.
     chown "$(stat -c %u:%g "$(dirname "$disk")")" "$disk" 2>/dev/null || true
 fi
 
 # KVM only helps when the host itself is x86_64 and /dev/kvm was passed in
-# (docker run --device /dev/kvm). Everywhere else — macOS, Windows, arm64 —
-# QEMU uses TCG software emulation.
+# (docker run --device /dev/kvm). Everywhere else QEMU emulates (TCG).
 kvm_usable() {
     [ "$(uname -m)" = x86_64 ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]
 }
@@ -59,25 +62,40 @@ case ${FASTROS_ACCEL:-auto} in
     *)    echo "fastros: FASTROS_ACCEL must be auto, kvm or tcg" >&2; exit 1 ;;
 esac
 
-# `-machine pc` (i440FX/PIIX4) is load-bearing: the shell's `exit` command
-# powers off through the PIIX4 ACPI port 0x604, which q35 does not have.
-# The disk must be IDE index 0 (primary master) — the only drive the ATA
-# driver probes (drivers/block/ata: select 0xA0).
-set -- -machine pc -accel "$accel" -m "${FASTROS_MEM:-256M}" -kernel "$kernel" \
-       -display none -monitor none -serial stdio \
+# `-machine pc` (i440FX/PIIX4): the kernel powers off through the PIIX4 ACPI
+# port and drives the disk as IDE primary master.
+# `-cpu max` under TCG gives the guest RDRAND, SMEP, SMAP and UMIP.
+monitor=/tmp/fastros-monitor.sock
+set -- -machine pc -accel "$accel" -m "${FASTROS_MEM:-1G}" -kernel "$kernel" \
+       -display none -serial stdio -monitor "unix:$monitor,server=on,wait=off" \
        -netdev user,id=net0,hostfwd=tcp::22-:22 -device e1000,netdev=net0 \
-       -drive "file=$disk,format=raw,if=ide,index=0" \
+       -drive "file=$disk,format=raw,if=ide,index=0,cache=writeback" \
+       -no-reboot \
        "$@"
-[ "$accel" = kvm ] && set -- -cpu host "$@"
+if [ "$accel" = kvm ]; then set -- -cpu host "$@"; else set -- -cpu max "$@"; fi
 # shellcheck disable=SC2086
 [ -n "${QEMU_EXTRA_ARGS:-}" ] && set -- "$@" $QEMU_EXTRA_ARGS
 
-echo "fastros: accel=$accel mem=${FASTROS_MEM:-256M} disk=$disk" >&2
+echo "fastros: accel=$accel mem=${FASTROS_MEM:-1G} disk=$disk" >&2
 
 case $mode in
     run)
         echo "fastros: SSH on container port 22 (user root, password root)" >&2
-        exec qemu-system-x86_64 "$@"
+        qemu-system-x86_64 "$@" &
+        qemu=$!
+        stop() {
+            echo "fastros: shutting down the guest" >&2
+            if command -v socat >/dev/null 2>&1 && [ -S "$monitor" ]; then
+                echo system_powerdown | socat - "UNIX-CONNECT:$monitor" >/dev/null 2>&1 || true
+                i=0
+                while [ $i -lt 20 ] && kill -0 "$qemu" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+            fi
+            kill "$qemu" 2>/dev/null || true
+        }
+        trap stop TERM INT
+        wait "$qemu" || true
+        trap - TERM INT
+        wait "$qemu" 2>/dev/null || true
         ;;
     test)
         log=$(mktemp)
@@ -92,8 +110,8 @@ case $mode in
                 # Full round trip: key exchange, password auth, exec channel.
                 if out=$(sshpass -p root ssh -p 22 -o StrictHostKeyChecking=no \
                            -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-                           -o ConnectTimeout=10 root@127.0.0.1 fastros-test 2>&1); then
-                    case $out in *fastros-test*) result=pass; break ;; esac
+                           -o ConnectTimeout=10 root@127.0.0.1 'echo fastros-test $(uname -s)' 2>&1); then
+                    case $out in *"fastros-test FastROS"*) result=pass; break ;; esac
                 fi
             fi
             sleep 2

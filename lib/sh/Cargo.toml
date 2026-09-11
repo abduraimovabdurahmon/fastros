@@ -1,0 +1,8 @@
+[package]
+name = "fastros-sh"
+description = "Shell language front end: lexer, parser, AST, word expansion, pattern matching"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

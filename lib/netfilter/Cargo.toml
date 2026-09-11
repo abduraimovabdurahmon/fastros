@@ -1,0 +1,8 @@
+[package]
+name = "fastros-netfilter"
+description = "Stateful packet filter: rules, connection tracking, rate limits, bans"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -13,11 +13,11 @@
 
 ARG DEBIAN_IMAGE=debian:trixie-slim
 
-# ── Toolchain: nasm + the Rust named in rust-toolchain.toml ─────────────────
+# ── Toolchain: the Rust named in rust-toolchain.toml ────────────────────────
 FROM ${DEBIAN_IMAGE} AS toolchain
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev nasm \
+ && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -33,13 +33,11 @@ RUN rustup toolchain install && rustc --version
 
 # ── Build ────────────────────────────────────────────────────────────────────
 FROM toolchain AS build
-# debug | release
-ARG PROFILE=debug
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    if [ "$PROFILE" = release ]; then cargo build --release; else cargo build; fi \
- && install -D "target/x86_64-unknown-none/$PROFILE/fastros" /out/fastros
+    cd kernel && cargo build --release \
+ && install -D /src/target/x86_64-unknown-none/release/fastros /out/fastros
 
 # ── Kernel artifact only (used with --output) ────────────────────────────────
 FROM scratch AS kernel
@@ -50,12 +48,12 @@ FROM ${DEBIAN_IMAGE} AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 # openssh-client + sshpass: only for the `test` mode's SSH login.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends qemu-system-x86 openssh-client sshpass \
+ && apt-get install -y --no-install-recommends qemu-system-x86 openssh-client sshpass socat \
  && rm -rf /var/lib/apt/lists/*
 
 ENV FASTROS_KERNEL=/opt/fastros/fastros \
     FASTROS_DISK=/var/lib/fastros/data.img \
-    FASTROS_MEM=256M \
+    FASTROS_MEM=1G \
     FASTROS_ACCEL=auto
 
 COPY --from=build /out/fastros /opt/fastros/fastros
@@ -63,5 +61,6 @@ COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/fastros-run
 
 # Guest SSH server, forwarded by QEMU user networking.
 EXPOSE 22
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["fastros-run"]
 CMD ["run"]

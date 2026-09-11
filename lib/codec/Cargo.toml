@@ -1,0 +1,8 @@
+[package]
+name = "fastros-codec"
+description = "Encodings used across FastROS: base64, hex"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

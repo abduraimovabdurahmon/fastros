@@ -1,0 +1,22 @@
+# Only applies when cargo runs from kernel/ — the kernel is the one crate built
+# for bare metal; the libraries under lib/ are tested on the host.
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    "-C", "force-frame-pointers=yes",
+    # The kernel never touches SSE/AVX state (user programs own it), so every
+    # crypto crate must use its portable implementation.
+    "--cfg", "chacha20_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "poly1305_force_soft",
+    "--cfg", "polyval_force_soft",
+    "--cfg", 'curve25519_dalek_backend="serial"',
+]

@@ -1,0 +1,8 @@
+[package]
+name = "fastros-alloc"
+description = "Physical frame (buddy) and object (slab) allocators used by the FastROS kernel"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

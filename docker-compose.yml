@@ -10,7 +10,7 @@
 #   FASTROS_BIND=0.0.0.0           publish SSH to the network (default 127.0.0.1)
 #   FASTROS_PORT=2323              host port for SSH
 #   FASTROS_RESTART=unless-stopped come back after a host reboot (default: no)
-#   FASTROS_MEM=256M  FASTROS_ACCEL=auto|kvm|tcg
+#   FASTROS_MEM=1G  FASTROS_ACCEL=auto|kvm|tcg
 
 services:
   fastros:
@@ -23,5 +23,5 @@ services:
     volumes:
       - ./disk:/var/lib/fastros
     environment:
-      FASTROS_MEM: ${FASTROS_MEM:-256M}
+      FASTROS_MEM: ${FASTROS_MEM:-1G}
       FASTROS_ACCEL: ${FASTROS_ACCEL:-auto}
