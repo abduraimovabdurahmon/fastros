@@ -85,13 +85,35 @@ class Pty:
         self.buf = b""
 
     def read_until(self, pattern, timeout=20):
-        rx = re.compile(pattern.encode() if isinstance(pattern, str) else pattern)
+        """Read until `pattern` matches the ANSI-stripped output; returns the
+        raw text consumed (escape sequences included)."""
+        rx = re.compile(pattern)
         deadline = time.time() + timeout
         while True:
-            m = rx.search(self.buf)
+            text = self.buf.decode(errors="replace")
+            # Match on stripped text, then map the end back to the raw buffer.
+            stripped, index = [], []
+            i = 0
+            while i < len(text):
+                m = ANSI.match(text, i)
+                if m:
+                    i = m.end()
+                    continue
+                stripped.append(text[i])
+                index.append(i)
+                i += 1
+            m = rx.search("".join(stripped))
             if m:
-                data, self.buf = self.buf[: m.end()], self.buf[m.end():]
-                return data.decode(errors="replace")
+                end = index[m.end() - 1] + 1 if m.end() > 0 else 0
+                # Swallow escape sequences that directly follow the match.
+                while True:
+                    n = ANSI.match(text, end)
+                    if not n:
+                        break
+                    end = n.end()
+                consumed = text[:end]
+                self.buf = text[end:].encode()
+                return consumed
             if time.time() > deadline:
                 raise TimeoutError(f"waiting for {pattern!r}, got {self.buf!r}")
             if self.chan.recv_ready():

@@ -28,6 +28,7 @@ const LAYOUT: &[(u16, &str)] = &[
     (0o755, "/usr"),
     (0o755, "/usr/local"),
     (0o755, "/usr/local/bin"),
+    (0o755, "/usr/lib"),
     (0o755, "/usr/share"),
     (0o755, "/var"),
     (0o755, "/var/lib"),

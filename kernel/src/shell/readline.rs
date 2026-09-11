@@ -18,6 +18,9 @@ pub struct Editor {
     cursor: usize,
     /// Row of the cursor relative to the first row of the prompt.
     cursor_row: usize,
+    /// Visible width of prompt + line at the last redraw (to know when the
+    /// old tail must be cleared).
+    drawn_width: usize,
     kill: Vec<char>,
     hist_pos: Option<usize>,
     saved_line: Vec<char>,
@@ -93,7 +96,7 @@ fn strip_markers(s: &str) -> String {
 
 impl Editor {
     pub fn new() -> Editor {
-        Editor { buf: Vec::new(), cursor: 0, cursor_row: 0, kill: Vec::new(), hist_pos: None, saved_line: Vec::new(), last_was_tab: false }
+        Editor { buf: Vec::new(), cursor: 0, cursor_row: 0, drawn_width: 0, kill: Vec::new(), hist_pos: None, saved_line: Vec::new(), last_was_tab: false }
     }
 
     /// Read one line. `None` on end of input (^D on an empty line, hangup).
@@ -111,10 +114,18 @@ impl Editor {
         tty.set_termios(raw);
         self.buf.clear();
         self.cursor = 0;
-        self.cursor_row = 0;
+        self.fresh_line();
+        self.drawn_width = 0;
         self.hist_pos = None;
         self.last_was_tab = false;
-        self.redraw(&tty, prompt);
+        // First draw: just the prompt, exactly as other shells print it.
+        let _ = raw_write(&tty, strip_markers(prompt).as_bytes());
+        self.drawn_width = visible_width(prompt);
+        let cols = (tty.winsize().cols as usize).max(10);
+        self.cursor_row = self.drawn_width / cols;
+        if self.drawn_width > 0 && self.drawn_width % cols == 0 {
+            let _ = raw_write(&tty, b" \r");
+        }
         let result = self.edit_loop(sh, &tty, prompt);
         tty.set_termios(saved);
         result
@@ -146,18 +157,37 @@ impl Editor {
                     let _ = tty.write(b"^C\n");
                     self.buf.clear();
                     self.cursor = 0;
-                    self.cursor_row = 0;
+                    self.fresh_line();
                     self.hist_pos = None;
                     sh.status = 130;
                 }
                 Key::Char(c) => {
                     self.buf.insert(self.cursor, c);
                     self.cursor += 1;
+                    // Typing at the end of a line that does not wrap: just echo.
+                    let cols = (tty.winsize().cols as usize).max(10);
+                    let new_width = self.drawn_width + char_width(c);
+                    if self.cursor == self.buf.len() && new_width % cols != 0 && new_width / cols == self.drawn_width / cols {
+                        let mut b = [0u8; 4];
+                        let _ = raw_write(tty, c.encode_utf8(&mut b).as_bytes());
+                        self.drawn_width = new_width;
+                        continue;
+                    }
                 }
                 Key::Backspace => {
                     if self.cursor > 0 {
                         self.cursor -= 1;
-                        self.buf.remove(self.cursor);
+                        let c = self.buf.remove(self.cursor);
+                        let cols = (tty.winsize().cols as usize).max(10);
+                        let w = char_width(c);
+                        // Erasing the last character on the same row: "\b \b".
+                        if self.cursor == self.buf.len() && self.drawn_width % cols >= w && self.drawn_width % cols != 0 {
+                            for _ in 0..w {
+                                let _ = raw_write(tty, b"\x08 \x08");
+                            }
+                            self.drawn_width -= w;
+                            continue;
+                        }
                     }
                 }
                 Key::Delete => {
@@ -215,7 +245,7 @@ impl Editor {
                 }
                 Key::Ctrl(b'L') => {
                     let _ = tty.write(b"\x1b[H\x1b[2J");
-                    self.cursor_row = 0;
+                    self.fresh_line();
                 }
                 Key::Up | Key::Ctrl(b'P') => self.history_step(sh, true),
                 Key::Down | Key::Ctrl(b'N') => self.history_step(sh, false),
@@ -224,7 +254,7 @@ impl Editor {
                         self.buf = line.chars().collect();
                         self.cursor = self.buf.len();
                     }
-                    self.cursor_row = 0;
+                    self.fresh_line();
                 }
                 Key::Tab => {
                     self.complete(sh, tty, prompt, was_tab);
@@ -274,8 +304,12 @@ impl Editor {
         out.push('\r');
         out.push_str(&strip_markers(prompt));
         out.push_str(&text);
-        out.push_str("\x1b[J");
         let end = pw + tw;
+        // Clear what the previous, longer line left behind.
+        if end < self.drawn_width {
+            out.push_str("\x1b[J");
+        }
+        self.drawn_width = end;
         // At an exact multiple of the width the terminal defers the wrap:
         // force it so the cursor math below holds.
         if end > 0 && end % cols == 0 {
@@ -285,12 +319,14 @@ impl Editor {
         let pos = pw + cw;
         let row = pos / cols;
         let col = pos % cols;
-        if end_row > row {
-            out.push_str(&alloc::format!("\x1b[{}A", end_row - row));
-        }
-        out.push('\r');
-        if col > 0 {
-            out.push_str(&alloc::format!("\x1b[{col}C"));
+        if pos != end {
+            if end_row > row {
+                out.push_str(&alloc::format!("\x1b[{}A", end_row - row));
+            }
+            out.push('\r');
+            if col > 0 {
+                out.push_str(&alloc::format!("\x1b[{col}C"));
+            }
         }
         self.cursor_row = row;
         let _ = raw_write(tty, out.as_bytes());
@@ -382,7 +418,13 @@ impl Editor {
             out.push_str("\r\n");
         }
         let _ = raw_write(tty, out.as_bytes());
+        self.fresh_line();
+    }
+
+    /// The cursor is at the start of a fresh line (nothing of ours above it).
+    fn fresh_line(&mut self) {
         self.cursor_row = 0;
+        self.drawn_width = 0;
     }
 
     fn insert_str(&mut self, s: &str) {

@@ -228,6 +228,14 @@ pub fn printf(ctx: &mut Ctx) -> i32 {
     status
 }
 
+/// `printf`-style formatting into a string (used by `seq -f`, `stat -c`...).
+pub fn sprintf(fmt: &str, args: &[String]) -> String {
+    let f: Vec<char> = fmt.chars().collect();
+    let mut ai = 0;
+    let mut st = 0;
+    format_once(&f, args, &mut ai, &mut st).0
+}
+
 fn next_arg<'a>(args: &'a [String], ai: &mut usize) -> Option<&'a str> {
     let a = args.get(*ai).map(|s| s.as_str());
     if a.is_some() {
