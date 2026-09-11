@@ -45,6 +45,12 @@ trap_common:
     push r14
     push r15
     cld
+    /* Came from ring 3? Then GS holds the user base: swap in the kernel's.
+       CS sits at offset 144 (15 GP regs + vector + error). */
+    test byte ptr [rsp + 144], 3
+    jz 1f
+    swapgs
+1:
     mov rdi, rsp
     call trap_dispatch
     .global trap_return
@@ -65,6 +71,12 @@ trap_return:
     pop rbx
     pop rax
     add rsp, 16
+    /* Returning to ring 3? Restore the user GS base first. CS is at [rsp+8]
+       now (rip, cs, ...). */
+    test byte ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 "#
 );

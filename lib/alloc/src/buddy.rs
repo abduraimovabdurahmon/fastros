@@ -84,6 +84,10 @@ impl<M: FrameMemory> Buddy<M> {
     pub fn free_frames(&self) -> usize {
         self.free_frames
     }
+    /// Size of the frame index space (managed or not).
+    pub fn total_frames(&self) -> usize {
+        self.frames
+    }
     /// Frames ever released into the allocator (usable RAM).
     pub fn managed_frames(&self) -> usize {
         self.managed_frames

@@ -147,3 +147,59 @@ pub fn counts() -> (usize, usize) {
 pub fn free_blocks() -> [usize; MAX_ORDER + 1] {
     FRAMES.lock().as_ref().map(|b| b.free_blocks()).unwrap_or([0; MAX_ORDER + 1])
 }
+
+// ── page reference counts (user memory) ────────────────────────────────────
+//
+// Pages mapped into user address spaces can be shared: copy-on-write after
+// fork, shared file mappings. Each frame has a 16-bit count in a table in
+// vmalloc space (2 bytes per frame: 512 KiB per GiB of RAM). Only user pages
+// use it; kernel allocations never touch the table.
+
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+
+static REF_TABLE: AtomicUsize = AtomicUsize::new(0);
+static REF_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Allocate the reference-count table (after the heap and vmalloc work).
+pub fn init_page_refs() {
+    let frames = FRAMES.lock().as_ref().map(|b| b.total_frames()).unwrap_or(0);
+    let pages = align_up(frames * 2, PAGE_SIZE) / PAGE_SIZE;
+    let base = super::vmalloc::alloc(pages).expect("out of memory for the page reference table");
+    unsafe { core::ptr::write_bytes(base as *mut u8, 0, pages * PAGE_SIZE) };
+    REF_FRAMES.store(frames, Ordering::Relaxed);
+    REF_TABLE.store(base, Ordering::Release);
+}
+
+fn ref_slot(p: PhysAddr) -> &'static AtomicU16 {
+    let idx = p as usize / PAGE_SIZE;
+    assert!(idx < REF_FRAMES.load(Ordering::Relaxed), "page ref for frame {p:#x} outside RAM");
+    let base = REF_TABLE.load(Ordering::Acquire);
+    assert!(base != 0, "frame::init_page_refs not called");
+    unsafe { &*((base as *const AtomicU16).add(idx)) }
+}
+
+/// A zeroed page for user memory, with one reference.
+pub fn alloc_user_page() -> Option<PhysAddr> {
+    let p = alloc_zeroed(0)?;
+    ref_slot(p).store(1, Ordering::Release);
+    Some(p)
+}
+
+/// Take another reference to a user page.
+pub fn page_get(p: PhysAddr) {
+    let old = ref_slot(p).fetch_add(1, Ordering::AcqRel);
+    assert!(old != 0 && old != u16::MAX, "page_get on a page with count {old} ({p:#x})");
+}
+
+/// Drop a reference; the page returns to the allocator with the last one.
+pub fn page_put(p: PhysAddr) {
+    let old = ref_slot(p).fetch_sub(1, Ordering::AcqRel);
+    assert!(old != 0, "page_put on a free page ({p:#x})");
+    if old == 1 {
+        free(p, 0);
+    }
+}
+
+pub fn page_count(p: PhysAddr) -> u16 {
+    ref_slot(p).load(Ordering::Acquire)
+}

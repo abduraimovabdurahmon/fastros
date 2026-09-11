@@ -845,6 +845,7 @@ impl Conn {
             ctty: tty_for_proc.clone(),
             uts: kernel.uts.clone(),
             container: None,
+            aspace: None,
             ignored: 0,
         };
         let interactive = command.is_none() && tty_for_proc.is_some();

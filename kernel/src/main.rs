@@ -35,6 +35,7 @@ mod panic;
 mod power;
 mod proc;
 mod sched;
+mod syscall;
 mod shell;
 mod ssh;
 mod sync;
@@ -74,6 +75,7 @@ pub extern "C" fn kernel_main(start_info_phys: u32) -> ! {
     mm::init(boot);
     log::heap_ready();
     let prot = cpu::enable_protections();
+    cpu::enable_user_fpu();
     kinfo!(
         "cpu",
         "{}; protections: NX={} SMEP={} SMAP={} UMIP={}",

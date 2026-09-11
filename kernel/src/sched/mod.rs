@@ -78,6 +78,10 @@ pub struct Task {
     /// Opaque owner cookie: the process this task belongs to (0 = kernel).
     pub owner: AtomicU32,
     pub created_ns: u64,
+    /// Physical PML4 to run this task under (0 = the kernel's own tables).
+    pub cr3: AtomicU64,
+    /// User thread pointer (FS base) for this task, restored on switch.
+    pub fs_base: AtomicU64,
 }
 
 // `saved_rsp` is only touched by the scheduler with interrupts disabled.
@@ -189,6 +193,8 @@ static RQ: SpinLock<RunQueue> = SpinLock::new(RunQueue {
 
 /// Raw pointer to the running task (kept alive by `RQ.current`).
 static CURRENT: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
+/// The CR3 currently loaded (0 until the first user task runs).
+static LOADED_CR3: AtomicU64 = AtomicU64::new(0);
 static TASKS: SpinLock<BTreeMap<Tid, Arc<Task>>> = SpinLock::new(BTreeMap::new());
 static NEXT_TID: AtomicU32 = AtomicU32::new(1);
 static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
@@ -220,6 +226,8 @@ fn new_task(tid: Tid, name: &str, stack: Option<KernelStack>, stack_top: usize, 
         cpu_ns: AtomicU64::new(0),
         owner: AtomicU32::new(0),
         created_ns: crate::time::now_ns(),
+        cr3: AtomicU64::new(0),
+        fs_base: AtomicU64::new(0),
     })
 }
 
@@ -408,6 +416,18 @@ pub fn schedule() {
         rq.switches += 1;
         if !next.is_idle() {
             gdt::set_kernel_stack(next.stack_top as u64);
+            crate::arch::x86_64::syscall::set_kernel_stack(next.stack_top as u64);
+        }
+        // Switch address spaces when the next task lives in a different one.
+        // 0 means "the kernel's own tables"; kernel mappings are global, so a
+        // reload keeps them in the TLB.
+        let want = next.cr3.load(Ordering::Relaxed);
+        let want = if want != 0 { want } else { crate::mm::kspace::pml4() };
+        if want != LOADED_CR3.swap(want, Ordering::Relaxed) {
+            unsafe { cpu::write_cr3(want) };
+        }
+        if next.cr3.load(Ordering::Relaxed) != 0 {
+            unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, next.fs_base.load(Ordering::Relaxed)) };
         }
         CURRENT.store(Arc::as_ptr(&next) as *mut Task, Ordering::Release);
         let p = prev.saved_rsp.get();

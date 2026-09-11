@@ -12,6 +12,7 @@
 //! Every kernel mapping is no-execute except the kernel's `.text`, and the
 //! kernel's `.text`/`.rodata` are read-only — enforced by the MMU (`CR0.WP`).
 
+pub mod aspace;
 pub mod dma;
 pub mod fault;
 pub mod frame;
@@ -95,6 +96,7 @@ pub fn init(boot: &crate::boot::BootInfo) {
     kspace::init(boot);
     frame::add_high_memory(boot);
     heap::init();
+    frame::init_page_refs();
 }
 
 pub struct MemStats {

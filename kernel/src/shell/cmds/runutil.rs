@@ -341,3 +341,41 @@ pub fn watch(ctx: &mut Ctx) -> i32 {
         }
     }
 }
+
+// ── fexec: run a native (Linux-ABI) ELF binary as a user process ───────────
+
+/// `fexec PATH [ARG...]` loads a static ELF64 program into a new user
+/// address space and runs it to completion. The bridge to real binaries
+/// until the shell resolves them automatically.
+pub fn fexec(ctx: &mut Ctx) -> i32 {
+    if ctx.args.len() < 2 {
+        ctx.eprint("usage: fexec PATH [ARG]...\n");
+        return 2;
+    }
+    let path = ctx.args[1].clone();
+    let data = match ctx.read_input(&path) {
+        Ok(d) => d,
+        Err(e) => return ctx.fail_errno(&path, e),
+    };
+    let argv: Vec<String> = ctx.args[1..].to_vec();
+    let envp: Vec<String> = ctx.proc.env.lock().iter().map(|(k, v)| alloc::format!("{k}={v}")).collect();
+    let (space, frame) = match crate::proc::elf::load(&data, &argv, &envp) {
+        Ok(v) => v,
+        Err(e) => return ctx.fail_errno(&path, e),
+    };
+    ctx.flush();
+    let spawn = crate::proc::Spawn::from_parent(&ctx.proc, path.rsplit('/').next().unwrap_or(&path), argv);
+    let child = match crate::proc::start_user(spawn, space, frame) {
+        Ok(c) => c,
+        Err(e) => return ctx.fail_errno("start_user", e),
+    };
+    let pid = child.pid;
+    loop {
+        match crate::proc::wait(&ctx.proc, crate::proc::WaitFor::Pid(pid), false) {
+            Ok(Some((_, st))) => return st.shell_code(),
+            Ok(None) => continue,
+            Err(crate::errno::Errno::EINTR) if crate::proc::absorb_signals() => continue,
+            Err(_) => return 1,
+        }
+    }
+}

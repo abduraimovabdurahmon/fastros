@@ -8,6 +8,7 @@
 //! Kernel threads have no process of their own; they run in the context of
 //! the kernel pseudo-process (pid 0) and are listed as `[name]` by `ps`.
 
+pub mod elf;
 pub mod fdtable;
 pub mod signal;
 
@@ -23,6 +24,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::arch::x86_64::syscall::{enter_user, UserFrame};
+use crate::mm::aspace::AddressSpace;
 use fdtable::FdTable;
 
 pub type Pid = u32;
@@ -90,6 +93,8 @@ pub struct Process {
     pub start_ns: u64,
     /// Container this process belongs to (None = host).
     pub container: SpinLock<Option<String>>,
+    /// User address space (None for kernel/native processes).
+    pub aspace: SpinLock<Option<Arc<AddressSpace>>>,
     /// Signals set to SIG_IGN (bit n-1 for signal n); inherited by children,
     /// as ignored dispositions survive fork and exec on Linux.
     pub ignored: AtomicU64,
@@ -197,11 +202,31 @@ pub fn init(ns: Arc<MountNamespace>) {
             ctty: SpinLock::new(None),
             start_ns: 0,
             container: SpinLock::new(None),
+            aspace: SpinLock::new(None),
             ignored: AtomicU64::new(0),
             cpu_at_exit: AtomicU64::new(0),
             children_cpu: AtomicU64::new(0),
         })
     });
+}
+
+/// Set the current task's user thread pointer (FS base).
+pub fn set_current_fs_base(v: u64) {
+    sched::with_current(|t| t.fs_base.store(v, core::sync::atomic::Ordering::Relaxed));
+}
+
+/// Set the CR3 the current task runs under (execve into a new address space).
+pub fn set_current_cr3(cr3: u64) {
+    sched::with_current(|t| t.cr3.store(cr3, core::sync::atomic::Ordering::Release));
+}
+
+/// The address space of the current process, if it is a user process.
+pub fn current_aspace() -> Option<Arc<AddressSpace>> {
+    let pid = sched::with_current(|t| t.owner.load(Ordering::Acquire));
+    if pid == 0 {
+        return None;
+    }
+    PROCS.lock().get(&pid).and_then(|p| p.aspace.lock().clone())
 }
 
 /// The process the current task belongs to (the kernel for kernel threads).
@@ -240,6 +265,8 @@ pub struct Spawn {
     pub ctty: Option<Arc<Tty>>,
     pub uts: Arc<Uts>,
     pub container: Option<String>,
+    /// User address space for the child (None = a kernel/native process).
+    pub aspace: Option<Arc<AddressSpace>>,
     /// Ignored signals (SIG_IGN), normally the parent's.
     pub ignored: u64,
 }
@@ -260,6 +287,7 @@ impl Spawn {
             ctty: parent.ctty.lock().clone(),
             uts: parent.uts.clone(),
             container: parent.container.lock().clone(),
+            aspace: None,
             ignored: parent.ignored.load(Ordering::Relaxed),
         }
     }
@@ -298,6 +326,7 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         ctty: SpinLock::new(s.ctty),
         start_ns: crate::time::now_ns(),
         container: SpinLock::new(s.container),
+        aspace: SpinLock::new(s.aspace),
         ignored: AtomicU64::new(s.ignored),
         cpu_at_exit: AtomicU64::new(0),
         children_cpu: AtomicU64::new(0),
@@ -305,6 +334,17 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
     PROCS.lock().insert(pid, p.clone());
     s.parent.children.lock().push(p.clone());
     task.owner.store(pid, Ordering::Release);
+    Ok(p)
+}
+
+/// Start a user process: spawn a task that enters ring 3 at `frame` under
+/// `aspace`. The task's CR3 is set before it can be scheduled.
+pub fn start_user(mut s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame) -> KResult<Arc<Process>> {
+    s.aspace = Some(aspace.clone());
+    let p = spawn(s, move || unsafe { enter_user(&frame) })?;
+    if let Some(t) = p.tasks().into_iter().next() {
+        t.cr3.store(aspace.pml4(), core::sync::atomic::Ordering::Release);
+    }
     Ok(p)
 }
 

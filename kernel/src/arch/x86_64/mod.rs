@@ -10,6 +10,7 @@ pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod rtc;
+pub mod syscall;
 pub mod trap;
 
 /// First-stage CPU setup: runs before memory management exists.
@@ -17,6 +18,7 @@ pub fn early_init() {
     cpu::detect();
     gdt::init();
     trap::init_idt();
+    syscall::init();
 }
 
 /// Interrupt controller + tick source (needs the heap for handler tables).

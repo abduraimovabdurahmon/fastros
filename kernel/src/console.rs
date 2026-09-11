@@ -79,6 +79,7 @@ pub fn start_getty() {
             ctty: Some(tty.clone()),
             uts: kernel.uts.clone(),
             container: None,
+            aspace: None,
             ignored: 0,
         };
         let u = user.clone();

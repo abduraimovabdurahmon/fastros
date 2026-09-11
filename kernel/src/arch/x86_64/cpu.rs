@@ -305,13 +305,28 @@ pub fn enable_protections() -> u64 {
     on
 }
 
-/// Allow SSE/x87 use by user programs (the kernel itself is soft-float).
+/// Allow SSE/x87 (and AVX where present) use by user programs. glibc/musl
+/// select AVX `memcpy`/`strlen` on a capable CPU, so without XSAVE + XCR0 the
+/// first `vmov*` would #UD. The kernel itself stays soft-float.
 pub fn enable_user_fpu() {
     unsafe {
         let cr0 = (read_cr0() & !(CR0_EM | CR0_TS)) | CR0_MP;
         write_cr0(cr0);
-        write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT);
+        let mut cr4 = read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT;
+        if has(feature::XSAVE) {
+            cr4 |= CR4_OSXSAVE;
+        }
+        write_cr4(cr4);
         asm!("fninit", options(nomem, nostack));
+        if has(feature::XSAVE) {
+            // XCR0: enable x87 (bit 0) + SSE (bit 1), and AVX (bit 2) if the
+            // CPU advertises it in CPUID.1:ECX.28.
+            let mut xcr0 = 0b11u64;
+            if cpuid(1, 0).ecx & (1 << 28) != 0 {
+                xcr0 |= 0b100;
+            }
+            asm!("xsetbv", in("ecx") 0u32, in("eax") xcr0 as u32, in("edx") (xcr0 >> 32) as u32, options(nomem, nostack));
+        }
     }
 }
 

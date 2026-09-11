@@ -53,6 +53,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("egrep", grep::egrep, "search with extended regular expressions (grep -E)", "PATTERNS [FILE]..."),
     cmd!("env", basic::env, "print or modify the environment", "[-i] [NAME=VALUE]... [COMMAND [ARG]...]"),
     cmd!("false", basic::false_, "do nothing, unsuccessfully", ""),
+    cmd!("fexec", runutil::fexec, "run a native (Linux ABI) ELF program", "PATH [ARG]..."),
     cmd!("fgrep", grep::fgrep, "search for fixed strings (grep -F)", "PATTERNS [FILE]..."),
     cmd!("find", findutils::find, "search for files in a directory hierarchy", "[-H] [-L] [-P] [PATH...] [EXPRESSION]"),
     cmd!("free", procps::free, "display amount of free and used memory", "[-bkmgh] [-w] [-t] [-s N] [-c N]"),
