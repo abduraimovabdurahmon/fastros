@@ -45,7 +45,9 @@ impl Terminal {
     pub fn open(tty: Arc<Tty>, alt_screen: bool) -> Terminal {
         let saved = tty.termios();
         let mut t = saved;
-        t.lflag &= !(consts::ICANON | consts::ECHO | consts::ECHONL | consts::IEXTEN);
+        // Clear ISIG too: a full-screen program reads ^C/^Z/^\ as ordinary
+        // keys (so ^C can quit it) rather than having them raised as signals.
+        t.lflag &= !(consts::ICANON | consts::ECHO | consts::ECHONL | consts::IEXTEN | consts::ISIG);
         t.iflag &= !(consts::ICRNL | consts::IXON);
         t.cc[consts::VMIN] = 1;
         t.cc[consts::VTIME] = 0;
