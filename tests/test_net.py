@@ -133,9 +133,13 @@ def test_curl_chunked(g):
     assert out == "hello world"
 
 
-def test_curl_tls_unsupported(g):
-    _, err, st = g.run("curl -sS https://example.com", timeout=20)
-    assert st == 60 and "TLS is not supported" in err
+def test_curl_tls_supported(g):
+    # A from-scratch TLS 1.3 client is now built in, so curl no longer rejects
+    # https outright. Depending on outbound reachability the request either
+    # succeeds or fails with a network/connect error — never "TLS unsupported".
+    out, err, st = g.run("curl -sS https://example.com", timeout=25)
+    assert "TLS is not supported" not in err, err
+    assert "not supported" not in err.lower() or "TLS" not in err, err
 
 
 def test_wget_download(g):

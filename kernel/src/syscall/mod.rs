@@ -33,6 +33,12 @@ pub fn dispatch(frame: &mut UserFrame) {
     // A signal that arrived during the call (or the EINTR it caused) may be
     // fatal with no handler: act on it before returning to ring 3.
     proc::deliver_user_signals();
+    // Give up the CPU if this task has used its slice, so a syscall-heavy loop
+    // is as fair as a compute loop preempted by the timer.
+    if crate::sched::need_resched() {
+        crate::sched::schedule();
+        proc::deliver_user_signals();
+    }
 }
 
 /// Log each unimplemented syscall number at most once (a tight loop calling a

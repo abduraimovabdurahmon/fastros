@@ -36,9 +36,17 @@ pub fn dispatch(tf: &mut TrapFrame) {
         SPURIOUS.fetch_add(1, Ordering::Relaxed);
     }
     // Returning to ring 3? Deliver any pending fatal signal (e.g. a timer
-    // tick that noticed a SIGTERM/SIGKILL sent to this container).
+    // tick that noticed a SIGTERM/SIGKILL sent to this container), then honour
+    // a pending reschedule. Preempting only on the ring-3 boundary keeps the
+    // kernel itself non-preemptive: the interrupted user context is fully in
+    // `tf` on this task's kernel stack, so `schedule()` may switch away and
+    // resume us here later, and the user holds no kernel spinlocks.
     if tf.from_user() {
         crate::proc::deliver_user_signals();
+        if crate::sched::need_resched() {
+            crate::sched::schedule();
+            crate::proc::deliver_user_signals();
+        }
     }
 }
 
