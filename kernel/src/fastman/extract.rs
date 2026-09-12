@@ -47,7 +47,7 @@ fn ae(e: fastros_archive::Error) -> Errno {
     }
 }
 
-fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, owner: u32, group: u32) -> KResult<Stats> {
+fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, _owner: u32, _group: u32) -> KResult<Stats> {
     let mut st = Stats::default();
     let mut tr = TarReader::new(src);
     while let Some(entry) = tr.next_entry().map_err(ae)? {
@@ -142,9 +142,13 @@ fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, owner: u32, group: u32) -> KRes
                 continue;
             }
         }
-        // Rootless ownership remap: the caller owns everything.
+        // Preserve the archive's ownership (like Docker), so an image whose
+        // files belong to a service user (e.g. postgres uid 70) works when the
+        // container runs as that user (`--user`). A root-owned file stays root
+        // owned; a container running as the caller (default) is root here and
+        // reaches everything regardless.
         let follow = !matches!(entry.kind, Kind::Symlink);
-        let _ = ops::chown(ctx, &full, Some(owner), Some(group), follow);
+        let _ = ops::chown(ctx, &full, Some(entry.uid), Some(entry.gid), follow);
     }
     Ok(st)
 }
