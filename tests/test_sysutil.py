@@ -18,7 +18,9 @@ def test_date_formats(g):
 
 def test_df(g):
     lines = g.ok("df").splitlines()
-    assert lines[0] == "Filesystem     1K-blocks  Used Available Use% Mounted on"
+    # Column widths follow the data (df right-aligns to the widest value), so
+    # compare header tokens rather than exact spacing.
+    assert lines[0].split() == ["Filesystem", "1K-blocks", "Used", "Available", "Use%", "Mounted", "on"]
     root = [l for l in lines if l.endswith(" /")][0]
     assert re.match(r"^/dev/sda +\d+ +\d+ +\d+ +\d+% /$", root)
     h = g.ok("df -hT /").splitlines()

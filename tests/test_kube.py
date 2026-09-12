@@ -113,13 +113,10 @@ def test_kube_apply_get_delete(g, kube_setup):
     assert "worker/worker-0 created" in out and "worker/worker-1 created" in out, out
     assert "service web created" in out, out
 
-    time.sleep(2)
-    pods = g.ok("fastman kube get pods")
-    for p in ("web-0", "worker-0", "worker-1"):
-        assert p in pods, pods
+    assert _wait(lambda: all(_running(g, p) for p in ("web-0", "worker-0", "worker-1"))), g.ok("fastman kube get pods")
 
+    assert _wait(lambda: "2/2" in "".join(l for l in g.ok("fastman kube get deployments").splitlines() if "worker" in l)), g.ok("fastman kube get deployments")
     deps = g.ok("fastman kube get deployments")
-    assert "worker" in deps and "2/2" in deps, deps
     assert "web" in deps and "1/1" in deps, deps
 
     svcs = g.ok("fastman kube get services")
@@ -127,8 +124,7 @@ def test_kube_apply_get_delete(g, kube_setup):
 
     # Reach the pod through its Service (port 80) — the pod's declared 8080 is
     # remapped to a unique backend port, so the Service is the entry point.
-    body = g.out("curl -s -m 8 http://127.0.0.1:80/", timeout=15)
-    assert "kube pod alive" in body, body
+    assert _wait(lambda: "kube pod alive" in g.out("curl -s -m 8 http://127.0.0.1:80/", timeout=15), tries=10), "service curl"
 
     d = g.ok("fastman kube delete worker")
     assert 'deployment "worker" deleted' in d, d
@@ -154,35 +150,49 @@ spec:
 """
 
 
+# Timing helpers — the guest is slow/contended under full-suite TCG load, so
+# poll for the desired state instead of sleeping a fixed amount.
+def _running(g, pod):
+    line = [l for l in g.ok("fastman kube get pods").splitlines() if l.startswith(pod + " ")]
+    return bool(line) and "Running" in line[0]
+
+
+def _absent(g, pod):
+    return not any(l.startswith(pod + " ") for l in g.ok("fastman kube get pods").splitlines())
+
+
+def _wait(pred, tries=30, delay=1.0):
+    import time
+    for _ in range(tries):
+        if pred():
+            return True
+        time.sleep(delay)
+    return False
+
+
 @pytest.fixture
 def hive(g, kube_setup):
     g.ok("base64 -d > /tmp/hive.yaml", stdin=base64.b64encode(HIVE.encode()).decode())
     g.run("fastman kube delete hive 2>/dev/null; true")
     g.ok("fastman kube apply -f /tmp/hive.yaml", timeout=60)
-    import time
-    time.sleep(2)
+    assert _wait(lambda: _running(g, "hive-0") and _running(g, "hive-1")), g.ok("fastman kube get pods")
     yield
     g.run("fastman kube delete hive 2>/dev/null; true")
 
 
 def test_kube_scale(g, hive):
-    import time
     up = g.ok("fastman kube scale hive --replicas=3")
     assert 'scaled to 3' in up, up
-    time.sleep(2)
-    pods = g.ok("fastman kube get pods")
-    for p in ("hive-0", "hive-1", "hive-2"):
-        assert p in pods, pods
+    assert _wait(lambda: all(_running(g, p) for p in ("hive-0", "hive-1", "hive-2"))), g.ok("fastman kube get pods")
     dn = g.ok("fastman kube scale deployment/hive --replicas=1")
     assert 'scaled to 1' in dn, dn
-    time.sleep(1)
-    pods = g.ok("fastman kube get pods")
-    assert "hive-0" in pods and "hive-1" not in pods and "hive-2" not in pods, pods
+    assert _wait(lambda: _running(g, "hive-0") and _absent(g, "hive-1") and _absent(g, "hive-2")), g.ok("fastman kube get pods")
 
 
 def test_kube_self_healing(g, hive):
     import re, time
     # Find hive-0's pid, kill it, and confirm the controller brings it back.
+    assert _wait(lambda: _running(g, "hive-0"))
     desc = g.ok("fastman kube describe hive")
     m = re.search(r"hive-0\s+Running\s+pid=(\d+)", desc)
     assert m, desc
