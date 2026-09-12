@@ -164,6 +164,11 @@ pub fn bind(fd: i32, addr: usize, len: usize) -> KResult<usize> {
         return Ok(0);
     }
     let ep = read_sockaddr(addr, len)?;
+    // Binding a privileged port (1..1024) requires CAP_NET_BIND_SERVICE, exactly
+    // as on Linux — a dropped-capability or non-root container cannot claim one.
+    if (1..1024).contains(&ep.port) && !crate::syscall::seccomp::current_has_cap(crate::syscall::seccomp::CAP_NET_BIND_SERVICE) {
+        return Err(Errno::EACCES);
+    }
     // A Kubernetes pod's declared port is remapped to a unique backend port so
     // replicas of a fixed-port image don't collide on the shared stack.
     let mut port = ep.port;

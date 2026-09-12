@@ -10,6 +10,7 @@ mod file;
 mod mem;
 mod net;
 pub mod proc_sys;
+pub mod seccomp;
 
 use crate::arch::x86_64::syscall::UserFrame;
 use crate::errno::{Errno, KResult};
@@ -28,6 +29,15 @@ pub fn ret(r: KResult<usize>) -> u64 {
 pub fn dispatch(frame: &mut UserFrame) {
     let nr = frame.rax;
     let a = frame.args();
+    // seccomp: if the process installed a filter, run it before the syscall.
+    if let Some(action) = seccomp_check(nr, a, frame) {
+        frame.rax = action;
+        // The filter denied (errno) or the syscall is not to run; skip handle.
+        let mut regs = proc::signal::Regs::from_user(frame);
+        proc::deliver_user_signals(&mut regs);
+        regs.store_user(frame);
+        return;
+    }
     let r = handle(nr, a, frame);
     frame.rax = r;
     // A signal that arrived during the call may run a user handler (which
@@ -43,6 +53,31 @@ pub fn dispatch(frame: &mut UserFrame) {
         let mut regs = proc::signal::Regs::from_user(frame);
         proc::deliver_user_signals(&mut regs);
         regs.store_user(frame);
+    }
+}
+
+/// Run the current process's seccomp filter (if any). Returns `Some(rax)` when
+/// the syscall must NOT execute — either the filter chose an errno, or it killed
+/// the process (which never returns here in the kill case). `None` means allow.
+fn seccomp_check(nr: u64, a: [u64; 6], frame: &UserFrame) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    let p = proc::current();
+    if !p.seccomp_active.load(Ordering::Relaxed) {
+        return None;
+    }
+    let filters = p.seccomp.lock().clone()?;
+    match filters.decide(nr, frame.rip, &a) {
+        seccomp::Action::Allow => None,
+        seccomp::Action::Errno(e) => Some((-(e as i64)) as u64),
+        seccomp::Action::Trap => {
+            p.signal(proc::signal::SIGSYS);
+            Some((-(Errno::ENOSYS as i32 as i64)) as u64)
+        }
+        seccomp::Action::KillThread | seccomp::Action::KillProcess => {
+            // Both terminate the offending process in our single-threaded-kill
+            // model: raise SIGSYS with the fatal default action.
+            proc::exit_current(proc::ExitStatus::Signaled(proc::signal::SIGSYS));
+        }
     }
 }
 
@@ -231,9 +266,16 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         13 => ret(proc_sys::rt_sigaction(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as usize)),
         14 => ret(proc_sys::rt_sigprocmask(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize)),
         15 => proc_sys::rt_sigreturn(frame),
-        // sigaltstack, set_robust_list, rseq, prctl, sched_setaffinity,
+        // sigaltstack, set_robust_list, rseq, sched_setaffinity,
         // fadvise64: accepted as no-ops so libc starts.
-        131 | 273 | 334 | 157 | 203 | 221 => 0,
+        131 | 273 | 334 | 203 | 221 => 0,
+        // prctl: no_new_privs, seccomp mode, capability bounding set.
+        157 => ret(proc_sys::prctl(a[0] as i32, a[1], a[2], a[3], a[4])),
+        // seccomp(op, flags, args) — install a cBPF filter or enter strict mode.
+        317 => ret(proc_sys::seccomp(a[0] as u32, a[1] as u32, a[2] as usize)),
+        // capget / capset — read and change the capability set.
+        125 => ret(proc_sys::capget(a[0] as usize, a[1] as usize)),
+        126 => ret(proc_sys::capset(a[0] as usize, a[1] as usize)),
         // sync_file_range: an advisory flush hint. postgres itself falls back to
         // doing nothing when it is unavailable (real durability is the checkpoint
         // fsync), so a success no-op is correct and avoids per-write fsync cost.

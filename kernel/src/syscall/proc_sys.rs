@@ -13,6 +13,121 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+// ── prctl / seccomp / capabilities ───────────────────────────────────────────
+
+use super::seccomp;
+
+// prctl operations we implement.
+const PR_SET_NO_NEW_PRIVS: i32 = 38;
+const PR_GET_NO_NEW_PRIVS: i32 = 39;
+const PR_SET_SECCOMP: i32 = 22;
+const PR_GET_SECCOMP: i32 = 21;
+const PR_CAPBSET_READ: i32 = 23;
+const PR_CAPBSET_DROP: i32 = 24;
+const PR_SET_NAME: i32 = 15;
+const PR_GET_NAME: i32 = 16;
+
+// SECCOMP modes as passed to PR_SET_SECCOMP.
+const SECCOMP_MODE_STRICT: u64 = 1;
+const SECCOMP_MODE_FILTER: u64 = 2;
+
+pub fn prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> KResult<usize> {
+    let p = proc::current();
+    match option {
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 == 1 {
+                p.no_new_privs.store(true, Ordering::Release);
+            }
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(p.no_new_privs.load(Ordering::Relaxed) as usize),
+        PR_SET_SECCOMP => match arg2 {
+            SECCOMP_MODE_STRICT => seccomp::set_strict(),
+            SECCOMP_MODE_FILTER => seccomp::install_filter(arg3 as usize),
+            _ => Err(Errno::EINVAL),
+        },
+        PR_GET_SECCOMP => Ok(if p.seccomp_active.load(Ordering::Relaxed) { 2 } else { 0 }),
+        PR_CAPBSET_READ => {
+            if arg2 > seccomp::CAP_LAST as u64 {
+                return Err(Errno::EINVAL);
+            }
+            Ok((p.caps.load(Ordering::Relaxed) >> arg2 & 1) as usize)
+        }
+        PR_CAPBSET_DROP => {
+            if arg2 > seccomp::CAP_LAST as u64 {
+                return Err(Errno::EINVAL);
+            }
+            // Dropping a bounding-set capability requires CAP_SETPCAP on Linux;
+            // we allow a process to drop its own caps freely (only ever reduces
+            // privilege), which is what container hardening needs.
+            p.caps.fetch_and(!(1u64 << arg2), Ordering::AcqRel);
+            Ok(0)
+        }
+        PR_SET_NAME => {
+            let mut buf = [0u8; 16];
+            let _ = uaccess::copy_from(arg2 as usize, &mut buf);
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(16);
+            p.set_comm(&String::from_utf8_lossy(&buf[..end]));
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let mut name = p.comm().into_bytes();
+            name.resize(16, 0);
+            uaccess::copy_to(arg2 as usize, &name[..16])?;
+            Ok(0)
+        }
+        // Other prctl options (PDEATHSIG, DUMPABLE, THP, …): accept as no-ops.
+        _ => Ok(0),
+    }
+}
+
+pub fn seccomp(op: u32, _flags: u32, args: usize) -> KResult<usize> {
+    match op as u64 {
+        seccomp::SECCOMP_SET_MODE_STRICT => seccomp::set_strict(),
+        seccomp::SECCOMP_SET_MODE_FILTER => seccomp::install_filter(args),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `capget`: report the current capability set. Linux packs caps into two
+/// 32-bit words (v3 header); we mirror the effective set into permitted and
+/// inheritable and ignore the target pid (self only).
+pub fn capget(hdrp: usize, datap: usize) -> KResult<usize> {
+    if hdrp == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let caps = proc::current().caps.load(Ordering::Relaxed);
+    if datap != 0 {
+        let lo = (caps & 0xffff_ffff) as u32;
+        let hi = (caps >> 32) as u32;
+        // Two __user_cap_data_struct { effective, permitted, inheritable }.
+        for word in 0..2 {
+            let v = if word == 0 { lo } else { hi };
+            let base = datap + word * 12;
+            uaccess::write_obj(base, &v)?; // effective
+            uaccess::write_obj(base + 4, &v)?; // permitted
+            uaccess::write_obj(base + 8, &v)?; // inheritable
+        }
+    }
+    Ok(0)
+}
+
+/// `capset`: set the (effective) capability set. A process may only clear bits
+/// or keep ones it already holds — it can never grant itself new capabilities.
+pub fn capset(hdrp: usize, datap: usize) -> KResult<usize> {
+    if hdrp == 0 || datap == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let e0: u32 = uaccess::read_obj(datap)?;
+    let e1: u32 = uaccess::read_obj(datap + 12)?;
+    let requested = (e0 as u64) | ((e1 as u64) << 32);
+    let p = proc::current();
+    let cur = p.caps.load(Ordering::Relaxed);
+    // Never allow gaining a capability not already held.
+    p.caps.store(requested & cur, Ordering::Release);
+    Ok(0)
+}
+
 pub fn umask(mask: u16) -> KResult<usize> {
     let p = proc::current();
     let mut fs = p.fs.lock();

@@ -267,6 +267,9 @@ fn run_step(bctx: &Ctx, argv: &[String], env: &[String], workdir: &str, out: Opt
         sigactions: crate::proc::signal::default_table(),
         vfork: false,
         pidns: Some(crate::proc::PidNs::new()),
+        caps: crate::syscall::seccomp::default_caps(bctx.cred.uid),
+        no_new_privs: false,
+        seccomp: None,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = child.tasks().into_iter().next().map(|t| t.join()).unwrap_or(0);

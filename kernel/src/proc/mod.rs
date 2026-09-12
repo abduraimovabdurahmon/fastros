@@ -115,6 +115,18 @@ pub struct Process {
     /// This process's id within its PID namespace (its "virtual" pid). Equals
     /// the global pid when the process is not in a namespace.
     pub vpid: AtomicU32,
+    /// Effective capability set (a bitmask of `CAP_*`); root defaults to all.
+    /// Enforced at the relevant syscalls (e.g. binding a privileged port).
+    pub caps: AtomicU64,
+    /// `PR_SET_NO_NEW_PRIVS`: once set, exec never gains privileges and seccomp
+    /// filters may be installed without `CAP_SYS_ADMIN`. Inherited by children.
+    pub no_new_privs: AtomicBool,
+    /// Installed seccomp filters (cBPF), shared with forked children and kept
+    /// across execve. `None` until the process installs one.
+    pub seccomp: SpinLock<Option<Arc<crate::syscall::seccomp::Filters>>>,
+    /// Fast-path flag: true once any seccomp filter is installed, so the syscall
+    /// hot path skips the lock entirely when no filtering is in effect.
+    pub seccomp_active: AtomicBool,
 }
 
 static PROCS: SpinLock<BTreeMap<Pid, Arc<Process>>> = SpinLock::new(BTreeMap::new());
@@ -257,6 +269,10 @@ pub fn init(ns: Arc<MountNamespace>) {
             vfork_pending: AtomicBool::new(false),
             pidns: SpinLock::new(None),
             vpid: AtomicU32::new(0),
+            caps: AtomicU64::new(crate::syscall::seccomp::CAP_ALL),
+            no_new_privs: AtomicBool::new(false),
+            seccomp: SpinLock::new(None),
+            seccomp_active: AtomicBool::new(false),
         })
     });
 }
@@ -395,6 +411,12 @@ pub struct Spawn {
     /// PID namespace to join (inherited from the parent; a fresh one for a
     /// container's init, None for host processes).
     pub pidns: Option<Arc<PidNs>>,
+    /// Effective capabilities (inherited across fork/exec).
+    pub caps: u64,
+    /// `no_new_privs` flag (inherited across fork/exec).
+    pub no_new_privs: bool,
+    /// seccomp filters to inherit (fork/exec keep the parent's).
+    pub seccomp: Option<Arc<crate::syscall::seccomp::Filters>>,
 }
 
 impl Spawn {
@@ -418,6 +440,9 @@ impl Spawn {
             sigactions: *parent.sigactions.lock(),
             vfork: false,
             pidns: parent.pidns.lock().clone(),
+            caps: parent.caps.load(Ordering::Relaxed),
+            no_new_privs: parent.no_new_privs.load(Ordering::Relaxed),
+            seccomp: parent.seccomp.lock().clone(),
         }
     }
 }
@@ -477,6 +502,10 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         vfork_pending: AtomicBool::new(s.vfork),
         pidns: SpinLock::new(s.pidns.clone()),
         vpid: AtomicU32::new(pid),
+        caps: AtomicU64::new(s.caps),
+        no_new_privs: AtomicBool::new(s.no_new_privs),
+        seccomp: SpinLock::new(s.seccomp.clone()),
+        seccomp_active: AtomicBool::new(s.seccomp.is_some()),
     });
     // In a PID namespace, the process gets a namespace-local vpid (init = 1).
     if let Some(ns) = &s.pidns {

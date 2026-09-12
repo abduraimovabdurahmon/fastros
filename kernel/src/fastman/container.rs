@@ -76,6 +76,10 @@ pub struct Container {
     /// cgroup limits: memory in bytes and max tasks (0 = unlimited).
     pub mem_limit: u64,
     pub pids_limit: u32,
+    /// Capabilities added/dropped relative to the uid default (`--cap-add` /
+    /// `--cap-drop`), as `CAP_*` bitmasks.
+    pub cap_add: u64,
+    pub cap_drop: u64,
 }
 
 impl Container {
@@ -87,6 +91,12 @@ impl Container {
     }
     pub fn log_path(&self, ctx: &Ctx) -> String {
         format!("{}/{}/log", store::containers_dir(ctx), self.id)
+    }
+
+    /// The capability set the container's processes run with: the uid default
+    /// (all for root, none otherwise), minus `--cap-drop`, plus `--cap-add`.
+    pub fn effective_caps(&self) -> u64 {
+        (crate::syscall::seccomp::default_caps(self.uid) & !self.cap_drop) | self.cap_add
     }
 
     /// True if the init process is still alive.
@@ -136,6 +146,12 @@ impl Container {
         if self.mem_limit != 0 {
             s.push_str(&format!("mem_limit\t{}\n", self.mem_limit));
         }
+        if self.cap_add != 0 {
+            s.push_str(&format!("cap_add\t{}\n", self.cap_add));
+        }
+        if self.cap_drop != 0 {
+            s.push_str(&format!("cap_drop\t{}\n", self.cap_drop));
+        }
         if self.pids_limit != 0 {
             s.push_str(&format!("pids_limit\t{}\n", self.pids_limit));
         }
@@ -164,6 +180,8 @@ impl Container {
             port_remap: None,
             mem_limit: 0,
             pids_limit: 0,
+            cap_add: 0,
+            cap_drop: 0,
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -204,6 +222,8 @@ impl Container {
                 }
                 "mem_limit" => c.mem_limit = v.parse().unwrap_or(0),
                 "pids_limit" => c.pids_limit = v.parse().unwrap_or(0),
+                "cap_add" => c.cap_add = v.parse().unwrap_or(0),
+                "cap_drop" => c.cap_drop = v.parse().unwrap_or(0),
                 _ => {}
             }
         }

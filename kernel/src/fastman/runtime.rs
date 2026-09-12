@@ -48,6 +48,9 @@ pub struct RunOpts {
     pub mem_limit: u64,
     /// Max tasks (`--pids-limit`), 0 = unlimited.
     pub pids_limit: u32,
+    /// Capabilities to add / drop (`--cap-add` / `--cap-drop`) as `CAP_*` masks.
+    pub cap_add: u64,
+    pub cap_drop: u64,
 }
 
 /// Create a container from an image, building its writable rootfs.
@@ -96,6 +99,8 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         port_remap: opts.port_remap,
         mem_limit: opts.mem_limit,
         pids_limit: opts.pids_limit,
+        cap_add: opts.cap_add,
+        cap_drop: opts.cap_drop,
     };
     c.save(ctx)?;
     if let Some((d, a)) = c.port_remap {
@@ -249,6 +254,9 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         vfork: false,
         // A container's init starts a fresh PID namespace (it becomes vpid 1).
         pidns: Some(crate::proc::PidNs::new()),
+        caps: c.effective_caps(),
+        no_new_privs: false,
+        seccomp: None,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
@@ -442,6 +450,9 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         vfork: false,
         // Join the running container's PID namespace.
         pidns: init.pidns.lock().clone(),
+        caps: c.effective_caps(),
+        no_new_privs: false,
+        seccomp: None,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = if let Some(t) = &itty {

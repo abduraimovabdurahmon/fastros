@@ -241,6 +241,8 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  -p HOST:CONT       publish a port");
     outln!(ctx, "  -v HOST:CONT[:ro]  bind-mount a volume");
     outln!(ctx, "  -u uid[:gid]       run as this user (e.g. for postgres)");
+    outln!(ctx, "  --cap-add <cap>    grant a capability (e.g. NET_BIND_SERVICE, or ALL)");
+    outln!(ctx, "  --cap-drop <cap>   drop a capability (e.g. NET_BIND_SERVICE, or ALL)");
     outln!(ctx, "  -w <dir>           working directory");
     outln!(ctx, "  --network <name>   network (default: bridge)");
     outln!(ctx);
@@ -438,6 +440,16 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, String, Vec<String>), String> 
                 i += 1;
                 o.pids_limit = args.get(i).and_then(|s| s.parse().ok()).ok_or("--pids-limit needs a number")?;
             }
+            "--cap-add" => {
+                i += 1;
+                let v = args.get(i).ok_or("--cap-add needs a capability")?;
+                o.cap_add |= parse_caps(v)?;
+            }
+            "--cap-drop" => {
+                i += 1;
+                let v = args.get(i).ok_or("--cap-drop needs a capability")?;
+                o.cap_drop |= parse_caps(v)?;
+            }
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             s => image = Some(s.to_string()),
         }
@@ -469,6 +481,24 @@ fn parse_user(s: &str) -> Result<(u32, u32), String> {
         None => uid,
     };
     Ok((uid, gid))
+}
+
+/// Parse a `--cap-add`/`--cap-drop` value: `ALL`, or a comma-separated list of
+/// capability names (`NET_BIND_SERVICE`, `CAP_SYS_ADMIN`, …). Returns a bitmask.
+fn parse_caps(s: &str) -> Result<u64, String> {
+    let mut mask = 0u64;
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.eq_ignore_ascii_case("all") {
+            return Ok(crate::syscall::seccomp::CAP_ALL);
+        }
+        let bit = crate::syscall::seccomp::cap_by_name(part).ok_or_else(|| format!("unknown capability '{part}'"))?;
+        mask |= 1u64 << bit;
+    }
+    Ok(mask)
 }
 
 /// Parse a byte size with an optional k/m/g/t suffix (e.g. `256m`, `1g`).
@@ -1074,6 +1104,8 @@ fn clone_opts(o: &RunOpts) -> RunOpts {
         port_remap: o.port_remap,
         mem_limit: o.mem_limit,
         pids_limit: o.pids_limit,
+        cap_add: o.cap_add,
+        cap_drop: o.cap_drop,
     }
 }
 

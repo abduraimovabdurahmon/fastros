@@ -838,6 +838,7 @@ impl Conn {
             fds.set(2, Arc::new(ChanWriter { chan: c.clone(), ext: Some(1) }), false);
         }
         let root = kernel.fs.lock().clone();
+        let caps = crate::syscall::seccomp::default_caps(cred.uid);
         let spawn = Spawn {
             name: String::from(if command.is_some() { "sh" } else { "-sh" }),
             args: match &command {
@@ -859,6 +860,9 @@ impl Conn {
             sigactions: crate::proc::signal::default_table(),
             vfork: false,
             pidns: None,
+            caps,
+            no_new_privs: false,
+            seccomp: None,
         };
         let interactive = command.is_none() && tty_for_proc.is_some();
         let u2 = user.clone();

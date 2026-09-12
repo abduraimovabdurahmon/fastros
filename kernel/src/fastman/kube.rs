@@ -199,6 +199,8 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         port_remap: o.port_remap,
         mem_limit: o.mem_limit,
         pids_limit: o.pids_limit,
+        cap_add: o.cap_add,
+        cap_drop: o.cap_drop,
     }
 }
 
@@ -219,6 +221,8 @@ pub fn opts_from_container(c: &super::container::Container, name: String) -> Run
         port_remap: c.port_remap,
         mem_limit: c.mem_limit,
         pids_limit: c.pids_limit,
+        cap_add: c.cap_add,
+        cap_drop: c.cap_drop,
     }
 }
 
