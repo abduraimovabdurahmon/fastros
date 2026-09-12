@@ -4,9 +4,11 @@
 //! optional deadlines. Dropping a stream closes it gracefully; the stack
 //! keeps the socket until the FIN handshake completes.
 
-use super::{poll_now, stack, Stack, SOCK_WQ};
+use super::netns::{self, NetNs};
+use super::{Stack, SOCK_WQ};
 use crate::errno::{Errno, KResult};
 use crate::sync::WaitResult;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::iface::SocketHandle;
@@ -29,10 +31,10 @@ fn deadline(timeout_ms: Option<u64>) -> Option<u64> {
 
 /// Run `f` on the TCP socket under the stack lock; retry after every stack
 /// poll until it yields `Some`.
-fn tcp_wait<R>(h: SocketHandle, dl: Option<u64>, mut f: impl FnMut(&mut tcp::Socket) -> Option<KResult<R>>) -> KResult<R> {
+fn tcp_wait<R>(ns: &NetNs, h: SocketHandle, dl: Option<u64>, mut f: impl FnMut(&mut tcp::Socket) -> Option<KResult<R>>) -> KResult<R> {
     let r = SOCK_WQ.wait_until_interruptible(
         || {
-            let mut s = stack().lock();
+            let mut s = ns.stack().lock();
             f(s.sockets.get_mut::<tcp::Socket>(h))
         },
         dl,
@@ -43,6 +45,7 @@ fn tcp_wait<R>(h: SocketHandle, dl: Option<u64>, mut f: impl FnMut(&mut tcp::Soc
 pub struct TcpStream {
     h: SocketHandle,
     closed: core::sync::atomic::AtomicBool,
+    ns: Arc<NetNs>,
 }
 
 fn new_tcp_socket() -> tcp::Socket<'static> {
@@ -55,8 +58,9 @@ fn new_tcp_socket() -> tcp::Socket<'static> {
 
 impl TcpStream {
     pub fn connect(remote: IpEndpoint, timeout_ms: u64) -> KResult<TcpStream> {
+        let ns = netns::current();
         let h = {
-            let mut st = stack().lock();
+            let mut st = ns.stack().lock();
             // Loopback destinations are reachable even without a configured
             // address: IPv4 127/8, IPv6 ::1, and our own ULA (fd00::/8) which is
             // where AF_INET6 loopback traffic rides.
@@ -71,9 +75,9 @@ impl TcpStream {
             sock.connect(iface.context(), remote, local).map_err(|_| Errno::EINVAL)?;
             sockets.add(sock)
         };
-        poll_now();
-        let stream = TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false) };
-        let r = tcp_wait(h, deadline(Some(timeout_ms)), |s| match s.state() {
+        ns.poll_now();
+        let stream = TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false), ns: ns.clone() };
+        let r = tcp_wait(&ns, h, deadline(Some(timeout_ms)), |s| match s.state() {
             tcp::State::Established => Some(Ok(())),
             tcp::State::Closed => Some(Err(Errno::ECONNREFUSED)),
             _ => None,
@@ -81,7 +85,7 @@ impl TcpStream {
         match r {
             Ok(()) => Ok(stream),
             Err(e) => {
-                stack().lock().sockets.get_mut::<tcp::Socket>(h).abort();
+                ns.stack().lock().sockets.get_mut::<tcp::Socket>(h).abort();
                 Err(e)
             }
         }
@@ -89,7 +93,7 @@ impl TcpStream {
 
     /// Read up to `buf.len()` bytes; `Ok(0)` at end of stream.
     pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: Option<u64>) -> KResult<usize> {
-        let n = tcp_wait(self.h, deadline(timeout_ms), |s| {
+        let n = tcp_wait(&self.ns, self.h, deadline(timeout_ms), |s| {
             if s.can_recv() {
                 return Some(s.recv_slice(buf).map_err(|_| Errno::ECONNRESET));
             }
@@ -99,19 +103,19 @@ impl TcpStream {
             None
         })?;
         if n > 0 {
-            poll_now(); // window update
+            self.ns.poll_now(); // window update
         }
         Ok(n)
     }
 
     /// Non-blocking read: `EAGAIN` if no data is available yet.
     pub fn try_read(&self, buf: &mut [u8]) -> KResult<usize> {
-        let mut st = stack().lock();
+        let mut st = self.ns.stack().lock();
         let s = st.sockets.get_mut::<tcp::Socket>(self.h);
         if s.can_recv() {
             let n = s.recv_slice(buf).map_err(|_| Errno::ECONNRESET)?;
             drop(st);
-            poll_now();
+            self.ns.poll_now();
             return Ok(n);
         }
         if !s.may_recv() {
@@ -125,7 +129,7 @@ impl TcpStream {
         if data.is_empty() {
             return Ok(0);
         }
-        let mut st = stack().lock();
+        let mut st = self.ns.stack().lock();
         let s = st.sockets.get_mut::<tcp::Socket>(self.h);
         if !s.may_send() {
             return Err(Errno::EPIPE);
@@ -133,7 +137,7 @@ impl TcpStream {
         if s.can_send() {
             let n = s.send_slice(data).map_err(|_| Errno::EPIPE)?;
             drop(st);
-            poll_now();
+            self.ns.poll_now();
             return Ok(n);
         }
         Err(Errno::EAGAIN)
@@ -141,7 +145,7 @@ impl TcpStream {
 
     /// Can a write make progress right now (poll: writable)?
     pub fn can_write(&self) -> bool {
-        let st = stack().lock();
+        let st = self.ns.stack().lock();
         let s = st.sockets.get::<tcp::Socket>(self.h);
         s.can_send() || !s.may_send()
     }
@@ -155,7 +159,7 @@ impl TcpStream {
         if data.is_empty() {
             return Ok(0);
         }
-        let n = tcp_wait(self.h, None, |s| {
+        let n = tcp_wait(&self.ns, self.h, None, |s| {
             if !s.may_send() {
                 return Some(Err(Errno::EPIPE));
             }
@@ -164,7 +168,7 @@ impl TcpStream {
             }
             None
         })?;
-        poll_now();
+        self.ns.poll_now();
         Ok(n)
     }
 
@@ -178,40 +182,40 @@ impl TcpStream {
 
     /// Bytes queued but not yet acknowledged by the peer.
     pub fn send_queue(&self) -> usize {
-        stack().lock().sockets.get::<tcp::Socket>(self.h).send_queue()
+        self.ns.stack().lock().sockets.get::<tcp::Socket>(self.h).send_queue()
     }
 
     pub fn can_read(&self) -> bool {
-        let st = stack().lock();
+        let st = self.ns.stack().lock();
         let s = st.sockets.get::<tcp::Socket>(self.h);
         s.can_recv() || !s.may_recv()
     }
 
     pub fn is_open(&self) -> bool {
-        let st = stack().lock();
+        let st = self.ns.stack().lock();
         let s = st.sockets.get::<tcp::Socket>(self.h);
         s.may_recv() || s.may_send()
     }
 
     pub fn peer(&self) -> Option<IpEndpoint> {
-        stack().lock().sockets.get::<tcp::Socket>(self.h).remote_endpoint()
+        self.ns.stack().lock().sockets.get::<tcp::Socket>(self.h).remote_endpoint()
     }
 
     pub fn local(&self) -> Option<IpEndpoint> {
-        stack().lock().sockets.get::<tcp::Socket>(self.h).local_endpoint()
+        self.ns.stack().lock().sockets.get::<tcp::Socket>(self.h).local_endpoint()
     }
 
     /// Send FIN (no more writes); reads continue until the peer closes.
     pub fn shutdown(&self) {
-        stack().lock().sockets.get_mut::<tcp::Socket>(self.h).close();
-        poll_now();
+        self.ns.stack().lock().sockets.get_mut::<tcp::Socket>(self.h).close();
+        self.ns.poll_now();
     }
 
     /// Hard reset.
     pub fn abort(&self) {
-        stack().lock().sockets.get_mut::<tcp::Socket>(self.h).abort();
+        self.ns.stack().lock().sockets.get_mut::<tcp::Socket>(self.h).abort();
         self.closed.store(true, core::sync::atomic::Ordering::Relaxed);
-        poll_now();
+        self.ns.poll_now();
     }
 }
 
@@ -219,7 +223,7 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         // Drop may run with spinlocks held: only take the (sleeping) stack
         // lock if it is free right now, otherwise leave it to the reaper.
-        if let Some(mut st) = stack().try_lock() {
+        if let Some(mut st) = self.ns.stack().try_lock() {
             let s = st.sockets.get_mut::<tcp::Socket>(self.h);
             if !self.closed.load(core::sync::atomic::Ordering::Relaxed) {
                 s.close();
@@ -236,13 +240,15 @@ impl Drop for TcpStream {
 pub struct TcpListener {
     port: u16,
     backlog: crate::sync::SpinLock<Vec<SocketHandle>>,
+    ns: Arc<NetNs>,
 }
 
 impl TcpListener {
     pub fn bind(port: u16, backlog: usize) -> KResult<TcpListener> {
+        let ns = netns::current();
         let mut hs = Vec::new();
         {
-            let mut st = stack().lock();
+            let mut st = ns.stack().lock();
             let in_use = st.sockets.iter().any(|(_, s)| match s {
                 smoltcp::socket::Socket::Tcp(t) => t.is_listening() && t.listen_endpoint().port == port,
                 _ => false,
@@ -256,7 +262,7 @@ impl TcpListener {
                 hs.push(st.sockets.add(s));
             }
         }
-        Ok(TcpListener { port, backlog: crate::sync::SpinLock::new(hs) })
+        Ok(TcpListener { port, backlog: crate::sync::SpinLock::new(hs), ns })
     }
 
     pub fn port(&self) -> u16 {
@@ -269,7 +275,7 @@ impl TcpListener {
         let (h, peer) = SOCK_WQ
             .wait_until_interruptible(
                 || {
-                    let st = stack().lock();
+                    let st = self.ns.stack().lock();
                     handles.iter().find_map(|&h| {
                         let s = st.sockets.get::<tcp::Socket>(h);
                         match s.state() {
@@ -283,7 +289,7 @@ impl TcpListener {
             .map_err(wait_err)?;
         // Re-arm: replace the accepted socket with a fresh listener.
         {
-            let mut st = stack().lock();
+            let mut st = self.ns.stack().lock();
             let mut s = new_tcp_socket();
             let _ = s.listen(IpListenEndpoint { addr: None, port: self.port });
             let nh = st.sockets.add(s);
@@ -292,7 +298,7 @@ impl TcpListener {
                 *slot = nh;
             }
         }
-        Ok((TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false) }, peer))
+        Ok((TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false), ns: self.ns.clone() }, peer))
     }
 }
 
@@ -300,7 +306,7 @@ impl TcpListener {
     /// Is a connection ready to accept right now?
     pub fn pending(&self) -> bool {
         let handles = self.backlog.lock().clone();
-        let st = stack().lock();
+        let st = self.ns.stack().lock();
         handles.iter().any(|&h| {
             let s = st.sockets.get::<tcp::Socket>(h);
             matches!(s.state(), tcp::State::Established | tcp::State::CloseWait) && s.remote_endpoint().is_some()
@@ -311,7 +317,7 @@ impl TcpListener {
     pub fn try_accept(&self) -> Option<(TcpStream, IpEndpoint)> {
         let handles = self.backlog.lock().clone();
         let picked = {
-            let st = stack().lock();
+            let st = self.ns.stack().lock();
             handles.iter().find_map(|&h| {
                 let s = st.sockets.get::<tcp::Socket>(h);
                 match s.state() {
@@ -321,21 +327,21 @@ impl TcpListener {
             })
         };
         let (h, peer) = picked?;
-        let mut st = stack().lock();
+        let mut st = self.ns.stack().lock();
         let mut fresh = new_tcp_socket();
         let _ = fresh.listen(IpListenEndpoint { addr: None, port: self.port });
         let nh = st.sockets.add(fresh);
         if let Some(slot) = self.backlog.lock().iter_mut().find(|x| **x == h) {
             *slot = nh;
         }
-        Some((TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false) }, peer))
+        Some((TcpStream { h, closed: core::sync::atomic::AtomicBool::new(false), ns: self.ns.clone() }, peer))
     }
 }
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
         let hs = core::mem::take(&mut *self.backlog.lock());
-        let mut st = stack().lock();
+        let mut st = self.ns.stack().lock();
         for h in hs {
             st.sockets.get_mut::<tcp::Socket>(h).abort();
             st.orphan(h);
@@ -347,6 +353,7 @@ impl Drop for TcpListener {
 pub struct UdpSocket {
     h: SocketHandle,
     port: u16,
+    ns: Arc<NetNs>,
 }
 
 impl UdpSocket {
@@ -357,8 +364,9 @@ impl UdpSocket {
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16384]),
         );
         sock.bind(port).map_err(|_| Errno::EADDRINUSE)?;
-        let h = stack().lock().sockets.add(sock);
-        Ok(UdpSocket { h, port })
+        let ns = netns::current();
+        let h = ns.stack().lock().sockets.add(sock);
+        Ok(UdpSocket { h, port, ns })
     }
 
     pub fn port(&self) -> u16 {
@@ -366,8 +374,8 @@ impl UdpSocket {
     }
 
     pub fn send_to(&self, data: &[u8], to: IpEndpoint) -> KResult<()> {
-        stack().lock().sockets.get_mut::<udp::Socket>(self.h).send_slice(data, to).map_err(|_| Errno::ENOBUFS)?;
-        poll_now();
+        self.ns.stack().lock().sockets.get_mut::<udp::Socket>(self.h).send_slice(data, to).map_err(|_| Errno::ENOBUFS)?;
+        self.ns.poll_now();
         Ok(())
     }
 
@@ -375,7 +383,7 @@ impl UdpSocket {
         SOCK_WQ
             .wait_until_interruptible(
                 || {
-                    let mut st = stack().lock();
+                    let mut st = self.ns.stack().lock();
                     let s = st.sockets.get_mut::<udp::Socket>(self.h);
                     if s.can_recv() {
                         s.recv_slice(buf).ok().map(|(n, meta)| (n, meta.endpoint))
@@ -391,10 +399,10 @@ impl UdpSocket {
 
 impl UdpSocket {
     pub fn can_recv(&self) -> bool {
-        stack().lock().sockets.get::<udp::Socket>(self.h).can_recv()
+        self.ns.stack().lock().sockets.get::<udp::Socket>(self.h).can_recv()
     }
     pub fn try_recv_from(&self, buf: &mut [u8]) -> KResult<(usize, IpEndpoint)> {
-        let mut st = stack().lock();
+        let mut st = self.ns.stack().lock();
         let s = st.sockets.get_mut::<udp::Socket>(self.h);
         if s.can_recv() {
             s.recv_slice(buf).map(|(n, meta)| (n, meta.endpoint)).map_err(|_| Errno::EAGAIN)
@@ -406,7 +414,7 @@ impl UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        if let Some(mut st) = stack().try_lock() {
+        if let Some(mut st) = self.ns.stack().try_lock() {
             st.sockets.remove(self.h);
         }
     }
@@ -416,6 +424,7 @@ impl Drop for UdpSocket {
 pub struct IcmpSocket {
     h: SocketHandle,
     pub ident: u16,
+    ns: Arc<NetNs>,
 }
 
 impl IcmpSocket {
@@ -426,13 +435,14 @@ impl IcmpSocket {
             icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 8192]),
         );
         sock.bind(icmp::Endpoint::Ident(ident)).map_err(|_| Errno::EADDRINUSE)?;
-        let h = stack().lock().sockets.add(sock);
-        Ok(IcmpSocket { h, ident })
+        let ns = netns::current();
+        let h = ns.stack().lock().sockets.add(sock);
+        Ok(IcmpSocket { h, ident, ns })
     }
 
     pub fn send(&self, packet: &[u8], to: IpAddress) -> KResult<()> {
-        stack().lock().sockets.get_mut::<icmp::Socket>(self.h).send_slice(packet, to).map_err(|_| Errno::ENOBUFS)?;
-        poll_now();
+        self.ns.stack().lock().sockets.get_mut::<icmp::Socket>(self.h).send_slice(packet, to).map_err(|_| Errno::ENOBUFS)?;
+        self.ns.poll_now();
         Ok(())
     }
 
@@ -440,7 +450,7 @@ impl IcmpSocket {
         SOCK_WQ
             .wait_until_interruptible(
                 || {
-                    let mut st = stack().lock();
+                    let mut st = self.ns.stack().lock();
                     let s = st.sockets.get_mut::<icmp::Socket>(self.h);
                     if s.can_recv() {
                         s.recv_slice(buf).ok()
@@ -456,7 +466,7 @@ impl IcmpSocket {
 
 impl Drop for IcmpSocket {
     fn drop(&mut self) {
-        if let Some(mut st) = stack().try_lock() {
+        if let Some(mut st) = self.ns.stack().try_lock() {
             st.sockets.remove(self.h);
         }
     }

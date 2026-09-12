@@ -244,7 +244,7 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  --cap-add <cap>    grant a capability (e.g. NET_BIND_SERVICE, or ALL)");
     outln!(ctx, "  --cap-drop <cap>   drop a capability (e.g. NET_BIND_SERVICE, or ALL)");
     outln!(ctx, "  -w <dir>           working directory");
-    outln!(ctx, "  --network <name>   network (default: bridge)");
+    outln!(ctx, "  --network <name>   network: bridge (shared, default) or none (private netns)");
     outln!(ctx);
     outln!(ctx, "{}", s.dim("Every container is a rootless sandbox: its own mount namespace, chrooted"));
     outln!(ctx, "{}", s.dim("to the image, with no access to host files, processes or network."));

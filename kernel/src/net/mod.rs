@@ -9,6 +9,7 @@
 
 pub mod device;
 pub mod ftp;
+pub mod netns;
 pub mod http;
 pub mod tls;
 pub mod dns;
@@ -251,23 +252,49 @@ pub fn kick() {
 /// waiting for the next `knetd` tick: send → deliver → reply → deliver.
 pub fn poll_now() {
     if let Some(s) = STACK.get() {
-        let mut changed = false;
-        // A loopback echo takes several device passes (send → deliver request
-        // → generate reply → deliver reply). The middle passes move a frame
-        // without changing socket state, so poll a few times unconditionally
-        // before trusting the "no change" signal to stop.
-        for i in 0..8 {
-            let c = s.lock().poll();
-            changed |= c;
-            if !c && i >= 3 {
-                break;
-            }
-        }
-        if changed {
-            SOCK_WQ.wake_all();
-        }
-        NETD_WQ.wake_all();
+        poll_now_on(s);
     }
+}
+
+/// Poll a specific stack to completion (used for a private network namespace's
+/// loopback stack, which has no NIC and so is not serviced by `netd`).
+pub fn poll_now_on(s: &Mutex<Stack>) {
+    let mut changed = false;
+    // A loopback echo takes several device passes (send → deliver request
+    // → generate reply → deliver reply). The middle passes move a frame
+    // without changing socket state, so poll a few times unconditionally
+    // before trusting the "no change" signal to stop.
+    for i in 0..8 {
+        let c = s.lock().poll();
+        changed |= c;
+        if !c && i >= 3 {
+            break;
+        }
+    }
+    if changed {
+        SOCK_WQ.wake_all();
+    }
+    NETD_WQ.wake_all();
+}
+
+/// Build an isolated loopback stack for a private network namespace: no NIC, so
+/// only intra-namespace loopback traffic flows (its own `127.0.0.1`, `::1` and a
+/// private ULA). Two such namespaces can each bind the same port with no
+/// collision, and neither sees the other's sockets.
+pub fn new_loopback_stack() -> Stack {
+    let mut dev = PhysDevice::new(None);
+    let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(dev.mac())));
+    config.random_seed = crate::crypto::rng::u64();
+    let mut iface = Interface::new(config, &mut dev, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128));
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), 64));
+    });
+    let sockets = SocketSet::new(vec![]);
+    let mut st = Stack { iface, dev, sockets, dhcp: None, cfg: IfConfig::default(), orphans: Vec::new() };
+    st.sync_local_ips();
+    st
 }
 
 fn nic_irq() {

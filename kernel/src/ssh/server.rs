@@ -863,6 +863,7 @@ impl Conn {
             caps,
             no_new_privs: false,
             seccomp: None,
+            netns: None,
         };
         let interactive = command.is_none() && tty_for_proc.is_some();
         let u2 = user.clone();

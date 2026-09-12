@@ -162,6 +162,17 @@ fn build_fs(ctx: &Ctx, c: &Container) -> KResult<FsContext> {
     Ok(FsContext { ns, root, cwd, umask: 0o022 })
 }
 
+/// The network namespace a container runs in: a private isolated loopback stack
+/// for `--network none`/`private`, or `None` (the shared host stack) for the
+/// default `bridge` network — preserving existing published-port behaviour.
+fn container_netns(c: &Container) -> Option<alloc::sync::Arc<crate::net::netns::NetNs>> {
+    if c.network == "none" || c.network == "private" {
+        Some(crate::net::netns::create(&c.id))
+    } else {
+        None
+    }
+}
+
 /// The credentials the container process runs under: its `--user` identity, or
 /// the caller's when unset.
 fn container_cred(ctx: &Ctx, c: &Container) -> crate::fs::perm::Cred {
@@ -257,6 +268,9 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         caps: c.effective_caps(),
         no_new_privs: false,
         seccomp: None,
+        // A private network namespace ("none"/"private") gives the container its
+        // own isolated loopback stack; the default "bridge" shares the host stack.
+        netns: container_netns(c),
     };
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
@@ -373,6 +387,7 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool) -> KResult<()> {
         }
     }
     crate::net::clear_pod_port(&c.id);
+    crate::net::netns::remove(&c.id);
     crate::cgroup::remove(&c.id);
     ops::remove_tree(ctx, &c.dir(ctx))
 }
@@ -453,6 +468,8 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         caps: c.effective_caps(),
         no_new_privs: false,
         seccomp: None,
+        // Join the running container's network namespace.
+        netns: init.netns.lock().clone(),
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = if let Some(t) = &itty {

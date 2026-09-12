@@ -127,6 +127,10 @@ pub struct Process {
     /// Fast-path flag: true once any seccomp filter is installed, so the syscall
     /// hot path skips the lock entirely when no filtering is in effect.
     pub seccomp_active: AtomicBool,
+    /// Network namespace (a container's private stack), or `None` for the shared
+    /// host namespace. Inherited across fork and exec; every socket created by
+    /// this process is bound to it.
+    pub netns: SpinLock<Option<Arc<crate::net::netns::NetNs>>>,
 }
 
 static PROCS: SpinLock<BTreeMap<Pid, Arc<Process>>> = SpinLock::new(BTreeMap::new());
@@ -273,6 +277,7 @@ pub fn init(ns: Arc<MountNamespace>) {
             no_new_privs: AtomicBool::new(false),
             seccomp: SpinLock::new(None),
             seccomp_active: AtomicBool::new(false),
+            netns: SpinLock::new(None),
         })
     });
 }
@@ -417,6 +422,8 @@ pub struct Spawn {
     pub no_new_privs: bool,
     /// seccomp filters to inherit (fork/exec keep the parent's).
     pub seccomp: Option<Arc<crate::syscall::seccomp::Filters>>,
+    /// Network namespace to join (inherited across fork/exec; `None` = host).
+    pub netns: Option<Arc<crate::net::netns::NetNs>>,
 }
 
 impl Spawn {
@@ -443,6 +450,7 @@ impl Spawn {
             caps: parent.caps.load(Ordering::Relaxed),
             no_new_privs: parent.no_new_privs.load(Ordering::Relaxed),
             seccomp: parent.seccomp.lock().clone(),
+            netns: parent.netns.lock().clone(),
         }
     }
 }
@@ -506,6 +514,7 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         no_new_privs: AtomicBool::new(s.no_new_privs),
         seccomp: SpinLock::new(s.seccomp.clone()),
         seccomp_active: AtomicBool::new(s.seccomp.is_some()),
+        netns: SpinLock::new(s.netns.clone()),
     });
     // In a PID namespace, the process gets a namespace-local vpid (init = 1).
     if let Some(ns) = &s.pidns {

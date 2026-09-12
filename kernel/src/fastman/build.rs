@@ -270,6 +270,7 @@ fn run_step(bctx: &Ctx, argv: &[String], env: &[String], workdir: &str, out: Opt
         caps: crate::syscall::seccomp::default_caps(bctx.cred.uid),
         no_new_privs: false,
         seccomp: None,
+        netns: None,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = child.tasks().into_iter().next().map(|t| t.join()).unwrap_or(0);

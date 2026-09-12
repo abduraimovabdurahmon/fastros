@@ -87,6 +87,7 @@ pub fn start_getty() {
             caps: crate::syscall::seccomp::default_caps(crate::users::cred_for(&user).uid),
             no_new_privs: false,
             seccomp: None,
+            netns: None,
         };
         let u = user.clone();
         if let Ok(p) = crate::proc::spawn(spawn, move || crate::shell::login_shell_main(u)) {
