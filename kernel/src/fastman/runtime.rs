@@ -42,6 +42,8 @@ pub struct RunOpts {
     pub detach: bool,
     /// `--user uid[:gid]`: run the container process as this identity.
     pub user: Option<(u32, u32)>,
+    /// Kubernetes pod port remap (declared, actual) — see [`Container::port_remap`].
+    pub port_remap: Option<(u16, u16)>,
 }
 
 /// Create a container from an image, building its writable rootfs.
@@ -87,8 +89,12 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         detach: opts.detach,
         uid: opts.user.map(|u| u.0).unwrap_or(0),
         gid: opts.user.map(|u| u.1).unwrap_or(0),
+        port_remap: opts.port_remap,
     };
     c.save(ctx)?;
+    if let Some((d, a)) = c.port_remap {
+        crate::net::set_pod_port(&c.id, d, a);
+    }
     Ok(c)
 }
 
@@ -183,6 +189,11 @@ fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Opti
 /// Start a created container. Returns its init pid. For a foreground run,
 /// `tee` receives a copy of the output; the caller then waits on the pid.
 pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResult<(u32, alloc::sync::Arc<crate::sched::Task>)> {
+    // Re-register the pod port remap (survives reboot: the controller restarts
+    // pods from their persisted config, and bind() must translate again).
+    if let Some((d, a)) = c.port_remap {
+        crate::net::set_pod_port(&c.id, d, a);
+    }
     let fs = build_fs(ctx, c)?;
     // The container process runs as its configured user (`--user`), defaulting
     // to the caller's identity.
@@ -339,6 +350,7 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool) -> KResult<()> {
             }
         }
     }
+    crate::net::clear_pod_port(&c.id);
     ops::remove_tree(ctx, &c.dir(ctx))
 }
 

@@ -138,7 +138,13 @@ pub fn bind(fd: i32, addr: usize, len: usize) -> KResult<usize> {
         return Ok(0);
     }
     let ep = read_sockaddr(addr, len)?;
-    with_sock(fd, |s| s.bind(ep.port))?;
+    // A Kubernetes pod's declared port is remapped to a unique backend port so
+    // replicas of a fixed-port image don't collide on the shared stack.
+    let mut port = ep.port;
+    if let Some(cid) = proc::current().container.lock().as_ref() {
+        port = crate::net::remap_pod_port(cid, port);
+    }
+    with_sock(fd, |s| s.bind(port))?;
     Ok(0)
 }
 

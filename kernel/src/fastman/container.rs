@@ -70,6 +70,9 @@ pub struct Container {
     /// (postgres/initdb) can drop to its own user.
     pub uid: u32,
     pub gid: u32,
+    /// Kubernetes pod port remap: (declared container port, actual backend port
+    /// on the shared stack). Lets replicas of a fixed-port image coexist.
+    pub port_remap: Option<(u16, u16)>,
 }
 
 impl Container {
@@ -124,6 +127,9 @@ impl Container {
         for v in &self.volumes {
             s.push_str(&format!("volume\t{}\t{}\t{}\n", v.host, v.container, v.read_only as u8));
         }
+        if let Some((d, a)) = self.port_remap {
+            s.push_str(&format!("remap\t{d}\t{a}\n"));
+        }
         s
     }
 
@@ -146,6 +152,7 @@ impl Container {
             detach: false,
             uid: 0,
             gid: 0,
+            port_remap: None,
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -178,6 +185,11 @@ impl Container {
                     let host = v.to_string();
                     let container = it.next().unwrap_or("").to_string();
                     c.volumes.push(Volume { host, container, read_only: it.next() == Some("1") });
+                }
+                "remap" => {
+                    if let (Ok(d), Ok(a)) = (v.parse(), it.next().unwrap_or("0").parse()) {
+                        c.port_remap = Some((d, a));
+                    }
                 }
                 _ => {}
             }

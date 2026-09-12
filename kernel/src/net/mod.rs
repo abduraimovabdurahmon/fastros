@@ -84,6 +84,39 @@ pub fn is_up() -> bool {
     STACK.get().is_some()
 }
 
+/// Per-container port remaps. A Kubernetes pod that declares a container port
+/// (e.g. nginx on :80) is given a unique backend port on the shared network
+/// stack, so N replicas of a fixed-port image can all "bind :80" without
+/// colliding. Keyed by container id → (declared port, actual port). A Service
+/// proxy fronts these with one stable endpoint. Cleared on delete/scale-down.
+static POD_PORTS: crate::sync::SpinLock<alloc::collections::BTreeMap<alloc::string::String, (u16, u16)>> =
+    crate::sync::SpinLock::new(alloc::collections::BTreeMap::new());
+
+pub fn set_pod_port(cid: &str, declared: u16, actual: u16) {
+    POD_PORTS.lock().insert(alloc::string::String::from(cid), (declared, actual));
+}
+
+pub fn clear_pod_port(cid: &str) {
+    POD_PORTS.lock().remove(cid);
+}
+
+/// Translate a bind port for a container: if it is the container's declared pod
+/// port, return the unique actual port; otherwise return it unchanged.
+pub fn remap_pod_port(cid: &str, port: u16) -> u16 {
+    match POD_PORTS.lock().get(cid) {
+        Some(&(declared, actual)) if declared == port => actual,
+        _ => port,
+    }
+}
+
+/// The actual backend port a container listens on for its declared pod port.
+pub fn pod_actual_port(cid: &str, declared: u16) -> Option<u16> {
+    match POD_PORTS.lock().get(cid) {
+        Some(&(d, a)) if d == declared => Some(a),
+        _ => None,
+    }
+}
+
 /// A free local port for outgoing connections.
 pub fn ephemeral_port() -> u16 {
     loop {

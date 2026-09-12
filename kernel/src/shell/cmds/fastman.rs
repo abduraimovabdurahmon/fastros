@@ -639,12 +639,18 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                     ctx.fail(format!("{}: image '{}' not found", w.name, w.image));
                     continue;
                 }
+                let declared = w.opts.ports.first().map(|p| p.container);
                 let rec = format!("{}\n{}\n{}\n", w.kind, w.replicas, w.image);
                 let _ = crate::fs::ops::write_file(&fc, &format!("{wdir}/{}", w.name), rec.as_bytes(), 0o600);
                 for n in 0..w.replicas {
                     let pod = crate::fastman::kube::pod_name(&w.name, n);
                     let _ = runtime::remove(&fc, &pod, true);
-                    let opts = crate::fastman::kube::clone_opts(&w.opts, pod.clone());
+                    let mut opts = crate::fastman::kube::clone_opts(&w.opts, pod.clone());
+                    // Give each replica a unique backend port for its declared
+                    // container port, so N fixed-port pods can coexist.
+                    if let Some(d) = declared {
+                        opts.port_remap = Some((d, crate::fastman::kube::alloc_pod_port()));
+                    }
                     ctx.flush();
                     match runtime::run(&fc, &w.image, opts, None) {
                         Ok(_) => outln!(ctx, "{} {}/{} created", s.green(&w.kind.to_lowercase()), w.name, pod),
@@ -655,9 +661,20 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                 }
             }
             for sv in &m.services {
-                let rec = format!("{}\n{}\n{}\n", sv.port, sv.target, sv.selector);
+                // Associate the service with a workload: same name, else the one
+                // whose name matches the selector value, else the first.
+                let wl = m
+                    .workloads
+                    .iter()
+                    .find(|w| w.name == sv.name || sv.selector.contains(&w.name))
+                    .or_else(|| m.workloads.first())
+                    .map(|w| w.name.clone())
+                    .unwrap_or_default();
+                let rec = format!("{}\n{}\n{}\n{}\n", sv.port, sv.target, sv.selector, wl);
                 let _ = crate::fs::ops::write_file(&fc, &format!("{sdir}/{}", sv.name), rec.as_bytes(), 0o600);
-                outln!(ctx, "{} {} created", s.green("service"), sv.name);
+                // Start a ClusterIP-style load-balancing proxy on the service port.
+                crate::fastman::kube::start_service_proxy(sv.name.clone(), sv.port, sv.target, wl);
+                outln!(ctx, "{} {} created (:{} → {})", s.green("service"), sv.name, sv.port, sv.name);
             }
             0
         }
@@ -842,10 +859,14 @@ fn kube_scale(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[Strin
         for n in old..want {
             let pod = crate::fastman::kube::pod_name(&name, n);
             let _ = runtime::remove(fc, &pod, true);
-            let opts = match &template {
+            let mut opts = match &template {
                 Some(c) => crate::fastman::kube::opts_from_container(c, pod.clone()),
                 None => runtime::RunOpts { name: Some(pod.clone()), detach: true, ..Default::default() },
             };
+            // Each new replica needs its OWN backend port, not pod-0's.
+            if let Some((declared, _)) = opts.port_remap {
+                opts.port_remap = Some((declared, crate::fastman::kube::alloc_pod_port()));
+            }
             ctx.flush();
             match runtime::run(fc, &image, opts, None) {
                 Ok(_) => outln!(ctx, "pod {pod} created"),
@@ -962,6 +983,7 @@ fn clone_opts(o: &RunOpts) -> RunOpts {
         network: o.network.clone(),
         detach: o.detach,
         user: o.user,
+        port_remap: o.port_remap,
     }
 }
 
