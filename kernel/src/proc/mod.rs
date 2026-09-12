@@ -169,12 +169,27 @@ impl Process {
     }
 
     /// Send a signal to every task of the process.
+    ///
+    /// A signal is dropped only when its *effective* disposition is "ignore":
+    /// explicit SIG_IGN, or SIG_DFL of a signal whose default action is ignore
+    /// AND no handler is installed. This distinction matters — e.g. SIGCHLD is
+    /// ignored by default, but a process that installs a handler (a reaper, as
+    /// postgres' postmaster does) must receive it and be woken from a blocking
+    /// wait/select. SIGKILL/SIGSTOP can never be ignored.
     pub fn signal(&self, sig: u32) {
-        if signal::ignored_by_default(sig) {
+        if !(1..=64).contains(&sig) {
             return;
         }
-        if sig != signal::SIGKILL && sig != signal::SIGSTOP && (1..=64).contains(&sig) && self.ignored.load(Ordering::Relaxed) & (1 << (sig - 1)) != 0 {
-            return;
+        if sig != signal::SIGKILL && sig != signal::SIGSTOP {
+            let act = self.sigactions.lock()[sig as usize];
+            let ignored = act.handler == signal::SIG_IGN
+                || (act.handler == signal::SIG_DFL && signal::ignored_by_default(sig));
+            // The `ignored` bitmask is a process-level ignore set directly (nohup
+            // ignores SIGHUP this way, without an rt_sigaction call).
+            let masked = self.ignored.load(Ordering::Relaxed) & (1 << (sig - 1)) != 0;
+            if ignored || masked {
+                return;
+            }
         }
         for t in self.tasks.lock().iter() {
             t.send_signal(sig);

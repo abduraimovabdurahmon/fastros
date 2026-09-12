@@ -457,6 +457,20 @@ pub fn getpgid(pid: i64) -> KResult<usize> {
     Ok(p.pgid.load(core::sync::atomic::Ordering::Relaxed) as usize)
 }
 
+/// `setsid`: start a new session and process group led by the caller, detaching
+/// its controlling terminal. Daemons (postgres' pg_ctl) rely on this to
+/// background themselves. Fails with EPERM if the caller already leads a group.
+pub fn setsid() -> KResult<usize> {
+    let p = proc::current();
+    if p.pgid.load(Ordering::Relaxed) == p.pid {
+        return Err(Errno::EPERM);
+    }
+    p.sid.store(p.pid, Ordering::Relaxed);
+    p.pgid.store(p.pid, Ordering::Relaxed);
+    *p.ctty.lock() = None;
+    Ok(p.pid as usize)
+}
+
 /// Resource limits. We enforce none, but programs (nginx) read `RLIMIT_NOFILE`
 /// to size their connection tables, so report a generous, sane value rather
 /// than zero.

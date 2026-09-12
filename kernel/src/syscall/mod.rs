@@ -61,6 +61,17 @@ fn warn_once(nr: u64) {
     }
 }
 
+/// `ppoll` takes a `struct timespec*` (NULL = block forever); convert it to the
+/// millisecond timeout `poll` expects (-1 for NULL/infinite).
+fn ppoll_timeout_ms(ts: usize) -> i32 {
+    if ts == 0 {
+        return -1;
+    }
+    let sec: i64 = crate::uaccess::read_obj(ts).unwrap_or(0);
+    let nsec: i64 = crate::uaccess::read_obj(ts + 8).unwrap_or(0);
+    (sec.max(0) * 1000 + nsec.max(0) / 1_000_000).min(i32::MAX as i64) as i32
+}
+
 fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
     match nr {
         // ── file I/O ──
@@ -140,6 +151,14 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         53 => ret(net::socketpair(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize)),
         130 => ret(proc_sys::rt_sigsuspend()),
         40 => ret(net::sendfile(a[0] as i32, a[1] as i32, a[2] as usize, a[3] as usize)),
+        7 => ret(net::poll(a[0] as usize, a[1] as usize, a[2] as i32)),
+        23 => ret(net::select(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize)),
+        // pselect6/ppoll: the extra sigmask arg is accepted and ignored; the
+        // timeout is a timespec, but poll/select read only its first two words,
+        // and a timespec's {sec,nsec} match {sec,usec} closely enough here — for
+        // ppoll (timespec) we convert to ms.
+        270 => ret(net::select(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize)),
+        271 => ret(net::poll(a[0] as usize, a[1] as usize, ppoll_timeout_ms(a[2] as usize))),
         213 => ret(net::epoll_create(a[0] as i32)),
         232 => ret(net::epoll_wait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32)),
         233 => ret(net::epoll_ctl(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize)),
@@ -176,6 +195,8 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         104 | 108 => proc::current().cred().gid as u64,
         110 => proc::current().ppid.load(core::sync::atomic::Ordering::Relaxed) as u64,
         111 => proc::current().pgid.load(core::sync::atomic::Ordering::Relaxed) as u64,
+        112 => ret(proc_sys::setsid()),
+        124 => proc::current().sid.load(core::sync::atomic::Ordering::Relaxed) as u64, // getsid
         118 => ret(proc_sys::getresuid(a[0] as usize, a[1] as usize, a[2] as usize)),
         120 => ret(proc_sys::getresgid(a[0] as usize, a[1] as usize, a[2] as usize)),
         121 => ret(proc_sys::getpgid(a[0] as i64)),

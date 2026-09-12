@@ -411,6 +411,158 @@ pub fn epoll_wait(epfd: i32, events: usize, maxevents: i32, timeout_ms: i32) -> 
     Ok(ready.len())
 }
 
+// ── poll / select ─────────────────────────────────────────────────────────────
+
+const POLLIN: u16 = 0x001;
+const POLLPRI: u16 = 0x002;
+const POLLOUT: u16 = 0x004;
+const POLLERR: u16 = 0x008;
+const POLLHUP: u16 = 0x010;
+const POLLNVAL: u16 = 0x020;
+
+/// Poll bits for one fd against a requested `events` mask (POLLNVAL for a bad fd).
+fn poll_one(fd: i32, events: u16) -> u16 {
+    if fd < 0 {
+        return 0;
+    }
+    let Ok(f) = fdt_get(fd) else { return POLLNVAL };
+    let p = f.poll();
+    let mut r = 0u16;
+    if p.contains(Poll::IN) {
+        r |= POLLIN;
+    }
+    if p.contains(Poll::OUT) {
+        r |= POLLOUT;
+    }
+    if p.contains(Poll::ERR) {
+        r |= POLLERR;
+    }
+    if p.contains(Poll::HUP) {
+        r |= POLLHUP;
+    }
+    // ERR/HUP/NVAL are always reported; the rest are masked by interest.
+    r & (events | POLLERR | POLLHUP)
+}
+
+/// `poll(fds, nfds, timeout_ms)`. `struct pollfd { i32 fd; i16 events; i16 revents }`.
+pub fn poll(fds: usize, nfds: usize, timeout_ms: i32) -> KResult<usize> {
+    if nfds > 4096 {
+        return Err(Errno::EINVAL);
+    }
+    // Read the (fd, events) pairs up front; revents is written back at the end.
+    let mut want: Vec<(i32, u16)> = Vec::with_capacity(nfds);
+    for i in 0..nfds {
+        let fd: i32 = uaccess::read_obj(fds + i * 8)?;
+        let events: u16 = uaccess::read_obj(fds + i * 8 + 4)?;
+        want.push((fd, events));
+    }
+    let deadline = if timeout_ms < 0 { None } else { Some(crate::time::now_ns() + timeout_ms.max(0) as u64 * 1_000_000) };
+
+    let scan = || -> Option<Vec<u16>> {
+        let revents: Vec<u16> = want.iter().map(|&(fd, ev)| poll_one(fd, ev)).collect();
+        if revents.iter().any(|&r| r != 0) {
+            Some(revents)
+        } else {
+            None
+        }
+    };
+    let revents = match SOCK_WQ.wait_until_interruptible(scan, deadline) {
+        Ok(v) => v,
+        Err(crate::sync::WaitResult::TimedOut) => want.iter().map(|_| 0u16).collect(),
+        Err(crate::sync::WaitResult::Interrupted) => return Err(Errno::EINTR),
+    };
+    let mut ready = 0;
+    for (i, r) in revents.iter().enumerate() {
+        uaccess::write_obj(fds + i * 8 + 6, r)?;
+        if *r != 0 {
+            ready += 1;
+        }
+    }
+    Ok(ready)
+}
+
+/// Read `nfds` bits from an fd_set at `addr` (NULL = empty).
+fn read_fdset(addr: usize, nfds: usize) -> KResult<alloc::vec::Vec<u8>> {
+    let bytes = nfds.div_ceil(8);
+    if addr == 0 {
+        return Ok(alloc::vec![0u8; bytes]);
+    }
+    let mut b = alloc::vec![0u8; bytes];
+    uaccess::copy_from(addr, &mut b)?;
+    Ok(b)
+}
+
+fn fdset_test(set: &[u8], fd: usize) -> bool {
+    set.get(fd / 8).is_some_and(|byte| byte & (1 << (fd % 8)) != 0)
+}
+fn fdset_set(set: &mut [u8], fd: usize) {
+    if let Some(byte) = set.get_mut(fd / 8) {
+        *byte |= 1 << (fd % 8);
+    }
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)`. Classic descriptor
+/// readiness over bitmap sets; `timeout` is a `struct timeval*` (NULL = block).
+pub fn select(nfds: i32, readfds: usize, writefds: usize, exceptfds: usize, timeout: usize) -> KResult<usize> {
+    let n = nfds.max(0) as usize;
+    if n > 4096 {
+        return Err(Errno::EINVAL);
+    }
+    let rin = read_fdset(readfds, n)?;
+    let win = read_fdset(writefds, n)?;
+    let ein = read_fdset(exceptfds, n)?;
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let sec: i64 = uaccess::read_obj(timeout)?;
+        let usec: i64 = uaccess::read_obj(timeout + 8)?;
+        Some(crate::time::now_ns() + (sec.max(0) as u64) * 1_000_000_000 + (usec.max(0) as u64) * 1_000)
+    };
+
+    let bytes = n.div_ceil(8);
+    let scan = || -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, usize)> {
+        let (mut ro, mut wo, mut eo) = (alloc::vec![0u8; bytes], alloc::vec![0u8; bytes], alloc::vec![0u8; bytes]);
+        let mut count = 0;
+        for fd in 0..n {
+            let want_r = fdset_test(&rin, fd);
+            let want_w = fdset_test(&win, fd);
+            let want_e = fdset_test(&ein, fd);
+            if !(want_r || want_w || want_e) {
+                continue;
+            }
+            let p = poll_one(fd as i32, POLLIN | POLLOUT | POLLPRI);
+            if want_r && p & (POLLIN | POLLHUP | POLLERR) != 0 {
+                fdset_set(&mut ro, fd);
+                count += 1;
+            }
+            if want_w && p & (POLLOUT | POLLERR) != 0 {
+                fdset_set(&mut wo, fd);
+                count += 1;
+            }
+            if want_e && p & POLLERR != 0 {
+                fdset_set(&mut eo, fd);
+                count += 1;
+            }
+        }
+        (count > 0).then_some((ro, wo, eo, count))
+    };
+    let (ro, wo, eo, count) = match SOCK_WQ.wait_until_interruptible(scan, deadline) {
+        Ok(v) => v,
+        Err(crate::sync::WaitResult::TimedOut) => (alloc::vec![0u8; bytes], alloc::vec![0u8; bytes], alloc::vec![0u8; bytes], 0),
+        Err(crate::sync::WaitResult::Interrupted) => return Err(Errno::EINTR),
+    };
+    if readfds != 0 {
+        uaccess::copy_to(readfds, &ro)?;
+    }
+    if writefds != 0 {
+        uaccess::copy_to(writefds, &wo)?;
+    }
+    if exceptfds != 0 {
+        uaccess::copy_to(exceptfds, &eo)?;
+    }
+    Ok(count)
+}
+
 // ── sendfile ────────────────────────────────────────────────────────────────
 
 /// `sendfile(out_fd, in_fd, offset*, count)`: copy up to `count` bytes from
