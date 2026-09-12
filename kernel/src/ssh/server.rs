@@ -759,7 +759,15 @@ impl Conn {
                 let cmd = r.utf8().map_err(truncated)?;
                 self.start_session(&c, Some(cmd))
             }
-            "subsystem" => false,
+            "subsystem" => {
+                let name = r.utf8().map_err(truncated)?;
+                if name == "sftp" {
+                    // scp (modern) and sftp both use the SFTP subsystem.
+                    self.start_session(&c, Some(String::from("sftp-server")))
+                } else {
+                    false
+                }
+            }
             _ => false,
         };
         if want_reply {
