@@ -48,9 +48,11 @@ pub fn mmap(addr: u64, len: usize, prot: u32, flags: u32, fd: i32, off: u64) -> 
     } else {
         None
     };
-    // MAP_SHARED|MAP_ANONYMOUS is genuinely shared (across fork): a database's
-    // main shared memory. A shared *file* mapping stays private for now.
-    let shared = flags & MAP_SHARED != 0 && flags & MAP_ANONYMOUS != 0;
+    // MAP_SHARED is genuinely shared across fork and across processes. For an
+    // anonymous mapping that's a fresh shared segment; for a file mapping it's
+    // the file's shared page set when its filesystem supports it (tmpfs /
+    // shm_open, i.e. POSIX shared memory), else it falls back to private.
+    let shared = flags & MAP_SHARED != 0;
     space.mmap(addr as usize, len, p, flags & MAP_FIXED != 0, file, shared)
 }
 

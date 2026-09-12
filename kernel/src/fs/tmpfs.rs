@@ -64,6 +64,9 @@ pub struct TmpNode {
     meta: SpinLock<Meta>,
     data: SpinLock<Data>,
     this: Weak<TmpNode>,
+    /// Shared page set for `MAP_SHARED` mappings of this file (POSIX shm),
+    /// created on first mmap and shared by every process that maps it.
+    mmap_shared: SpinLock<Option<Arc<crate::mm::aspace::SharedAnon>>>,
 }
 
 impl TmpFs {
@@ -123,6 +126,7 @@ impl TmpNode {
             meta: SpinLock::new(Meta { kind, perm, uid, gid, nlink: 1, rdev, atime: now, mtime: now, ctime: now }),
             data: SpinLock::new(data),
             this: w.clone(),
+            mmap_shared: SpinLock::new(None),
         })
     }
 
@@ -483,6 +487,15 @@ impl Inode for TmpNode {
             }
             _ => Ok(None),
         }
+    }
+
+    fn shared_mmap(&self) -> Option<Arc<crate::mm::aspace::SharedAnon>> {
+        // Only regular files back a shared mapping; created once and reused.
+        if self.meta.lock().kind != FileType::Regular {
+            return None;
+        }
+        let mut g = self.mmap_shared.lock();
+        Some(g.get_or_insert_with(crate::mm::aspace::SharedAnon::new).clone())
     }
 
     fn as_any(&self) -> &dyn Any {

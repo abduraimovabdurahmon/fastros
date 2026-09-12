@@ -247,6 +247,14 @@ pub trait Inode: Send + Sync + Any {
     fn open_special(self: Arc<Self>, _flags: u32) -> KResult<Option<Arc<dyn file::File>>> {
         Ok(None)
     }
+    /// The shared page set backing a `MAP_SHARED` mapping of this file, so all
+    /// processes mapping the same file see the same memory (POSIX shared memory
+    /// / `shm_open`). Only in-memory filesystems (tmpfs) support this; others
+    /// return `None` and get a private mapping. The object is created once and
+    /// returned for every caller.
+    fn shared_mmap(&self) -> Option<alloc::sync::Arc<crate::mm::aspace::SharedAnon>> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
 }
 

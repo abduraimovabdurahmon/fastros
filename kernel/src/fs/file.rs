@@ -106,6 +106,11 @@ pub trait File: Send + Sync + Any {
     fn tty(&self) -> Option<Arc<crate::tty::Tty>> {
         None
     }
+    /// The shared page set for a `MAP_SHARED` mapping of this file (POSIX shm),
+    /// or `None` for a private mapping. See [`crate::fs::Inode::shared_mmap`].
+    fn shared_mmap(&self) -> Option<Arc<crate::mm::aspace::SharedAnon>> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -238,6 +243,9 @@ impl File for InodeFile {
     fn set_flags(&self, f: u32) {
         let old = self.flags.load(Ordering::Relaxed);
         self.flags.store((old & !flags::SETFL_MASK) | (f & flags::SETFL_MASK), Ordering::Relaxed);
+    }
+    fn shared_mmap(&self) -> Option<Arc<crate::mm::aspace::SharedAnon>> {
+        self.inode.shared_mmap()
     }
     fn as_any(&self) -> &dyn Any {
         self

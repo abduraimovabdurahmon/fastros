@@ -111,8 +111,14 @@ struct Region {
     grows_down: bool,
     /// `Some` for a file-backed (MAP_PRIVATE) mapping.
     backing: Option<FileBacking>,
-    /// `Some` for a shared anonymous (`MAP_SHARED|MAP_ANONYMOUS`) mapping.
+    /// `Some` for a shared mapping (`MAP_SHARED`): anonymous, System V shm, or a
+    /// file's shared page set. Pages are keyed within the object by
+    /// `shared_base + (page - start)`, so the same object mapped at different
+    /// addresses (or file offsets) in different processes shares pages.
     shared: Option<Arc<SharedAnon>>,
+    /// Offset added to `page - start` when keying `shared` (the file offset that
+    /// `start` maps to; 0 for anonymous shared and System V segments).
+    shared_base: usize,
 }
 
 pub struct AddressSpace {
@@ -183,7 +189,7 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, end) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end, prot, grows_down, backing: None, shared: None });
+        regions.push(Region { start, end, prot, grows_down, backing: None, shared: None, shared_base: 0 });
         Ok(())
     }
 
@@ -198,7 +204,7 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, end) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end, prot, grows_down: false, backing: None, shared: Some(SharedAnon::new()) });
+        regions.push(Region { start, end, prot, grows_down: false, backing: None, shared: Some(SharedAnon::new()), shared_base: 0 });
         Ok(())
     }
 
@@ -227,7 +233,7 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, start + len) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end: start + len, prot, grows_down: false, backing: None, shared: Some(obj) });
+        regions.push(Region { start, end: start + len, prot, grows_down: false, backing: None, shared: Some(obj), shared_base: 0 });
         Ok(start)
     }
 
@@ -242,7 +248,7 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, end) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end, prot, grows_down: false, backing: Some(FileBacking { file, offset, length }), shared: None });
+        regions.push(Region { start, end, prot, grows_down: false, backing: Some(FileBacking { file, offset, length }), shared: None, shared_base: 0 });
         Ok(())
     }
 
@@ -252,6 +258,13 @@ impl AddressSpace {
         let len = align_up(len.max(1), PAGE_SIZE);
         let place = |this: &Self, start: usize| -> KResult<()> {
             match &file {
+                // MAP_SHARED of a file whose fs backs shared memory (tmpfs /
+                // shm_open): all mappers share the file's page set (POSIX shm).
+                Some((f, off)) if shared => match f.shared_mmap() {
+                    Some(obj) => this.map_shared_file_region(start, start + len, prot, obj, *off as usize),
+                    // Other filesystems: fall back to a private mapping.
+                    None => this.map_file_region(start, start + len, prot, f.clone(), *off, len as u64),
+                },
                 Some((f, off)) => this.map_file_region(start, start + len, prot, f.clone(), *off, len as u64),
                 None if shared => this.map_shared_region(start, start + len, prot),
                 None => this.map_region(start, start + len, prot, false),
@@ -276,6 +289,23 @@ impl AddressSpace {
         place(self, start)?;
         *top = start;
         Ok(start)
+    }
+
+    /// Reserve a `MAP_SHARED` mapping backed by a file's shared page set `obj`,
+    /// where `base` is the file offset that `start` maps to. Every process that
+    /// maps the same file shares `obj`, so writes are visible to all — POSIX
+    /// shared memory (postgres' dynamic shared memory segments).
+    fn map_shared_file_region(&self, start: usize, end: usize, prot: Prot, obj: Arc<SharedAnon>, base: usize) -> KResult<()> {
+        let (start, end) = (align_down(start, PAGE_SIZE), align_up(end, PAGE_SIZE));
+        if start < USER_START || end > USER_END || start >= end {
+            return Err(Errno::EINVAL);
+        }
+        let mut regions = self.regions.lock();
+        if Self::overlaps(&regions, start, end) {
+            return Err(Errno::EEXIST);
+        }
+        regions.push(Region { start, end, prot, grows_down: false, backing: None, shared: Some(obj), shared_base: base });
+        Ok(())
     }
 
     /// Map `[start, end)` of `file` (from `offset`) with `length` bytes of
@@ -334,7 +364,7 @@ impl AddressSpace {
                 out.push(Region { end: start, ..r.clone() });
             }
             let mid_start = start.max(r.start);
-            out.push(Region { start: mid_start, end: end.min(r.end), prot, grows_down: r.grows_down, backing: shift_backing(&r.backing, mid_start - r.start), shared: r.shared.clone() });
+            out.push(Region { start: mid_start, end: end.min(r.end), prot, grows_down: r.grows_down, backing: shift_backing(&r.backing, mid_start - r.start), shared: r.shared.clone(), shared_base: r.shared_base + (mid_start - r.start) });
             if end < r.end {
                 out.push(Region { start: end, backing: shift_backing(&r.backing, end - r.start), ..r.clone() });
             }
@@ -482,7 +512,7 @@ impl AddressSpace {
         // the page's offset within the region, so a System V segment attached at
         // different addresses in different processes still shares its pages.
         if let Some(sh) = &r.shared {
-            let off = page - r.start;
+            let off = r.shared_base + (page - r.start);
             let mut pages = sh.pages.lock();
             let phys = match pages.get(&off) {
                 Some(&p) => {
@@ -630,7 +660,7 @@ impl AddressSpace {
             if let Some(r) = regions.iter_mut().find(|r| r.end == cur && r.start >= base && !r.grows_down) {
                 r.end = new;
             } else if !Self::overlaps(&regions, cur, new) {
-                regions.push(Region { start: base.max(cur), end: new, prot: Prot::READ | Prot::WRITE, grows_down: false, backing: None, shared: None });
+                regions.push(Region { start: base.max(cur), end: new, prot: Prot::READ | Prot::WRITE, grows_down: false, backing: None, shared: None, shared_base: 0 });
             } else {
                 return cur;
             }
