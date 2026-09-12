@@ -29,3 +29,4 @@ ed25519-dalek = { version = "2", default-features = false }
 smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4"] }
 regex = { version = "1", default-features = false, features = ["perf", "unicode"] }
 argon2 ={ version = "0.5", default-features = false, features = ["alloc"] }
+bcrypt-pbkdf = { version = "0.10", default-features = false, features = ["alloc"] }

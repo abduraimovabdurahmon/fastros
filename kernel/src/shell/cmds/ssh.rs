@@ -33,16 +33,33 @@ fn home(ctx: &Ctx) -> String {
     ctx.env("HOME").filter(|h| h.starts_with('/')).unwrap_or_else(|| "/root".to_string())
 }
 
-/// Load the user's ed25519 identity (`~/.ssh/id_ed25519`), if present.
-fn load_identity(ctx: &Ctx) -> Option<(ed25519_dalek::SigningKey, Vec<u8>)> {
+/// Load the user's ed25519 identity (`~/.ssh/id_ed25519`), if present,
+/// prompting for a passphrase if the key is encrypted.
+fn load_identity(ctx: &mut Ctx) -> Option<(ed25519_dalek::SigningKey, Vec<u8>)> {
     let path = alloc::format!("{}/.ssh/id_ed25519", home(ctx));
     let fsx = ops::Ctx::of(&ctx.proc);
     let data = ops::read_file(&fsx, &path).ok()?;
-    keys::parse_openssh_ed25519(&String::from_utf8_lossy(&data))
+    let pem = String::from_utf8_lossy(&data).into_owned();
+    match keys::parse_openssh_ed25519(&pem, None) {
+        Ok(k) => Some(k),
+        Err(keys::KeyError::NeedPassphrase) => {
+            // Prompt for the passphrase (up to 3 tries).
+            for _ in 0..3 {
+                let pp = prompt(ctx, &alloc::format!("Enter passphrase for key '{path}': "));
+                match keys::parse_openssh_ed25519(&pem, Some(&pp)) {
+                    Ok(k) => return Some(k),
+                    Err(keys::KeyError::BadPassphrase) => ctx.eprint("Bad passphrase, try again.\n"),
+                    Err(_) => break,
+                }
+            }
+            None
+        }
+        Err(_) => None,
+    }
 }
 
-fn read_password_prompt(ctx: &mut Ctx) -> String {
-    ctx.print("password: ");
+fn prompt(ctx: &mut Ctx, msg: &str) -> String {
+    ctx.print(msg);
     ctx.flush();
     let mut line = Vec::new();
     let mut b = [0u8; 1];
@@ -105,7 +122,7 @@ pub fn connect(ctx: &mut Ctx, user: &str, host: &str, port: u16) -> Result<Arc<S
     let password = if let Some(p) = ctx.env("SSHPASS") {
         Some(p)
     } else if key.is_none() {
-        Some(read_password_prompt(ctx))
+        Some(prompt(ctx, "password: "))
     } else {
         None
     };
