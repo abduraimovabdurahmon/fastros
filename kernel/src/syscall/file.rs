@@ -275,6 +275,15 @@ pub fn ftruncate(fd: i32, len: u64) -> KResult<usize> {
     Ok(0)
 }
 
+/// `truncate(path, len)`: path-based truncation. postgres' `do_truncate`
+/// (DROP/REFRESH/VACUUM shrink) uses this rather than `ftruncate`.
+pub fn truncate(path: usize, len: u64) -> KResult<usize> {
+    let p = crate::proc::current();
+    let ctx = ops::Ctx::of(&p);
+    ops::truncate(&ctx, &user_path(path)?, len)?;
+    Ok(0)
+}
+
 /// `fallocate(fd, mode, offset, len)`: reserve space. With no flags this also
 /// extends the file to `offset+len`; KEEP_SIZE (and other modes) are accepted
 /// without changing the size. Databases (postgres WAL) rely on this succeeding.

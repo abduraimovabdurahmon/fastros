@@ -180,18 +180,29 @@ impl Process {
         if !(1..=64).contains(&sig) {
             return;
         }
-        if sig != signal::SIGKILL && sig != signal::SIGSTOP {
+        let bit = 1u64 << (sig - 1);
+        let ignored = if sig != signal::SIGKILL && sig != signal::SIGSTOP {
             let act = self.sigactions.lock()[sig as usize];
-            let ignored = act.handler == signal::SIG_IGN
+            let disp_ignored = act.handler == signal::SIG_IGN
                 || (act.handler == signal::SIG_DFL && signal::ignored_by_default(sig));
             // The `ignored` bitmask is a process-level ignore set directly (nohup
             // ignores SIGHUP this way, without an rt_sigaction call).
-            let masked = self.ignored.load(Ordering::Relaxed) & (1 << (sig - 1)) != 0;
-            if ignored || masked {
-                return;
-            }
-        }
+            let masked = self.ignored.load(Ordering::Relaxed) & bit != 0;
+            disp_ignored || masked
+        } else {
+            false
+        };
         for t in self.tasks.lock().iter() {
+            // A signal that is *blocked* must always be made pending, even when
+            // its disposition is "ignore": the ignore is applied only at
+            // delivery, which a blocked signal never reaches until unblocked.
+            // This is what lets `signalfd`/`sigwait` observe it — the mechanism
+            // postgres' latch uses (it blocks SIGURG and drains it via a
+            // signalfd in epoll). Dropping it here wedged every latch wait.
+            let blocked = t.blocked() & bit != 0;
+            if ignored && !blocked {
+                continue;
+            }
             t.send_signal(sig);
         }
     }

@@ -108,6 +108,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         33 => ret(file::dup2(a[0] as i32, a[1] as i32)),
         72 => ret(file::fcntl(a[0] as i32, a[1] as u32, a[2] as usize)),
         74 | 75 => ret(file::fsync(a[0] as i32)),
+        76 => ret(file::truncate(a[0] as usize, a[1] as u64)),
         77 => ret(file::ftruncate(a[0] as i32, a[1] as u64)),
         285 => ret(file::fallocate(a[0] as i32, a[1] as i32, a[2] as u64, a[3] as u64)),
         79 => ret(file::getcwd(a[0] as usize, a[1] as usize)),
@@ -230,6 +231,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         // sigaltstack, set_robust_list, rseq, prctl, sched_setaffinity,
         // fadvise64: accepted as no-ops so libc starts.
         131 | 273 | 334 | 157 | 203 | 221 => 0,
+        // sync_file_range: an advisory flush hint. postgres itself falls back to
+        // doing nothing when it is unavailable (real durability is the checkpoint
+        // fsync), so a success no-op is correct and avoids per-write fsync cost.
+        277 => 0,
         97 => ret(proc_sys::getrlimit(a[0] as u32, a[1] as usize)),
         160 => 0, // setrlimit: accepted, not enforced
         302 => ret(proc_sys::prlimit64(a[0] as i32, a[1] as u32, a[2] as usize, a[3] as usize)),
