@@ -59,7 +59,7 @@ impl WaitQueue {
                 return Ok(v);
             }
             let me = sched::current();
-            if interruptible && me.signal_pending() {
+            if interruptible && me.deliverable_signal_pending() {
                 return Err(WaitResult::Interrupted);
             }
             if deadline.is_some_and(|d| crate::time::now_ns() >= d) {

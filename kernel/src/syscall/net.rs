@@ -526,6 +526,25 @@ pub fn epoll_wait(epfd: i32, events: usize, maxevents: i32, timeout_ms: i32) -> 
     Ok(ready.len())
 }
 
+/// Apply a `sigmask` (a `sigset_t*`, 8 bytes) as the task's blocked set for the
+/// duration of a p-wait syscall, so signals it unblocks — a latch's SIGURG —
+/// can wake the wait. The caller (libc's WaitEventSet) re-establishes its own
+/// mask afterward, so this deliberately leaves the mask in place: restoring it
+/// here would re-block the signal before its handler runs and the wait would
+/// spin. A NULL pointer means "no mask change" (plain wait).
+fn apply_sigmask(sigmask: usize) -> KResult<()> {
+    if sigmask != 0 {
+        let m: u64 = uaccess::read_obj(sigmask)?;
+        crate::sched::with_current(|t| t.set_blocked(m));
+    }
+    Ok(())
+}
+
+pub fn epoll_pwait(epfd: i32, events: usize, maxevents: i32, timeout_ms: i32, sigmask: usize) -> KResult<usize> {
+    apply_sigmask(sigmask)?;
+    epoll_wait(epfd, events, maxevents, timeout_ms)
+}
+
 // ── poll / select ─────────────────────────────────────────────────────────────
 
 const POLLIN: u16 = 0x001;
@@ -676,6 +695,26 @@ pub fn select(nfds: i32, readfds: usize, writefds: usize, exceptfds: usize, time
         uaccess::copy_to(exceptfds, &eo)?;
     }
     Ok(count)
+}
+
+/// `ppoll(fds, nfds, timespec*, sigmask*)`: poll with an atomically-applied
+/// signal mask (so a latch's SIGURG wakes it) and a `timespec` timeout.
+pub fn ppoll(fds: usize, nfds: usize, ts: usize, sigmask: usize) -> KResult<usize> {
+    apply_sigmask(sigmask)?;
+    poll(fds, nfds, crate::syscall::ppoll_timeout_ms(ts))
+}
+
+/// `pselect6(nfds, r, w, e, timeout*, sigmask_arg*)`: select with a signal mask.
+/// The 6th argument is a `{ const sigset_t *ss; size_t ss_len; }` pair, so the
+/// mask pointer is its first word. The timeout is a `timespec`.
+pub fn pselect6(nfds: i32, r: usize, w: usize, e: usize, timeout: usize, sigmask_arg: usize) -> KResult<usize> {
+    if sigmask_arg != 0 {
+        let ss: u64 = uaccess::read_obj(sigmask_arg)?;
+        apply_sigmask(ss as usize)?;
+    }
+    // select() reads {sec, usec}; a timespec's {sec, nsec} is close enough for a
+    // wakeup deadline (the nsec is treated as usec — a slightly shorter cap).
+    select(nfds, r, w, e, timeout)
 }
 
 // ── sendfile ────────────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ fn warn_once(nr: u64) {
 
 /// `ppoll` takes a `struct timespec*` (NULL = block forever); convert it to the
 /// millisecond timeout `poll` expects (-1 for NULL/infinite).
-fn ppoll_timeout_ms(ts: usize) -> i32 {
+pub fn ppoll_timeout_ms(ts: usize) -> i32 {
     if ts == 0 {
         return -1;
     }
@@ -157,12 +157,12 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         // timeout is a timespec, but poll/select read only its first two words,
         // and a timespec's {sec,nsec} match {sec,usec} closely enough here — for
         // ppoll (timespec) we convert to ms.
-        270 => ret(net::select(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize)),
-        271 => ret(net::poll(a[0] as usize, a[1] as usize, ppoll_timeout_ms(a[2] as usize))),
+        270 => ret(net::pselect6(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize, a[5] as usize)),
+        271 => ret(net::ppoll(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize)),
         213 => ret(net::epoll_create(a[0] as i32)),
         232 => ret(net::epoll_wait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32)),
         233 => ret(net::epoll_ctl(a[0] as i32, a[1] as i32, a[2] as i32, a[3] as usize)),
-        281 => ret(net::epoll_wait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32)),
+        281 => ret(net::epoll_pwait(a[0] as i32, a[1] as usize, a[2] as i32, a[3] as i32, a[4] as usize)),
         291 => ret(net::epoll_create1(a[0] as i32)),
 
         // ── memory ──

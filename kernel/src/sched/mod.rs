@@ -145,6 +145,15 @@ impl Task {
     pub fn signal_pending(&self) -> bool {
         self.signals.load(Ordering::Acquire) != 0
     }
+    /// A signal that can actually be delivered right now is pending: one that is
+    /// not blocked (SIGKILL is never blockable). A blocked pending signal must
+    /// NOT interrupt an interruptible wait — otherwise a process that blocks a
+    /// signal (as postgres does around its latch) would spin returning EINTR.
+    pub fn deliverable_signal_pending(&self) -> bool {
+        let pending = self.signals.load(Ordering::Acquire);
+        let blocked = self.blocked.load(Ordering::Acquire) & !(1 << (crate::proc::signal::SIGKILL - 1));
+        pending & !blocked != 0
+    }
     pub fn pending_signals(&self) -> u64 {
         self.signals.load(Ordering::Acquire)
     }
