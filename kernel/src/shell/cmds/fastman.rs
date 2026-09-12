@@ -365,6 +365,14 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, String, Vec<String>), String> 
                 i += 1;
                 o.volumes.push(parse_volume(args.get(i).ok_or("-v needs HOST:CONT")?)?);
             }
+            "-m" | "--memory" => {
+                i += 1;
+                o.mem_limit = parse_size(args.get(i).ok_or("-m needs a size (e.g. 256m)")?)?;
+            }
+            "--pids-limit" => {
+                i += 1;
+                o.pids_limit = args.get(i).and_then(|s| s.parse().ok()).ok_or("--pids-limit needs a number")?;
+            }
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             s => image = Some(s.to_string()),
         }
@@ -396,6 +404,21 @@ fn parse_user(s: &str) -> Result<(u32, u32), String> {
         None => uid,
     };
     Ok((uid, gid))
+}
+
+/// Parse a byte size with an optional k/m/g/t suffix (e.g. `256m`, `1g`).
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('k') | Some('K') => (&s[..s.len() - 1], 1024u64),
+        Some('m') | Some('M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('t') | Some('T') => (&s[..s.len() - 1], 1024u64.pow(4)),
+        Some('b') | Some('B') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    let n: u64 = num.trim().parse().map_err(|_| format!("bad size '{s}'"))?;
+    Ok(n * mult)
 }
 
 fn parse_volume(s: &str) -> Result<Volume, String> {
@@ -984,6 +1007,8 @@ fn clone_opts(o: &RunOpts) -> RunOpts {
         detach: o.detach,
         user: o.user,
         port_remap: o.port_remap,
+        mem_limit: o.mem_limit,
+        pids_limit: o.pids_limit,
     }
 }
 

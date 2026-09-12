@@ -73,6 +73,9 @@ pub struct Container {
     /// Kubernetes pod port remap: (declared container port, actual backend port
     /// on the shared stack). Lets replicas of a fixed-port image coexist.
     pub port_remap: Option<(u16, u16)>,
+    /// cgroup limits: memory in bytes and max tasks (0 = unlimited).
+    pub mem_limit: u64,
+    pub pids_limit: u32,
 }
 
 impl Container {
@@ -130,6 +133,12 @@ impl Container {
         if let Some((d, a)) = self.port_remap {
             s.push_str(&format!("remap\t{d}\t{a}\n"));
         }
+        if self.mem_limit != 0 {
+            s.push_str(&format!("mem_limit\t{}\n", self.mem_limit));
+        }
+        if self.pids_limit != 0 {
+            s.push_str(&format!("pids_limit\t{}\n", self.pids_limit));
+        }
         s
     }
 
@@ -153,6 +162,8 @@ impl Container {
             uid: 0,
             gid: 0,
             port_remap: None,
+            mem_limit: 0,
+            pids_limit: 0,
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -191,6 +202,8 @@ impl Container {
                         c.port_remap = Some((d, a));
                     }
                 }
+                "mem_limit" => c.mem_limit = v.parse().unwrap_or(0),
+                "pids_limit" => c.pids_limit = v.parse().unwrap_or(0),
                 _ => {}
             }
         }

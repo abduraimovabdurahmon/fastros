@@ -197,6 +197,8 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         detach: true,
         user: o.user,
         port_remap: o.port_remap,
+        mem_limit: o.mem_limit,
+        pids_limit: o.pids_limit,
     }
 }
 
@@ -215,6 +217,8 @@ pub fn opts_from_container(c: &super::container::Container, name: String) -> Run
         detach: true,
         user: if c.uid == 0 && c.gid == 0 { None } else { Some((c.uid, c.gid)) },
         port_remap: c.port_remap,
+        mem_limit: c.mem_limit,
+        pids_limit: c.pids_limit,
     }
 }
 

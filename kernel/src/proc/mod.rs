@@ -347,11 +347,24 @@ impl Spawn {
 /// Start a new process whose single task runs `entry`; the value it returns
 /// is the exit code.
 pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<Arc<Process>> {
-    let task = sched::try_spawn(&s.name, move || {
+    // Enforce the container's pid limit (fork/clone return EAGAIN over it).
+    if let Some(cid) = &s.container {
+        if !crate::cgroup::try_add_pid(cid) {
+            return Err(Errno::EAGAIN);
+        }
+    }
+    let task = match sched::try_spawn(&s.name, move || {
         let code = entry();
         exit_current(ExitStatus::Exited(code));
-    })
-    .ok_or(Errno::ENOMEM)?;
+    }) {
+        Some(t) => t,
+        None => {
+            if let Some(cid) = &s.container {
+                crate::cgroup::sub_pid(cid, 1);
+            }
+            return Err(Errno::ENOMEM);
+        }
+    };
     // The task cannot run before we yield, so registering now is race-free.
     let pid = task.tid;
     let pgid = if s.new_session { pid } else { s.pgid.unwrap_or(pid) };
@@ -402,6 +415,8 @@ pub fn start_user(s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame) -> KRes
 /// `execve`/exec passes 0 (the new program sets it up via `arch_prctl`).
 pub fn start_user_with(mut s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame, fs_base: u64) -> KResult<Arc<Process>> {
     s.aspace = Some(aspace.clone());
+    // Charge this space's memory to the container's cgroup, if any.
+    aspace.set_container(s.container.clone());
     let p = spawn(s, move || unsafe { enter_user(&frame) })?;
     if let Some(t) = p.tasks().into_iter().next() {
         t.cr3.store(aspace.pml4(), core::sync::atomic::Ordering::Release);
@@ -424,6 +439,13 @@ pub fn start_thread(
     frame: &UserFrame,
 ) -> KResult<usize> {
     let parent = current();
+    // A thread counts toward the container's pid limit.
+    let cid = parent.container.lock().clone();
+    if let Some(c) = &cid {
+        if !crate::cgroup::try_add_pid(c) {
+            return Err(Errno::EAGAIN);
+        }
+    }
     let aspace = parent.aspace.lock().clone().ok_or(Errno::ENOSYS)?;
     let mut tframe = *frame;
     tframe.rax = 0; // the child's clone() returns 0
@@ -436,11 +458,18 @@ pub fn start_thread(
     {
         // Fully set up the task before it can be scheduled (no preemption).
         let _irq = crate::arch::cpu::IrqGuard::new();
-        let task = sched::make_task(&parent.comm(), move || {
+        let task = match sched::make_task(&parent.comm(), move || {
             unsafe { enter_user(&tframe) };
             sched::exit_current(0);
-        })
-        .ok_or(Errno::ENOMEM)?;
+        }) {
+            Some(t) => t,
+            None => {
+                if let Some(c) = &cid {
+                    crate::cgroup::sub_pid(c, 1);
+                }
+                return Err(Errno::ENOMEM);
+            }
+        };
         task.cr3.store(aspace.pml4(), Ordering::Release);
         task.fs_base.store(fs_base, Ordering::Release);
         task.owner.store(parent.pid, Ordering::Release);
@@ -476,6 +505,10 @@ pub fn exit_thread(code: i32) -> ! {
         // sees a consistent list.
         me.tasks.lock().push(sched::current());
         exit_current(ExitStatus::Exited(code));
+    }
+    // This thread no longer counts toward the container's pid limit.
+    if let Some(c) = me.container.lock().clone() {
+        crate::cgroup::sub_pid(&c, 1);
     }
     // A joined thread's clear_child_tid word is zeroed and futex-woken.
     let ctid = sched::with_current(|t| t.clear_child_tid.load(Ordering::Relaxed)) as usize;
@@ -549,6 +582,11 @@ pub fn exit_current(status: ExitStatus) -> ! {
         parent.signal(signal::SIGCHLD);
     }
     parent.child_wq.wake_all();
+    // Release this process's remaining tasks from the container's pid count.
+    if let Some(c) = me.container.lock().clone() {
+        let n = me.tasks.lock().len() as u32;
+        crate::cgroup::sub_pid(&c, n);
+    }
     me.tasks.lock().clear();
     drop(parent);
     drop(me);

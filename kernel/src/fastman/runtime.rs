@@ -44,6 +44,10 @@ pub struct RunOpts {
     pub user: Option<(u32, u32)>,
     /// Kubernetes pod port remap (declared, actual) — see [`Container::port_remap`].
     pub port_remap: Option<(u16, u16)>,
+    /// Memory limit in bytes (`-m`), 0 = unlimited.
+    pub mem_limit: u64,
+    /// Max tasks (`--pids-limit`), 0 = unlimited.
+    pub pids_limit: u32,
 }
 
 /// Create a container from an image, building its writable rootfs.
@@ -90,10 +94,15 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         uid: opts.user.map(|u| u.0).unwrap_or(0),
         gid: opts.user.map(|u| u.1).unwrap_or(0),
         port_remap: opts.port_remap,
+        mem_limit: opts.mem_limit,
+        pids_limit: opts.pids_limit,
     };
     c.save(ctx)?;
     if let Some((d, a)) = c.port_remap {
         crate::net::set_pod_port(&c.id, d, a);
+    }
+    if c.mem_limit != 0 || c.pids_limit != 0 {
+        crate::cgroup::create(&c.id, c.mem_limit, c.pids_limit);
     }
     Ok(c)
 }
@@ -193,6 +202,9 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
     // pods from their persisted config, and bind() must translate again).
     if let Some((d, a)) = c.port_remap {
         crate::net::set_pod_port(&c.id, d, a);
+    }
+    if c.mem_limit != 0 || c.pids_limit != 0 {
+        crate::cgroup::create(&c.id, c.mem_limit, c.pids_limit);
     }
     let fs = build_fs(ctx, c)?;
     // The container process runs as its configured user (`--user`), defaulting
@@ -351,6 +363,7 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool) -> KResult<()> {
         }
     }
     crate::net::clear_pod_port(&c.id);
+    crate::cgroup::remove(&c.id);
     ops::remove_tree(ctx, &c.dir(ctx))
 }
 

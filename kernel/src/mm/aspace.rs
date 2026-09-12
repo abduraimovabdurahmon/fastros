@@ -129,6 +129,8 @@ pub struct AddressSpace {
     brk_base: AtomicUsize,
     /// Where a fresh `mmap` with no hint is placed (grows down from here).
     mmap_top: SpinLock<usize>,
+    /// The container this address space is charged to (memory cgroup), if any.
+    container: SpinLock<Option<alloc::string::String>>,
 }
 
 /// Base of the mmap region (below the stack), matching a small ASLR-free
@@ -162,11 +164,31 @@ impl AddressSpace {
             brk: SpinLock::new(0),
             brk_base: AtomicUsize::new(0),
             mmap_top: SpinLock::new(MMAP_TOP),
+            container: SpinLock::new(None),
         }))
     }
 
     pub fn pml4(&self) -> PhysAddr {
         self.pml4
+    }
+
+    /// Charge this space's committed pages to `cid`'s memory cgroup.
+    pub fn set_container(&self, cid: Option<alloc::string::String>) {
+        *self.container.lock() = cid;
+    }
+
+    /// Charge one page to the cgroup; false → over the memory limit (ENOMEM).
+    fn charge_page(&self) -> bool {
+        match &*self.container.lock() {
+            Some(cid) => crate::cgroup::try_charge_page(cid),
+            None => true,
+        }
+    }
+
+    fn uncharge_pages(&self, n: u64) {
+        if let Some(cid) = &*self.container.lock() {
+            crate::cgroup::uncharge_pages(cid, n);
+        }
     }
 
     /// Install this space on the current CPU.
@@ -334,15 +356,18 @@ impl AddressSpace {
         *regions = out;
         drop(regions);
         let mut va = start;
+        let mut freed = 0u64;
         while va < end {
             if let Some((phys, fl)) = unsafe { paging::unmap_4k(self.pml4, va) } {
                 if fl & flags::PRESENT != 0 {
                     frame::page_put(phys);
+                    freed += 1;
                 }
                 cpu::invlpg(va);
             }
             va += PAGE_SIZE;
         }
+        self.uncharge_pages(freed);
         Ok(())
     }
 
@@ -506,6 +531,11 @@ impl AddressSpace {
                     return Ok(());
                 }
             }
+        }
+        // About to commit a new page into this space — charge the memory cgroup
+        // (per-space, so it balances with the uncharge on unmap/teardown).
+        if !self.charge_page() {
+            return Err(Errno::ENOMEM);
         }
         // Shared anonymous page: resolve it through the shared object so every
         // mapping (and every process after fork) sees the same frame. Keyed by
@@ -689,17 +719,20 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         // Free every user page, then the lower-half page tables.
         let regions = core::mem::take(&mut *self.regions.lock());
+        let mut freed = 0u64;
         for r in regions {
             let mut va = r.start;
             while va < r.end {
                 if let Some((phys, fl)) = unsafe { paging::unmap_4k(self.pml4, va) } {
                     if fl & flags::PRESENT != 0 {
                         frame::page_put(phys);
+                        freed += 1;
                     }
                 }
                 va += PAGE_SIZE;
             }
         }
+        self.uncharge_pages(freed);
         free_lower_tables(self.pml4);
         frame::free(self.pml4, 0);
     }

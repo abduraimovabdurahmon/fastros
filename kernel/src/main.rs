@@ -29,6 +29,7 @@ mod errno;
 mod fastman;
 mod firewall;
 mod fs;
+mod cgroup;
 mod init;
 mod ipc;
 mod mm;
