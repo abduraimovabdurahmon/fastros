@@ -50,3 +50,53 @@ def test_shared_anon_across_fork(g, shmem_bin):
     # The child's writes must be visible in the parent.
     assert "shared[0]=123 shared[1]=0xbeef" in out, out + err
     assert st == 0
+
+
+# System V shared memory (shmget/shmat/shmdt/shmctl) — postgres uses a small
+# segment as its cross-postmaster interlock and reads shm_nattch from it.
+SYSVSHM = r"""
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/wait.h>
+int main(void){
+    int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT|0600);
+    if (id < 0){ perror("shmget"); return 1; }
+    volatile long *m = shmat(id, 0, 0);
+    if (m == (void*)-1){ perror("shmat"); return 1; }
+    m[0] = 100;
+    pid_t pid = fork();
+    if (pid == 0){
+        volatile long *c = shmat(id, 0, 0);   // attach again in the child
+        if (c == (void*)-1){ perror("shmat-child"); _exit(2); }
+        c[0] += 23;                            // write to the SAME segment
+        shmdt((void*)c);
+        _exit(0);
+    }
+    int st; waitpid(pid, &st, 0);
+    struct shmid_ds ds;
+    shmctl(id, IPC_STAT, &ds);
+    printf("sysv[0]=%ld segsz=%lu nattch=%lu\n",
+           m[0], (unsigned long)ds.shm_segsz, (unsigned long)ds.shm_nattch);
+    shmdt((void*)m);
+    shmctl(id, IPC_RMID, 0);
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def sysvshm_bin():
+    return _compile(SYSVSHM)
+
+
+def test_sysv_shared_memory(g, sysvshm_bin):
+    g.ok("base64 -d > /tmp/sysvshm && chmod +x /tmp/sysvshm",
+         stdin=base64.b64encode(sysvshm_bin).decode())
+    out, err, st = g.run("fexec /tmp/sysvshm")
+    # Child's write to the same segment is visible; nattch counted the parent.
+    assert "sysv[0]=123" in out, out + err
+    assert "segsz=4096" in out, out + err
+    assert "nattch=1" in out, out + err   # parent still attached at IPC_STAT time
+    assert st == 0

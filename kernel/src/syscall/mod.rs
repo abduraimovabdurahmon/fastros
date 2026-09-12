@@ -107,6 +107,8 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         293 => ret(file::pipe(a[0] as usize, a[1] as u32)),
         206 => ret(file::io_setup(a[0] as u32, a[1] as usize)),
         207 => ret(file::io_destroy(a[0] as usize)),
+        282 => ret(file::signalfd(a[0] as i32, a[1] as usize, a[2] as usize, 0)),
+        289 => ret(file::signalfd(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as u32)),
         284 => ret(file::eventfd(a[0] as u32, 0)),
         290 => ret(file::eventfd(a[0] as u32, a[1] as u32)),
 
@@ -169,6 +171,11 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
             // set_tid_address: we have no clear_child_tid; return the tid.
             crate::proc::current_tid() as u64
         }
+        // ── System V shared memory ──
+        29 => ret(crate::ipc::shmget(a[0] as i32, a[1] as usize, a[2] as i32)),
+        30 => ret(crate::ipc::shmat(a[0] as i32, a[1] as usize, a[2] as i32)),
+        31 => ret(crate::ipc::shmctl(a[0] as i32, a[1] as i32, a[2] as usize)),
+        67 => ret(crate::ipc::shmdt(a[0] as usize)),
         202 => ret(proc_sys::futex(a[0] as usize, a[1] as i32, a[2] as u32, a[3] as usize, a[4] as usize, a[5] as u32)),
         204 => ret(proc_sys::sched_getaffinity(a[0] as i32, a[1] as usize, a[2] as usize)),
         228 => ret(proc_sys::clock_gettime(a[0] as u32, a[1] as usize)),

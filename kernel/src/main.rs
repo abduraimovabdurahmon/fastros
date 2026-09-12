@@ -30,6 +30,7 @@ mod fastman;
 mod firewall;
 mod fs;
 mod init;
+mod ipc;
 mod mm;
 mod net;
 mod panic;

@@ -86,7 +86,7 @@ pub struct SharedAnon {
 }
 
 impl SharedAnon {
-    fn new() -> Arc<SharedAnon> {
+    pub fn new() -> Arc<SharedAnon> {
         Arc::new(SharedAnon { pages: SpinLock::new(BTreeMap::new()) })
     }
 }
@@ -200,6 +200,35 @@ impl AddressSpace {
         }
         regions.push(Region { start, end, prot, grows_down: false, backing: None, shared: Some(SharedAnon::new()) });
         Ok(())
+    }
+
+    /// Attach an existing shared-anonymous object into this address space (the
+    /// System V `shmat` path). `hint` is honoured if free, else a slot is chosen
+    /// growing down from the mmap area. Returns the attach address.
+    pub fn attach_shared(&self, hint: usize, len: usize, prot: Prot, obj: Arc<SharedAnon>) -> KResult<usize> {
+        let len = align_up(len.max(1), PAGE_SIZE);
+        let hinted = if hint >= USER_START {
+            let s = align_down(hint, PAGE_SIZE);
+            let regions = self.regions.lock();
+            (!Self::overlaps(&regions, s, s + len) && s + len <= USER_END).then_some(s)
+        } else {
+            None
+        };
+        let start = match hinted {
+            Some(s) => s,
+            None => {
+                let mut top = self.mmap_top.lock();
+                let s = align_down(top.checked_sub(len).ok_or(Errno::ENOMEM)?, PAGE_SIZE);
+                *top = s;
+                s
+            }
+        };
+        let mut regions = self.regions.lock();
+        if Self::overlaps(&regions, start, start + len) {
+            return Err(Errno::EEXIST);
+        }
+        regions.push(Region { start, end: start + len, prot, grows_down: false, backing: None, shared: Some(obj) });
+        Ok(start)
     }
 
     /// Reserve a private, file-backed mapping (used by `mmap` with an fd and
@@ -449,17 +478,20 @@ impl AddressSpace {
             }
         }
         // Shared anonymous page: resolve it through the shared object so every
-        // mapping (and every process after fork) sees the same frame.
+        // mapping (and every process after fork) sees the same frame. Keyed by
+        // the page's offset within the region, so a System V segment attached at
+        // different addresses in different processes still shares its pages.
         if let Some(sh) = &r.shared {
+            let off = page - r.start;
             let mut pages = sh.pages.lock();
-            let phys = match pages.get(&page) {
+            let phys = match pages.get(&off) {
                 Some(&p) => {
                     frame::page_get(p); // this page table's reference
                     p
                 }
                 None => {
                     let p = frame::alloc_user_page().ok_or(Errno::ENOMEM)?; // the object's reference
-                    pages.insert(page, p);
+                    pages.insert(off, p);
                     frame::page_get(p); // this page table's reference
                     p
                 }

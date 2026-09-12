@@ -22,6 +22,7 @@ pub mod path;
 pub mod perm;
 pub mod pipe;
 pub mod procfs;
+pub mod signalfd;
 pub mod tmpfs;
 
 pub use crate::errno::{Errno, KResult};

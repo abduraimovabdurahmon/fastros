@@ -110,7 +110,15 @@ impl PInode {
     fn kind(&self) -> FileType {
         match self.node {
             Node::Root | Node::Dir(_) | Node::PidDir(_) | Node::FdDir(_) => FileType::Directory,
-            Node::PidLink(..) | Node::FdLink(..) | Node::SelfLink => FileType::Symlink,
+            Node::PidLink(..) | Node::SelfLink => FileType::Symlink,
+            // /proc/PID/fd/N is a *magic* link: it reports the type of the file
+            // it refers to and, when opened, hands back that very open file (so
+            // /dev/fd/N and process substitution `<(...)` work).
+            Node::FdLink(pid, fd) => proc::find(pid)
+                .and_then(|p| p.fds.lock().get(fd).ok())
+                .and_then(|f| f.stat().ok())
+                .map(|m| m.kind)
+                .unwrap_or(FileType::Regular),
             _ => FileType::Regular,
         }
     }
@@ -349,6 +357,12 @@ impl Inode for PInode {
     }
 
     fn open_special(self: Arc<Self>, flags: u32) -> KResult<Option<Arc<dyn File>>> {
+        // Opening /proc/PID/fd/N returns that descriptor's open file itself.
+        if let Node::FdLink(pid, fd) = self.node {
+            let p = proc::find(pid).ok_or(Errno::ENOENT)?;
+            let f = p.fds.lock().get(fd).map_err(|_| Errno::ENOENT)?;
+            return Ok(Some(f));
+        }
         match self.kind() {
             FileType::Regular => {
                 // Writable sysctls keep inode semantics; everything else snapshots.

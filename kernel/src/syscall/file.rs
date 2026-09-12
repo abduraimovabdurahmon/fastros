@@ -249,6 +249,21 @@ pub fn io_destroy(_ctx: usize) -> KResult<usize> {
     Ok(0)
 }
 
+/// `signalfd`/`signalfd4`: a descriptor that yields the process's pending
+/// signals (in `mask`) as data. `fd < 0` creates one; `fd >= 0` updates it.
+pub fn signalfd(fd: i32, mask_ptr: usize, sizemask: usize, flags: u32) -> KResult<usize> {
+    let mask: u64 = if mask_ptr != 0 && sizemask >= 8 { uaccess::read_obj(mask_ptr)? } else { 0 };
+    if fd >= 0 {
+        let f = fdt_get(fd)?;
+        let sf = f.as_any().downcast_ref::<crate::fs::signalfd::SignalFd>().ok_or(Errno::EINVAL)?;
+        sf.set_mask(mask);
+        return Ok(fd as usize);
+    }
+    let sf = crate::fs::signalfd::SignalFd::new(mask, flags);
+    let cloexec = flags & crate::fs::signalfd::SFD_CLOEXEC != 0;
+    Ok(proc::current().fds.lock().alloc(sf, cloexec, 0)? as usize)
+}
+
 pub fn eventfd(initval: u32, flags: u32) -> KResult<usize> {
     let ev = crate::fs::eventfd::EventFd::new(initval, flags);
     let cloexec = flags & crate::fs::eventfd::EFD_CLOEXEC != 0;
