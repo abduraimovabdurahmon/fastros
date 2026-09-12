@@ -1,5 +1,6 @@
 //! SSH server (`sshd`).
 
+pub mod client;
 pub mod server;
 pub mod transport;
 pub mod wire;

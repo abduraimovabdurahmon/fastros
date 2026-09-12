@@ -1,85 +1,227 @@
-//! `scp` — secure copy, remote (server) side of the protocol.
+//! `scp` — secure copy over SSH.
 //!
-//! When a client runs `scp file user@fastros:/dest`, our sshd executes
-//! `scp -t /dest` here and the client speaks the scp binary protocol to it;
-//! `scp user@fastros:/file local` runs `scp -f /file`. We implement both the
-//! sink (`-t`) and source (`-f`) roles, single files and (`-r`) directory trees,
-//! over stdin/stdout. Outbound copies from FastROS to another host would need an
-//! SSH client, which does not exist yet — that form reports a clear error.
+//! Client (user-typed): `scp [-r] [-P port] SRC DEST`, where one side is
+//! `[user@]host:path`. Uploads run the remote `scp -t`, downloads the remote
+//! `scp -f`, over an SSH channel.
+//!
+//! Remote side (run by our sshd for an incoming scp): `scp -t PATH` (sink) or
+//! `scp -f PATH` (source), speaking the scp protocol over stdin/stdout.
+//!
+//! Both directions share one protocol engine over a `Chan` (a byte channel that
+//! is either the process stdio or an SSH session).
 
 use crate::fs::file::{flags, File};
 use crate::fs::ops::{self, Ctx as FsCtx};
 use crate::fs::FileType;
 use crate::shell::ctx::Ctx;
+use crate::ssh::client::Session;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+/// A bidirectional byte channel the scp protocol runs over.
+trait Chan {
+    fn rd(&self, buf: &mut [u8]) -> usize; // 0 = EOF
+    fn wr(&self, data: &[u8]) -> bool; // true = ok
+}
+
+/// Server side: the process's stdin (read) and stdout (write).
+struct FileChan {
+    inp: Arc<dyn File>,
+    out: Arc<dyn File>,
+}
+impl Chan for FileChan {
+    fn rd(&self, buf: &mut [u8]) -> usize {
+        self.inp.read(buf).unwrap_or(0)
+    }
+    fn wr(&self, data: &[u8]) -> bool {
+        self.out.write_all(data).is_ok()
+    }
+}
+
+/// Client side: an SSH session channel.
+struct SessChan {
+    sess: Arc<Session>,
+}
+impl Chan for SessChan {
+    fn rd(&self, buf: &mut [u8]) -> usize {
+        self.sess.read(buf)
+    }
+    fn wr(&self, data: &[u8]) -> bool {
+        self.sess.write(data).is_ok()
+    }
+}
+
 pub fn scp(ctx: &mut Ctx) -> i32 {
     let (mut sink, mut source, mut recursive) = (false, false, false);
-    let mut path: Option<String> = None;
-    for a in ctx.args[1..].iter() {
-        match a.as_str() {
+    let mut port = 22u16;
+    let mut operands: Vec<String> = Vec::new();
+    let args = ctx.args[1..].to_vec();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "-t" => sink = true,
             "-f" => source = true,
             "-r" => recursive = true,
+            "-P" => {
+                i += 1;
+                port = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(22);
+            }
             "--" | "-d" | "-p" | "-v" | "-q" | "-e" | "-B" | "-C" => {}
             s if s.starts_with('-') => {}
-            s => path = Some(s.to_string()),
+            s => operands.push(s.to_string()),
         }
+        i += 1;
     }
-    let Some(path) = path else {
-        // No -t/-f: this is a user-typed scp. Only local<->local or a helpful note.
-        if ctx.args[1..].iter().any(|a| a.contains(':') && !a.starts_with('-')) {
-            return ctx.fail("scp: outbound copy needs an SSH client (not yet implemented); use `ftp` or run scp from the remote side");
-        }
-        return ctx.fail("scp: usage: scp [-r] SRC DEST (remote side is driven by sshd)");
+
+    // Remote side (invoked by sshd).
+    if sink || source {
+        let chan = FileChan { inp: ctx.stdin(), out: ctx.stdout() };
+        let path = operands.first().cloned().unwrap_or_else(|| ".".to_string());
+        return if sink {
+            sink_mode(ctx, &path, recursive, &chan)
+        } else {
+            source_mode(ctx, &path, recursive, &chan)
+        };
+    }
+
+    // Client side: scp SRC DEST.
+    if operands.len() != 2 {
+        return ctx.fail("usage: scp [-r] [-P PORT] SRC DEST  (one side is [user@]host:path)");
+    }
+    let (src, dst) = (operands[0].clone(), operands[1].clone());
+    let src_r = parse_remote(&src);
+    let dst_r = parse_remote(&dst);
+    match (src_r, dst_r) {
+        (None, Some((user, host, rpath))) => client_upload(ctx, &src, &user, &host, port, &rpath, recursive),
+        (Some((user, host, rpath)), None) => client_download(ctx, &user, &host, port, &rpath, &dst, recursive),
+        (Some(_), Some(_)) => ctx.fail("scp: remote-to-remote copy is not supported"),
+        (None, None) => ctx.fail("scp: neither SRC nor DEST is remote — use cp for local copies"),
+    }
+}
+
+/// `[user@]host:path` → (user, host, path); None if the operand is local.
+fn parse_remote(s: &str) -> Option<(String, String, String)> {
+    let colon = s.find(':')?;
+    // A ':' after a '/' is part of a local path, not a host separator.
+    if s[..colon].contains('/') {
+        return None;
+    }
+    let (authority, path) = (&s[..colon], &s[colon + 1..]);
+    let (user, host) = match authority.split_once('@') {
+        Some((u, h)) => (u.to_string(), h.to_string()),
+        None => ("root".to_string(), authority.to_string()),
     };
-    if sink {
-        sink_mode(ctx, &path, recursive)
-    } else if source {
-        source_mode(ctx, &path, recursive)
-    } else {
-        ctx.fail("scp: outbound copy needs an SSH client (not yet implemented)")
+    if host.is_empty() {
+        return None;
+    }
+    let path = if path.is_empty() { ".".to_string() } else { path.to_string() };
+    Some((user, host, path))
+}
+
+fn open_session(ctx: &mut Ctx, user: &str, host: &str, port: u16) -> Result<Arc<Session>, i32> {
+    let Some(pass) = super::ssh::resolve_password(ctx) else {
+        return Err(ctx.fail("scp: no password"));
+    };
+    match Session::open(host, port, user, &pass, 20_000) {
+        Ok(s) => Ok(s),
+        Err(e) => Err(ctx.fail(alloc::format!("scp: {}", super::ssh::errmsg(&e)))),
     }
 }
 
-// ── low-level protocol I/O over the ssh channel (stdin/stdout) ──────────────
-
-fn ack(out: &Arc<dyn File>) {
-    let _ = out.write_all(&[0u8]);
+fn client_upload(ctx: &mut Ctx, local: &str, user: &str, host: &str, port: u16, rpath: &str, recursive: bool) -> i32 {
+    let sess = match open_session(ctx, user, host, port) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let cmd = alloc::format!("scp {}-t {}", if recursive { "-r " } else { "" }, sh_quote(rpath));
+    if let Err(e) = sess.exec(&cmd) {
+        return ctx.fail(alloc::format!("scp: {}", super::ssh::errmsg(&e)));
+    }
+    let chan = SessChan { sess: sess.clone() };
+    let code = source_mode(ctx, local, recursive, &chan);
+    sess.eof();
+    let ecode = sess.wait_exit();
+    let err = sess.stderr();
+    if !err.is_empty() {
+        ctx.eprint(&String::from_utf8_lossy(&err));
+    }
+    sess.close();
+    if code != 0 {
+        code
+    } else {
+        ecode
+    }
 }
 
-fn err_reply(out: &Arc<dyn File>, msg: &str) {
+fn client_download(ctx: &mut Ctx, user: &str, host: &str, port: u16, rpath: &str, local: &str, recursive: bool) -> i32 {
+    let sess = match open_session(ctx, user, host, port) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let cmd = alloc::format!("scp {}-f {}", if recursive { "-r " } else { "" }, sh_quote(rpath));
+    if let Err(e) = sess.exec(&cmd) {
+        return ctx.fail(alloc::format!("scp: {}", super::ssh::errmsg(&e)));
+    }
+    let chan = SessChan { sess: sess.clone() };
+    let code = sink_mode(ctx, local, recursive, &chan);
+    let ecode = sess.wait_exit();
+    let err = sess.stderr();
+    if !err.is_empty() {
+        ctx.eprint(&String::from_utf8_lossy(&err));
+    }
+    sess.close();
+    if code != 0 {
+        code
+    } else {
+        ecode
+    }
+}
+
+/// Minimal shell quoting for the remote command.
+fn sh_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)) {
+        s.to_string()
+    } else {
+        alloc::format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+// ── protocol I/O over a Chan ────────────────────────────────────────────────
+
+fn ack(c: &dyn Chan) {
+    c.wr(&[0u8]);
+}
+
+fn err_reply(c: &dyn Chan, msg: &str) {
     let mut b = Vec::with_capacity(msg.len() + 2);
-    b.push(1u8); // warning
+    b.push(1u8);
     b.extend_from_slice(msg.as_bytes());
     b.push(b'\n');
-    let _ = out.write_all(&b);
+    c.wr(&b);
 }
 
-/// Read exactly `n` bytes; false on early EOF.
-fn read_exact(inp: &Arc<dyn File>, buf: &mut [u8]) -> bool {
+fn read_exact(c: &dyn Chan, buf: &mut [u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
-        match inp.read(&mut buf[off..]) {
-            Ok(0) | Err(_) => return false,
-            Ok(k) => off += k,
+        let n = c.rd(&mut buf[off..]);
+        if n == 0 {
+            return false;
         }
+        off += n;
     }
     true
 }
 
-fn read_byte(inp: &Arc<dyn File>) -> Option<u8> {
+fn read_byte(c: &dyn Chan) -> Option<u8> {
     let mut b = [0u8; 1];
-    read_exact(inp, &mut b).then_some(b[0])
+    read_exact(c, &mut b).then_some(b[0])
 }
 
-/// A control line up to and excluding '\n'; None on EOF.
-fn read_line(inp: &Arc<dyn File>) -> Option<String> {
+fn read_line(c: &dyn Chan) -> Option<String> {
     let mut line = Vec::new();
     loop {
-        let b = read_byte(inp)?;
+        let b = read_byte(c)?;
         if b == b'\n' {
             return Some(String::from_utf8_lossy(&line).into_owned());
         }
@@ -87,12 +229,11 @@ fn read_line(inp: &Arc<dyn File>) -> Option<String> {
     }
 }
 
-/// Wait for the peer's status byte (0 ok). Returns false on error/EOF.
-fn read_ack(inp: &Arc<dyn File>) -> bool {
-    match read_byte(inp) {
+fn read_ack(c: &dyn Chan) -> bool {
+    match read_byte(c) {
         Some(0) => true,
         Some(_) => {
-            let _ = read_line(inp); // consume the message
+            let _ = read_line(c);
             false
         }
         None => false,
@@ -101,17 +242,14 @@ fn read_ack(inp: &Arc<dyn File>) -> bool {
 
 // ── sink: receive into `dest` ───────────────────────────────────────────────
 
-fn sink_mode(ctx: &mut Ctx, dest: &str, _recursive: bool) -> i32 {
-    let inp = ctx.stdin();
-    let out = ctx.stdout();
+fn sink_mode(ctx: &mut Ctx, dest: &str, _recursive: bool, c: &dyn Chan) -> i32 {
     let fsx = ops::Ctx::of(&ctx.proc);
     let dest_is_dir = ops::stat(&fsx, dest, true).map(|m| m.kind == FileType::Directory).unwrap_or(false);
-    // Directory stack for -r; starts at dest (if a dir) else its parent.
     let mut dir = if dest_is_dir { dest.to_string() } else { parent_of(dest) };
     let mut first = true;
-    ack(&out);
+    ack(c);
     loop {
-        let Some(line) = read_line(&inp) else { break };
+        let Some(line) = read_line(c) else { break };
         if line.is_empty() {
             continue;
         }
@@ -120,23 +258,22 @@ fn sink_mode(ctx: &mut Ctx, dest: &str, _recursive: bool) -> i32 {
         match tag {
             'C' => {
                 let Some((mode, size, name)) = parse_cd(body) else {
-                    err_reply(&out, "bad C header");
+                    err_reply(c, "bad C header");
                     return 1;
                 };
                 let target = if first && !dest_is_dir { dest.to_string() } else { join(&dir, &name) };
                 first = false;
-                ack(&out);
-                if let Err(e) = recv_file(&inp, &fsx, &target, size, mode) {
-                    err_reply(&out, &alloc::format!("{target}: {}", e.desc()));
+                ack(c);
+                if let Err(e) = recv_file(c, &fsx, &target, size, mode) {
+                    err_reply(c, &alloc::format!("{target}: {}", e.desc()));
                     return 1;
                 }
-                // peer's post-data status byte, then our ack
-                let _ = read_byte(&inp);
-                ack(&out);
+                let _ = read_byte(c);
+                ack(c);
             }
             'D' => {
                 let Some((mode, _sz, name)) = parse_cd(body) else {
-                    err_reply(&out, "bad D header");
+                    err_reply(c, "bad D header");
                     return 1;
                 };
                 let sub = if first && !dest_is_dir { dest.to_string() } else { join(&dir, &name) };
@@ -145,17 +282,15 @@ fn sink_mode(ctx: &mut Ctx, dest: &str, _recursive: bool) -> i32 {
                     let _ = ops::mkdir(&fsx, &sub, (mode & 0o7777) as u16);
                 }
                 dir = sub;
-                ack(&out);
+                ack(c);
             }
             'E' => {
                 dir = parent_of(&dir);
-                ack(&out);
+                ack(c);
             }
-            'T' => {
-                ack(&out); // times: accepted, not applied
-            }
+            'T' => ack(c),
             _ => {
-                err_reply(&out, "unexpected scp command");
+                err_reply(c, "unexpected scp command");
                 return 1;
             }
         }
@@ -163,13 +298,13 @@ fn sink_mode(ctx: &mut Ctx, dest: &str, _recursive: bool) -> i32 {
     0
 }
 
-fn recv_file(inp: &Arc<dyn File>, fsx: &FsCtx, path: &str, size: u64, mode: u32) -> crate::errno::KResult<()> {
+fn recv_file(c: &dyn Chan, fsx: &FsCtx, path: &str, size: u64, mode: u32) -> crate::errno::KResult<()> {
     let f = ops::open(fsx, path, flags::O_WRONLY | flags::O_CREAT | flags::O_TRUNC, (mode & 0o7777) as u16)?;
     let mut left = size;
     let mut buf = [0u8; 8192];
     while left > 0 {
         let want = core::cmp::min(left as usize, buf.len());
-        if !read_exact(inp, &mut buf[..want]) {
+        if !read_exact(c, &mut buf[..want]) {
             return Err(crate::errno::Errno::EIO);
         }
         f.write_all(&buf[..want])?;
@@ -180,23 +315,21 @@ fn recv_file(inp: &Arc<dyn File>, fsx: &FsCtx, path: &str, size: u64, mode: u32)
 
 // ── source: send `path` ─────────────────────────────────────────────────────
 
-fn source_mode(ctx: &mut Ctx, path: &str, recursive: bool) -> i32 {
-    let inp = ctx.stdin();
-    let out = ctx.stdout();
+fn source_mode(ctx: &mut Ctx, path: &str, recursive: bool, c: &dyn Chan) -> i32 {
     let fsx = ops::Ctx::of(&ctx.proc);
-    if !read_ack(&inp) {
+    if !read_ack(c) {
         return 1;
     }
-    match send_path(&inp, &out, &fsx, path, recursive) {
+    match send_path(c, &fsx, path, recursive) {
         Ok(()) => 0,
         Err(msg) => {
-            err_reply(&out, &msg);
+            err_reply(c, &msg);
             1
         }
     }
 }
 
-fn send_path(inp: &Arc<dyn File>, out: &Arc<dyn File>, fsx: &FsCtx, path: &str, recursive: bool) -> Result<(), String> {
+fn send_path(c: &dyn Chan, fsx: &FsCtx, path: &str, recursive: bool) -> Result<(), String> {
     let meta = ops::stat(fsx, path, true).map_err(|e| alloc::format!("{path}: {}", e.desc()))?;
     let name = basename(path);
     if meta.kind == FileType::Directory {
@@ -204,8 +337,7 @@ fn send_path(inp: &Arc<dyn File>, out: &Arc<dyn File>, fsx: &FsCtx, path: &str, 
             return Err(alloc::format!("{path}: not a regular file"));
         }
         let hdr = alloc::format!("D{:04o} 0 {}\n", meta.perm & 0o7777, name);
-        out.write_all(hdr.as_bytes()).map_err(|_| "write".to_string())?;
-        if !read_ack(inp) {
+        if !c.wr(hdr.as_bytes()) || !read_ack(c) {
             return Err("peer".to_string());
         }
         let entries = ops::list_dir(fsx, path).map_err(|e| e.desc().to_string())?;
@@ -213,19 +345,16 @@ fn send_path(inp: &Arc<dyn File>, out: &Arc<dyn File>, fsx: &FsCtx, path: &str, 
             if e.name == "." || e.name == ".." {
                 continue;
             }
-            send_path(inp, out, fsx, &join(path, &e.name), recursive)?;
+            send_path(c, fsx, &join(path, &e.name), recursive)?;
         }
-        out.write_all(b"E\n").map_err(|_| "write".to_string())?;
-        if !read_ack(inp) {
+        if !c.wr(b"E\n") || !read_ack(c) {
             return Err("peer".to_string());
         }
         return Ok(());
     }
-    // Regular file.
     let f = ops::open(fsx, path, flags::O_RDONLY, 0).map_err(|e| alloc::format!("{path}: {}", e.desc()))?;
     let hdr = alloc::format!("C{:04o} {} {}\n", meta.perm & 0o7777, meta.size, name);
-    out.write_all(hdr.as_bytes()).map_err(|_| "write".to_string())?;
-    if !read_ack(inp) {
+    if !c.wr(hdr.as_bytes()) || !read_ack(c) {
         return Err("peer".to_string());
     }
     let mut buf = [0u8; 8192];
@@ -235,14 +364,16 @@ fn send_path(inp: &Arc<dyn File>, out: &Arc<dyn File>, fsx: &FsCtx, path: &str, 
         match f.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => {
-                out.write_all(&buf[..n]).map_err(|_| "write".to_string())?;
+                if !c.wr(&buf[..n]) {
+                    return Err("write".to_string());
+                }
                 left -= n as u64;
             }
             Err(_) => return Err("read".to_string()),
         }
     }
-    ack(out); // end-of-file status
-    if !read_ack(inp) {
+    ack(c);
+    if !read_ack(c) {
         return Err("peer".to_string());
     }
     Ok(())
@@ -250,7 +381,6 @@ fn send_path(inp: &Arc<dyn File>, out: &Arc<dyn File>, fsx: &FsCtx, path: &str, 
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-/// Parse "0644 12345 name" from a C/D header body.
 fn parse_cd(body: &str) -> Option<(u32, u64, String)> {
     let mode_end = body.find(' ')?;
     let mode = u32::from_str_radix(&body[..mode_end], 8).ok()?;
@@ -279,3 +409,4 @@ fn join(dir: &str, name: &str) -> String {
         alloc::format!("{}/{name}", dir.trim_end_matches('/'))
     }
 }
+

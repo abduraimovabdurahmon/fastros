@@ -20,6 +20,7 @@ pub mod procinfo;
 pub mod procps;
 pub mod runutil;
 pub mod scp;
+pub mod ssh;
 pub mod sed;
 pub mod sftp;
 pub mod sysutil;
@@ -51,7 +52,8 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("cp", fileops::cp, "copy files and directories", "[-rapfinvuls] SOURCE... DEST"),
     cmd!("curl", http::curl, "transfer data from or to a server", "[-sSLIifO] [-X METHOD] [-H HEADER] [-d DATA] [-o FILE] [-w FMT] URL..."),
     cmd!("ftp", ftp::ftp, "FTP client (ls/get/put or interactive)", "ls|get|put ftp://[user[:pass]@]host[:port]/path | HOST [PORT]"),
-    cmd!("scp", scp::scp, "secure copy (remote side of the protocol)", "[-r] [-t|-f] PATH"),
+    cmd!("scp", scp::scp, "secure copy over SSH (local↔remote, or remote side)", "[-r] [-P PORT] SRC DEST | [-t|-f] PATH"),
+    cmd!("ssh", ssh::ssh, "OpenSSH client — run a remote command or shell", "[-p PORT] [user@]host [command...]"),
     cmd!("sftp-server", sftp::sftp_server, "SFTP subsystem (run by sshd)", ""),
     cmd!("cut", textutils::cut, "remove sections from each line", "-b|-c|-f LIST [-d DELIM] [FILE]..."),
     cmd!("date", sysutil::date, "print or set the system date and time", "[-uR] [-d STRING] [-s STRING] [-I[FMT]] [+FORMAT]"),

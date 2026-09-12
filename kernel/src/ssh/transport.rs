@@ -655,6 +655,162 @@ pub fn server_kex(
     Ok(h)
 }
 
+// ── client side ─────────────────────────────────────────────────────────────
+
+pub const CLIENT_VERSION: &str = "SSH-2.0-FastROS_client_0.2";
+
+fn csv(s: &str) -> Vec<String> {
+    s.split(',').map(String::from).collect()
+}
+
+pub fn client_kexinit() -> Vec<u8> {
+    let mut w = Writer::msg(msg::KEXINIT);
+    w.raw(&rng::array::<16>());
+    let kex = "curve25519-sha256,curve25519-sha256@libssh.org,ext-info-c,kex-strict-c-v00@openssh.com";
+    w.str(kex).str(HOSTKEY_ALGS).str(CIPHERS).str(CIPHERS).str(MACS).str(MACS).str("none").str("none").str("").str("");
+    w.bool(false).u32(0);
+    w.done()
+}
+
+/// Negotiate algorithms from the server's KEXINIT, client preference winning.
+fn client_negotiate(server_kexinit: &[u8]) -> SResult<Negotiated> {
+    let mut r = Reader::new(server_kexinit);
+    let bad = |_| SshError::Protocol("malformed KEXINIT".into());
+    r.u8().map_err(bad)?;
+    r.bytes(16).map_err(bad)?;
+    let kex = r.name_list().map_err(bad)?;
+    let hk = r.name_list().map_err(bad)?;
+    let enc_cs = r.name_list().map_err(bad)?;
+    let enc_sc = r.name_list().map_err(bad)?;
+    let mac_cs = r.name_list().map_err(bad)?;
+    let mac_sc = r.name_list().map_err(bad)?;
+    let _cc = r.name_list().map_err(bad)?;
+    let _cs = r.name_list().map_err(bad)?;
+    let joined = |v: &[String]| v.join(",");
+    if pick(&csv("curve25519-sha256,curve25519-sha256@libssh.org"), &joined(&kex)).is_none() {
+        return proto("no common key exchange algorithm");
+    }
+    if pick(&csv(HOSTKEY_ALGS), &joined(&hk)).is_none() {
+        return proto("server has no ssh-ed25519 host key");
+    }
+    let dir = |enc: &[String], mac: &[String]| -> SResult<(CipherAlg, MacAlg)> {
+        let c = pick(&csv(CIPHERS), &joined(enc)).and_then(|n| CipherAlg::from_name(&n)).ok_or(SshError::Protocol("no common cipher".into()))?;
+        if c == CipherAlg::ChaChaPoly {
+            return Ok((c, MacAlg::Aead));
+        }
+        let m = match pick(&csv(MACS), &joined(mac)).as_deref() {
+            Some("hmac-sha2-256-etm@openssh.com") => MacAlg::HmacSha256Etm,
+            Some("hmac-sha2-256") => MacAlg::HmacSha256,
+            _ => return proto("no common MAC"),
+        };
+        Ok((c, m))
+    };
+    Ok(Negotiated {
+        c2s: dir(&enc_cs, &mac_cs)?,
+        s2c: dir(&enc_sc, &mac_sc)?,
+        strict: kex.iter().any(|k| k == "kex-strict-s-v00@openssh.com"),
+        ext_info: kex.iter().any(|k| k == "ext-info-s"),
+    })
+}
+
+/// Verify the server's exchange-hash signature against its ed25519 host key.
+fn verify_host_sig(ks: &[u8], sig: &[u8], h: &[u8; 32]) -> SResult<()> {
+    let mut kr = Reader::new(ks);
+    let alg = kr.string().map_err(|_| SshError::Protocol("bad host key".into()))?;
+    let pk = kr.string().map_err(|_| SshError::Protocol("bad host key".into()))?;
+    if alg != b"ssh-ed25519" || pk.len() != 32 {
+        return proto("host key is not ssh-ed25519");
+    }
+    let mut sr = Reader::new(sig);
+    let salg = sr.string().map_err(|_| SshError::Protocol("bad signature".into()))?;
+    let sb = sr.string().map_err(|_| SshError::Protocol("bad signature".into()))?;
+    if salg != b"ssh-ed25519" || sb.len() != 64 {
+        return proto("signature is not ssh-ed25519");
+    }
+    let mut pkb = [0u8; 32];
+    pkb.copy_from_slice(pk);
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pkb).map_err(|_| SshError::Protocol("bad host key point".into()))?;
+    let mut sgb = [0u8; 64];
+    sgb.copy_from_slice(sb);
+    let signature = ed25519_dalek::Signature::from_bytes(&sgb);
+    ed25519_dalek::Verifier::verify(&vk, h, &signature).map_err(|_| SshError::Protocol("host key signature verification failed".into()))
+}
+
+/// Client side of curve25519-sha256. Returns the exchange hash (session id on
+/// the first exchange) and the server's host-key blob (for known-hosts checks).
+pub fn client_kex(
+    client_version: &str,
+    server_version: &str,
+    client_kexinit: &[u8],
+    server_kexinit: &[u8],
+    recv: &mut RecvHalf,
+    send: &Sender,
+) -> SResult<([u8; 32], Vec<u8>)> {
+    let neg = client_negotiate(server_kexinit)?;
+    let secret = x25519_dalek::StaticSecret::from(rng::array::<32>());
+    let q_c = x25519_dalek::PublicKey::from(&secret);
+    let mut init = Writer::msg(msg::KEX_ECDH_INIT);
+    init.string(q_c.as_bytes());
+    send.send_kex(&init.done())?;
+
+    let reply = loop {
+        let p = recv.read_packet(Some(60_000))?;
+        match p[0] {
+            msg::KEX_ECDH_REPLY => break p,
+            msg::IGNORE | msg::DEBUG => continue,
+            msg::DISCONNECT => return Err(SshError::Disconnected("peer disconnected during key exchange".into())),
+            _ => return proto("expected KEX_ECDH_REPLY"),
+        }
+    };
+    let mut rr = Reader::new(&reply);
+    rr.u8().map_err(|_| SshError::Protocol("bad ECDH_REPLY".into()))?;
+    let ks = rr.string().map_err(|_| SshError::Protocol("bad ECDH_REPLY".into()))?.to_vec();
+    let q_s = rr.string().map_err(|_| SshError::Protocol("bad ECDH_REPLY".into()))?;
+    let sig = rr.string().map_err(|_| SshError::Protocol("bad ECDH_REPLY".into()))?.to_vec();
+    if q_s.len() != 32 {
+        return proto("bad server ephemeral key");
+    }
+    let mut qs = [0u8; 32];
+    qs.copy_from_slice(q_s);
+    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(qs));
+    if !shared.was_contributory() {
+        return proto("low-order ephemeral key");
+    }
+    let k_mpint = Writer::new().mpint(shared.as_bytes()).done();
+    let mut hw = Writer::new();
+    hw.str(client_version).str(server_version).string(client_kexinit).string(server_kexinit).string(&ks).string(q_c.as_bytes()).string(q_s);
+    hw.raw(&k_mpint);
+    let h: [u8; 32] = Sha256::digest(&hw.b).into();
+    verify_host_sig(&ks, &sig, &h)?;
+    let sid = h;
+
+    let mk = |letter_iv: u8, letter_key: u8, letter_mac: u8, (alg, mac): (CipherAlg, MacAlg)| -> Keys {
+        let iv = derive(&k_mpint, &h, letter_iv, &sid, alg.iv_len().max(1));
+        let key = derive(&k_mpint, &h, letter_key, &sid, alg.key_len());
+        let mk = if mac == MacAlg::Aead { Vec::new() } else { derive(&k_mpint, &h, letter_mac, &sid, 32) };
+        Keys::new(alg, mac, &key, &iv, mk, 0)
+    };
+    {
+        let mut s = send.lock();
+        s.strict = neg.strict;
+        s.send_packet(&[msg::NEWKEYS])?;
+        s.set_keys(mk(b'A', b'C', b'E', neg.c2s)); // client → server
+        s.bytes_since_kex = 0;
+    }
+    loop {
+        let p = recv.read_packet(Some(60_000))?;
+        match p[0] {
+            msg::NEWKEYS => break,
+            msg::IGNORE | msg::DEBUG if !neg.strict => continue,
+            msg::DISCONNECT => return Err(SshError::Disconnected("peer disconnected during key exchange".into())),
+            _ => return proto("unexpected message during key exchange"),
+        }
+    }
+    recv.strict = neg.strict;
+    recv.set_keys(mk(b'B', b'D', b'F', neg.s2c)); // server → client
+    Ok((h, ks))
+}
+
 pub fn disconnect_msg(reason: u32, text: &str) -> Vec<u8> {
     let mut w = Writer::msg(msg::DISCONNECT);
     w.u32(reason).str(text).str("");
