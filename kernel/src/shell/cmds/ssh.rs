@@ -215,19 +215,62 @@ fn pump_stdin(sin: Arc<dyn crate::fs::file::File>, sess: Arc<Session>) {
     }
 }
 
-/// `ssh-keygen` — generate `~/.ssh/id_ed25519` + `id_ed25519.pub`.
+/// `ssh-keygen [-f FILE] [-C COMMENT] [-N PASSPHRASE]` — generate an ed25519
+/// key pair. If `-N` is omitted, prompt for a passphrase (empty = no passphrase).
 pub fn ssh_keygen(ctx: &mut Ctx) -> i32 {
-    let dir = alloc::format!("{}/.ssh", home(ctx));
-    let priv_path = alloc::format!("{dir}/id_ed25519");
+    let mut file = None;
+    let mut comment = None;
+    let mut passphrase: Option<String> = None;
+    let args = ctx.args[1..].to_vec();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" => {
+                i += 1;
+                file = args.get(i).cloned();
+            }
+            "-C" => {
+                i += 1;
+                comment = args.get(i).cloned();
+            }
+            "-N" => {
+                i += 1;
+                passphrase = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            "-t" => {
+                i += 1; // key type; only ed25519 is supported, accept and ignore
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let priv_path = file.unwrap_or_else(|| alloc::format!("{}/.ssh/id_ed25519", home(ctx)));
     let pub_path = alloc::format!("{priv_path}.pub");
+    let dir = priv_path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_else(|| ".".to_string());
+    let comment = comment.unwrap_or_else(|| alloc::format!("{}@fastros", ctx.env("USER").unwrap_or_else(|| "root".to_string())));
+
     let fsx = ops::Ctx::of(&ctx.proc);
     if ops::stat(&fsx, &priv_path, true).is_ok() {
         return ctx.fail(alloc::format!("{priv_path} already exists"));
     }
+
+    // Passphrase: -N value, or prompt with confirmation.
+    let passphrase = match passphrase {
+        Some(p) => p,
+        None => {
+            let p1 = prompt(ctx, "Enter passphrase (empty for no passphrase): ");
+            let p2 = prompt(ctx, "Enter same passphrase again: ");
+            if p1 != p2 {
+                return ctx.fail("passphrases do not match");
+            }
+            p1
+        }
+    };
+    let pp = if passphrase.is_empty() { None } else { Some(passphrase.as_str()) };
+
     let sk = keys::generate();
-    let comment = alloc::format!("{}@fastros", ctx.env("USER").unwrap_or_else(|| "root".to_string()));
     let _ = ops::mkdir_all(&fsx, &dir, 0o700);
-    if let Err(e) = write_file(&fsx, &priv_path, keys::to_openssh_pem(&sk, &comment).as_bytes(), 0o600) {
+    if let Err(e) = write_file(&fsx, &priv_path, keys::to_openssh_pem(&sk, &comment, pp).as_bytes(), 0o600) {
         return ctx.fail_errno(&priv_path, e);
     }
     if let Err(e) = write_file(&fsx, &pub_path, keys::public_line(&sk, &comment).as_bytes(), 0o644) {
@@ -236,6 +279,9 @@ pub fn ssh_keygen(ctx: &mut Ctx) -> i32 {
     ctx.println(&alloc::format!("Your identification has been saved in {priv_path}"));
     ctx.println(&alloc::format!("Your public key has been saved in {pub_path}"));
     ctx.println(&alloc::format!("The key fingerprint is: {}", crate::ssh::fingerprint(&keys::public_blob(&sk))));
+    if pp.is_some() {
+        ctx.println("The key is protected with a passphrase.");
+    }
     0
 }
 

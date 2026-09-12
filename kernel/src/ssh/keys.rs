@@ -117,8 +117,10 @@ pub fn parse_openssh_ed25519(pem: &str, passphrase: Option<&str>) -> Result<(Sig
     Ok((sk, w.done()))
 }
 
-/// Serialize a signing key as an unencrypted OpenSSH private key (PEM).
-pub fn to_openssh_pem(sk: &SigningKey, comment: &str) -> String {
+/// Serialize a signing key as an OpenSSH private key (PEM). With a passphrase
+/// the private section is encrypted with `bcrypt` + `aes256-ctr` (as `ssh-keygen`
+/// does); without one it is stored in the clear.
+pub fn to_openssh_pem(sk: &SigningKey, comment: &str, passphrase: Option<&str>) -> String {
     let pk = sk.verifying_key().to_bytes();
     let pubblob = public_blob(sk);
     // 64-byte private = seed(32) || public(32).
@@ -130,17 +132,35 @@ pub fn to_openssh_pem(sk: &SigningKey, comment: &str) -> String {
     let mut inner = Writer::new();
     inner.u32(check).u32(check);
     inner.str("ssh-ed25519").string(&pk).string(&privkey).str(comment);
-    // Pad to an 8-byte boundary with 1,2,3,...
     let mut body = inner.done();
+
+    let encrypt = passphrase.filter(|p| !p.is_empty());
+    // Pad to the cipher block size (8 for "none", 16 for aes256-ctr).
+    let block = if encrypt.is_some() { 16 } else { 8 };
     let mut pad = 1u8;
-    while body.len() % 8 != 0 {
+    while body.len() % block != 0 {
         body.push(pad);
         pad += 1;
     }
 
+    let (cipher, kdf, kdfopts) = if let Some(pass) = encrypt {
+        let salt = rng::array::<16>();
+        let rounds: u32 = 16;
+        let mut material = [0u8; 48]; // 32-byte key + 16-byte IV
+        // bcrypt_pbkdf cannot fail for these sizes; a failure leaves the key
+        // unencrypted-in-body, but we treat it as fatal-ish by ignoring Err.
+        let _ = bcrypt_pbkdf::bcrypt_pbkdf(pass.as_bytes(), &salt, rounds, &mut material);
+        ctr_decrypt("aes256-ctr", &material[..32], &material[32..48], &mut body);
+        let mut ko = Writer::new();
+        ko.string(&salt).u32(rounds);
+        ("aes256-ctr", "bcrypt", ko.done())
+    } else {
+        ("none", "none", Vec::new())
+    };
+
     let mut w = Writer::new();
     w.raw(MAGIC);
-    w.str("none").str("none").string(&[]);
+    w.str(cipher).str(kdf).string(&kdfopts);
     w.u32(1);
     w.string(&pubblob);
     w.string(&body);

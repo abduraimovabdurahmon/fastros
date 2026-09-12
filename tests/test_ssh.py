@@ -99,9 +99,24 @@ def test_ssh_encrypted_key_passphrase(g):
     g.run("rm -f /root/.ssh/id_ed25519 /root/.ssh/authorized_keys /root/.ssh/known_hosts")
 
 
+def test_ssh_keygen_encrypted(g):
+    """ssh-keygen -N generates a passphrase-encrypted key, usable via the prompt."""
+    g.run("rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys /root/.ssh/known_hosts")
+    out = g.ok("ssh-keygen -N topsecret -C enc@fastros", timeout=30)
+    assert "protected with a passphrase" in out, out
+    g.ok("cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys")
+    # Correct passphrase → decrypts the just-generated key → logs in.
+    out2, err2, _ = g.run("printf 'topsecret\\n' | ssh root@127.0.0.1 'echo KEYGEN_ENC_OK'", timeout=45)
+    assert "KEYGEN_ENC_OK" in out2, out2 + err2
+    # Wrong passphrase → rejected.
+    out3, err3, _ = g.run("printf 'x\\nx\\nx\\n' | ssh root@127.0.0.1 'echo NO'", timeout=45)
+    assert "NO" not in out3 and "bad passphrase" in (out3 + err3).lower(), out3 + err3
+    g.run("rm -f /root/.ssh/id_ed25519 /root/.ssh/authorized_keys /root/.ssh/known_hosts")
+
+
 def test_ssh_keygen_and_pubkey_auth(g):
     g.run("rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys /root/.ssh/known_hosts")
-    out = g.ok("ssh-keygen", timeout=30)
+    out = g.ok("ssh-keygen -N ''", timeout=30)  # -N '' = no passphrase, no prompt
     assert "saved in" in out and "fingerprint" in out.lower(), out
     assert g.ok("test -f /root/.ssh/id_ed25519 && echo yes").strip() == "yes"
     g.ok("cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys")
