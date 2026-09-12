@@ -92,19 +92,29 @@ pub fn rt_sigprocmask(how: i32, set: usize, oldset: usize, _sigsetsize: usize) -
 }
 
 /// `rt_sigreturn`: restore the context a signal handler was set up over, and the
-/// blocked mask that was in force before the handler ran. Rewrites `frame` in
-/// place; the returned value becomes the resumed `rax`.
-pub fn rt_sigreturn(frame: &mut UserFrame) -> u64 {
+/// blocked mask that was in force before the handler ran, then resume that
+/// context directly via iretq.
+///
+/// It must NOT return through the syscall/sysret path: sysret clobbers rcx and
+/// r11, but an asynchronously interrupted context (e.g. a SIGALRM off the timer)
+/// may have had live values there. `sigreturn_resume` restores all 18 registers.
+pub fn rt_sigreturn(frame: &mut UserFrame) -> ! {
     let mut regs = signal::Regs::from_user(frame);
-    match signal::restore_frame(&mut regs) {
-        Ok(mask) => {
-            sched::with_current(|t| t.set_blocked(mask));
-            regs.store_user(frame);
-            regs.rax
-        }
+    let mask = match signal::restore_frame(&mut regs) {
+        Ok(m) => m,
         // A corrupt sigframe means the process trampled its own stack: kill it.
         Err(_) => proc::exit_current(ExitStatus::Signaled(signal::SIGSEGV)),
-    }
+    };
+    sched::with_current(|t| t.set_blocked(mask));
+    // Deliver any further pending, now-unblocked signal before resuming, so a
+    // queued signal is not delayed until the next kernel entry.
+    proc::deliver_user_signals(&mut regs);
+    let image: [u64; 18] = [
+        regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15,
+        regs.rdi, regs.rsi, regs.rbp, regs.rbx, regs.rdx, regs.rax, regs.rcx, regs.rsp,
+        regs.rip, regs.rflags,
+    ];
+    unsafe { crate::arch::x86_64::syscall::sigreturn_resume(&image) }
 }
 
 // ── interval timers (SIGALRM) ────────────────────────────────────────────────

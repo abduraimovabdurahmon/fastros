@@ -190,3 +190,55 @@ extern "C" {
 pub unsafe fn enter_user(frame: &UserFrame) -> ! {
     unsafe { enter_user_asm(frame as *const UserFrame) }
 }
+
+core::arch::global_asm!(
+    r#"
+    .section .text.sigreturn_resume, "ax"
+    .global sigreturn_resume_asm
+sigreturn_resume_asm:
+    /* rdi = *const [u64; 18] in the fixed order:
+       r8,r9,r10,r11,r12,r13,r14,r15, rdi,rsi,rbp,rbx,rdx,rax,rcx,rsp, rip,rflags.
+       Restore EVERY GP register (rcx and r11 too — this is why sigreturn cannot
+       use sysret) and iretq back to the exact interrupted ring-3 context. */
+    mov r8,  [rdi + 0]
+    mov r9,  [rdi + 8]
+    mov r10, [rdi + 16]
+    mov r11, [rdi + 24]
+    mov r12, [rdi + 32]
+    mov r13, [rdi + 40]
+    mov r14, [rdi + 48]
+    mov r15, [rdi + 56]
+    mov rsi, [rdi + 72]
+    mov rbp, [rdi + 80]
+    mov rbx, [rdi + 88]
+    mov rdx, [rdi + 96]
+    mov rax, [rdi + 104]
+    mov rcx, [rdi + 112]
+    /* iretq frame: SS, RSP, RFLAGS, CS, RIP */
+    push {user_ss}
+    push qword ptr [rdi + 120]
+    push qword ptr [rdi + 136]
+    push {user_cs}
+    push qword ptr [rdi + 128]
+    mov rdi, [rdi + 64]         /* rdi last */
+    swapgs
+    iretq
+"#,
+    user_ss = const gdt::USER_DS as u64,
+    user_cs = const gdt::USER_CS as u64,
+);
+
+extern "C" {
+    fn sigreturn_resume_asm(regs: *const u64) -> !;
+}
+
+/// Resume a signal-interrupted ring-3 context from `rt_sigreturn`. `regs` is the
+/// 18-word register image (see the asm for the order). Unlike a normal syscall
+/// return this restores rcx/r11, so an asynchronously interrupted computation
+/// resumes with every register intact.
+///
+/// # Safety
+/// `regs` must describe a valid ring-3 context in the current address space.
+pub unsafe fn sigreturn_resume(regs: &[u64; 18]) -> ! {
+    unsafe { sigreturn_resume_asm(regs.as_ptr()) }
+}
