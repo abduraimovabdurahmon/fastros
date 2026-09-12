@@ -127,6 +127,14 @@ pub fn bind(fd: i32, addr: usize, len: usize) -> KResult<usize> {
     if sockaddr_family(addr, len) == AF_UNIX {
         let path = read_sun_path(addr, len)?;
         with_unix(fd, |s| s.bind(&path))?;
+        // Create a socket node at the path so a server can stat/chmod it (as
+        // postgres does on its `.s.PGSQL.<port>` socket). Abstract/unnamed
+        // sockets (empty path) have no filesystem entry. Best-effort.
+        if !path.is_empty() && path.starts_with('/') {
+            let p = proc::current();
+            let ctx = crate::fs::ops::Ctx::of(&p);
+            let _ = crate::fs::ops::mknod(&ctx, &path, crate::fs::FileType::Socket, 0o600, 0);
+        }
         return Ok(0);
     }
     let ep = read_sockaddr(addr, len)?;
