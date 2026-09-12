@@ -31,6 +31,12 @@ WORKER = r"""
 int main(void){ for(;;){ struct timespec t={1,0}; nanosleep(&t,0); } return 0; }
 """
 
+# Prints and exits — usable as a `kube exec` target (the image has no shell).
+INFO = r"""
+#include <stdio.h>
+int main(int argc, char **argv){ printf("info ran argc=%d\n", argc); return 0; }
+"""
+
 MANIFEST = """\
 apiVersion: apps/v1
 kind: Deployment
@@ -87,6 +93,7 @@ def kube_setup(g):
         os.makedirs(os.path.join(root, "bin"))
         _cc(HTTPD, os.path.join(root, "bin", "httpd"))
         _cc(WORKER, os.path.join(root, "bin", "worker"))
+        _cc(INFO, os.path.join(root, "bin", "info"))
         tar = os.path.join(d, "img.tar.gz")
         subprocess.run(["tar", "czf", tar, "-C", root, "."], check=True)
         data = open(tar, "rb").read()
@@ -125,3 +132,93 @@ def test_kube_apply_get_delete(g, kube_setup):
     assert "worker-0" not in pods2 and "web-0" in pods2, pods2
 
     g.run("fastman kube delete web 2>/dev/null; true")
+
+
+HIVE = """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: hive
+          image: appimg:latest
+          command: ["/bin/worker"]
+"""
+
+
+@pytest.fixture
+def hive(g, kube_setup):
+    g.ok("base64 -d > /tmp/hive.yaml", stdin=base64.b64encode(HIVE.encode()).decode())
+    g.run("fastman kube delete hive 2>/dev/null; true")
+    g.ok("fastman kube apply -f /tmp/hive.yaml", timeout=60)
+    import time
+    time.sleep(2)
+    yield
+    g.run("fastman kube delete hive 2>/dev/null; true")
+
+
+def test_kube_scale(g, hive):
+    import time
+    up = g.ok("fastman kube scale hive --replicas=3")
+    assert 'scaled to 3' in up, up
+    time.sleep(2)
+    pods = g.ok("fastman kube get pods")
+    for p in ("hive-0", "hive-1", "hive-2"):
+        assert p in pods, pods
+    dn = g.ok("fastman kube scale deployment/hive --replicas=1")
+    assert 'scaled to 1' in dn, dn
+    time.sleep(1)
+    pods = g.ok("fastman kube get pods")
+    assert "hive-0" in pods and "hive-1" not in pods and "hive-2" not in pods, pods
+
+
+def test_kube_self_healing(g, hive):
+    import re, time
+    # Find hive-0's pid, kill it, and confirm the controller brings it back.
+    desc = g.ok("fastman kube describe hive")
+    m = re.search(r"hive-0\s+Running\s+pid=(\d+)", desc)
+    assert m, desc
+    pid = m.group(1)
+    g.run(f"kill -9 {pid}")
+    # Controller reconciles every ~3s.
+    healed = False
+    for _ in range(6):
+        time.sleep(3)
+        pods = g.ok("fastman kube get pods")
+        line = [l for l in pods.splitlines() if l.startswith("hive-0")]
+        if line and "Running" in line[0]:
+            # RESTARTS column (3rd) should be >= 1.
+            cols = line[0].split()
+            if len(cols) >= 3 and cols[2].isdigit() and int(cols[2]) >= 1:
+                healed = True
+                break
+    assert healed, g.ok("fastman kube get pods") + "\n" + g.ok("fastman kube describe hive")
+
+
+def test_kube_rollout_restart(g, hive):
+    out = g.ok("fastman kube rollout restart hive")
+    assert 'restarted' in out, out
+    st = g.ok("fastman kube rollout status hive")
+    assert "hive" in st and "ready" in st, st
+
+
+def test_kube_logs_describe_exec(g, kube_setup):
+    import time
+    g.run("fastman kube delete web 2>/dev/null; true")
+    g.ok("fastman kube apply -f /tmp/k8s.yaml", timeout=60)
+    time.sleep(2)
+    # describe shows pods + image
+    desc = g.ok("fastman kube describe web")
+    assert "web-0" in desc and "appimg:latest" in desc, desc
+    # logs: the httpd pod prints nothing until hit; just ensure the command works
+    g.run("curl -s -m 5 http://127.0.0.1:8080/ >/dev/null; true")
+    # exec into a pod: run the quick-exit /bin/info and capture its output
+    ex = g.ok("fastman kube exec web-0 -- /bin/info")
+    assert "info ran" in ex, ex
+    # logs command returns cleanly
+    g.ok("fastman kube logs web-0")
+    g.run("fastman kube delete web 2>/dev/null; fastman kube delete worker 2>/dev/null; true")

@@ -28,6 +28,7 @@ pub fn main() {
     crate::console::init();
     crate::ssh::start();
     crate::ftpd::start();
+    crate::fastman::kube::controller_start();
     crate::console::start_getty();
     let m = crate::mm::stats();
     kinfo!("init", "system ready: {} MiB free, {} tasks", m.free_bytes >> 20, crate::sched::stats().tasks);

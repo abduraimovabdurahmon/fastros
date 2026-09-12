@@ -183,3 +183,77 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         user: o.user,
     }
 }
+
+/// Build run options that faithfully clone an existing pod's container config
+/// (command, env, ports, volumes, user) under a new pod name — used for
+/// scaling a Deployment up.
+pub fn opts_from_container(c: &super::container::Container, name: String) -> RunOpts {
+    RunOpts {
+        name: Some(name),
+        cmd: c.cmd.clone(),
+        env: c.env.clone(),
+        workdir: if c.workdir.is_empty() { None } else { Some(c.workdir.clone()) },
+        ports: c.ports.iter().map(|p| Port { host: p.host, container: p.container, udp: p.udp }).collect(),
+        volumes: c.volumes.iter().map(|v| Volume { host: v.host.clone(), container: v.container.clone(), read_only: v.read_only }).collect(),
+        network: c.network.clone(),
+        detach: true,
+        user: if c.uid == 0 && c.gid == 0 { None } else { Some((c.uid, c.gid)) },
+    }
+}
+
+// ── self-healing controller ─────────────────────────────────────────────────
+
+use crate::sync::SpinLock;
+use alloc::collections::BTreeMap;
+
+/// Per-pod restart counts, shown in `kube get pods` (like kubectl's RESTARTS).
+static RESTARTS: SpinLock<BTreeMap<String, u32>> = SpinLock::new(BTreeMap::new());
+
+pub fn restart_count(pod: &str) -> u32 {
+    RESTARTS.lock().get(pod).copied().unwrap_or(0)
+}
+
+fn bump_restart(pod: &str) {
+    *RESTARTS.lock().entry(pod.to_string()).or_insert(0) += 1;
+}
+
+/// Forget a pod's restart tally (on delete/scale-down).
+pub fn forget_pod(pod: &str) {
+    RESTARTS.lock().remove(pod);
+}
+
+/// Start the reconciliation loop: a background task that keeps each workload's
+/// pods running, restarting any that have died — the core self-healing that
+/// makes a Deployment a Deployment. Runs as root over `/var/lib/fastman/0`.
+pub fn controller_start() {
+    crate::sched::spawn("kube-controller", || loop {
+        crate::sched::sleep_ms(3000);
+        reconcile_once();
+    });
+}
+
+fn reconcile_once() {
+    let kctx = crate::fs::ops::Ctx::of(&crate::proc::kernel());
+    let base = super::store::base(&kctx);
+    let wdir = alloc::format!("{base}/kube/workloads");
+    let Ok(list) = crate::fs::ops::list_dir(&kctx, &wdir) else { return };
+    for e in list {
+        let Ok(d) = crate::fs::ops::read_file(&kctx, &alloc::format!("{wdir}/{}", e.name)) else { continue };
+        let rec = String::from_utf8_lossy(&d).into_owned();
+        let replicas: usize = rec.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+        for n in 0..replicas {
+            let pod = pod_name(&e.name, n);
+            if let Ok(mut c) = super::container::find(&kctx, &pod) {
+                if c.live_state() != super::container::State::Running {
+                    match super::runtime::start(&kctx, &mut c, None) {
+                        Ok(_) => {
+                            bump_restart(&pod);
+                            crate::knotice!("kube", "restarted pod {} (self-healing)", pod);
+                        }
+                        Err(e) => crate::kwarn!("kube", "could not restart pod {}: {}", pod, e),
+                    }
+                }
+            }
+        }
+    }
+}

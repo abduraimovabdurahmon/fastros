@@ -680,7 +680,7 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                 t.render(ctx, &s);
             }
             if pods {
-                let mut t = Table::new(&["POD", "STATUS", "IMAGE"]);
+                let mut t = Table::new(&["POD", "STATUS", "RESTARTS", "IMAGE"]);
                 for e in &workloads {
                     let rec = crate::fs::ops::read_file(&fc, &format!("{wdir}/{}", e.name)).map(|d| String::from_utf8_lossy(&d).into_owned()).unwrap_or_default();
                     let mut it = rec.lines();
@@ -694,7 +694,8 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                                 State::Exited => s.dim(&format!("Exited ({})", c.exit_code)),
                                 State::Created => s.dim("Pending"),
                             };
-                            t.row(alloc::vec![pod, status, c.image_key.clone()]);
+                            let restarts = crate::fastman::kube::restart_count(&pod).to_string();
+                            t.row(alloc::vec![pod, status, restarts, c.image_key.clone()]);
                         }
                     }
                 }
@@ -723,10 +724,14 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
             if let Ok(d) = crate::fs::ops::read_file(&fc, &rec_path) {
                 let text = String::from_utf8_lossy(&d).into_owned();
                 let want: usize = text.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
-                for n in 0..want {
-                    let _ = runtime::remove(&fc, &crate::fastman::kube::pod_name(&name, n), true);
-                }
+                // Remove the record FIRST so the controller stops reconciling
+                // these pods before we tear them down.
                 let _ = crate::fs::ops::unlink(&fc, &rec_path);
+                for n in 0..want {
+                    let pod = crate::fastman::kube::pod_name(&name, n);
+                    let _ = runtime::remove(&fc, &pod, true);
+                    crate::fastman::kube::forget_pod(&pod);
+                }
                 outln!(ctx, "deployment \"{name}\" deleted");
                 return 0;
             }
@@ -736,8 +741,213 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
             }
             ctx.fail(format!("{name}: not found"))
         }
-        other => ctx.fail(format!("unknown kube command '{other}' (apply|get|delete)")),
+        "scale" => kube_scale(ctx, &fc, &wdir, &rest),
+        "rollout" => kube_rollout(ctx, &fc, &wdir, &rest),
+        "logs" => {
+            let Some(pod) = rest.iter().find(|a| !a.starts_with('-')).cloned() else {
+                return ctx.fail("logs requires a pod name");
+            };
+            match runtime::logs(&fc, &pod) {
+                Ok(d) => {
+                    ctx.write(&d);
+                    0
+                }
+                Err(e) => ctx.fail_errno(&pod, e),
+            }
+        }
+        "exec" => {
+            // kube exec [-it] POD [--] CMD...
+            let mut it_flag = false;
+            let mut pod = None;
+            let mut cmd: Vec<String> = Vec::new();
+            let mut seen = false;
+            for a in &rest {
+                if !seen && matches!(a.as_str(), "-i" | "-t" | "-it" | "-ti") {
+                    it_flag = true;
+                } else if !seen && a == "--" {
+                    seen = true;
+                } else if pod.is_none() {
+                    pod = Some(a.clone());
+                } else {
+                    cmd.push(a.clone());
+                }
+            }
+            let Some(pod) = pod else { return ctx.fail("exec requires a pod name") };
+            if cmd.is_empty() {
+                cmd.push("sh".to_string());
+            }
+            let itty = if it_flag {
+                let fds = ctx.proc.fds.lock();
+                match (fds.get(0), fds.get(1), fds.get(2)) {
+                    (Ok(i), Ok(o), Ok(e)) => {
+                        drop(fds);
+                        Some(runtime::ExecTty { stdin: i, stdout: o, stderr: e, tty: ctx.proc.ctty.lock().clone(), pgid: ctx.proc.pgid.load(core::sync::atomic::Ordering::Relaxed) })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let tee = if it_flag { None } else { runtime::caller_stdout(&ctx.proc) };
+            ctx.flush();
+            match runtime::exec(&fc, &pod, cmd, tee, itty) {
+                Ok(code) => code,
+                Err(e) => ctx.fail_errno(&pod, e),
+            }
+        }
+        "describe" => kube_describe(ctx, &fc, &wdir, &sdir, &rest),
+        other => ctx.fail(format!("unknown kube command '{other}' (apply|get|delete|scale|rollout|logs|exec|describe)")),
     }
+}
+
+/// Strip a `kind/name` prefix (`deployment/web` → `web`).
+fn bare_name(s: &str) -> String {
+    s.rsplit('/').next().unwrap_or(s).to_string()
+}
+
+/// `kube scale <name> --replicas=N` (or `deployment/<name> N`).
+fn kube_scale(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[String]) -> i32 {
+    let mut name = None;
+    let mut replicas: Option<usize> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = &rest[i];
+        if let Some(v) = a.strip_prefix("--replicas=") {
+            replicas = v.parse().ok();
+        } else if a == "--replicas" || a == "-r" {
+            i += 1;
+            replicas = rest.get(i).and_then(|v| v.parse().ok());
+        } else if name.is_none() {
+            name = Some(bare_name(a));
+        } else if replicas.is_none() {
+            replicas = a.parse().ok();
+        }
+        i += 1;
+    }
+    let (Some(name), Some(want)) = (name, replicas) else {
+        return ctx.fail("usage: kube scale <name> --replicas=N");
+    };
+    let rec_path = format!("{wdir}/{name}");
+    let Ok(d) = crate::fs::ops::read_file(fc, &rec_path) else {
+        return ctx.fail(format!("{name}: no such deployment"));
+    };
+    let text = String::from_utf8_lossy(&d).into_owned();
+    let mut lines = text.lines();
+    let kind = lines.next().unwrap_or("Deployment").to_string();
+    let old: usize = lines.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let image = lines.next().unwrap_or("").to_string();
+    if want > old {
+        // Scale up: clone pod-0's container config into the new replicas.
+        let template = container::find(fc, &crate::fastman::kube::pod_name(&name, 0)).ok();
+        for n in old..want {
+            let pod = crate::fastman::kube::pod_name(&name, n);
+            let _ = runtime::remove(fc, &pod, true);
+            let opts = match &template {
+                Some(c) => crate::fastman::kube::opts_from_container(c, pod.clone()),
+                None => runtime::RunOpts { name: Some(pod.clone()), detach: true, ..Default::default() },
+            };
+            ctx.flush();
+            match runtime::run(fc, &image, opts, None) {
+                Ok(_) => outln!(ctx, "pod {pod} created"),
+                Err(e) => {
+                    ctx.fail_errno(&pod, e);
+                }
+            }
+        }
+    } else if want < old {
+        // Scale down: remove the excess pods.
+        for n in want..old {
+            let pod = crate::fastman::kube::pod_name(&name, n);
+            let _ = runtime::remove(fc, &pod, true);
+            crate::fastman::kube::forget_pod(&pod);
+            outln!(ctx, "pod {pod} removed");
+        }
+    }
+    let rec = format!("{kind}\n{want}\n{image}\n");
+    let _ = crate::fs::ops::write_file(fc, &rec_path, rec.as_bytes(), 0o600);
+    outln!(ctx, "deployment \"{name}\" scaled to {want}");
+    0
+}
+
+/// `kube rollout restart <name>` — restart every pod of a deployment.
+fn kube_rollout(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[String]) -> i32 {
+    let action = rest.first().map(|s| s.as_str()).unwrap_or("");
+    if action != "restart" && action != "status" {
+        return ctx.fail("usage: kube rollout <restart|status> <name>");
+    }
+    let Some(name) = rest.iter().skip(1).map(|s| bare_name(s)).next() else {
+        return ctx.fail("rollout requires a deployment name");
+    };
+    let rec_path = format!("{wdir}/{name}");
+    let Ok(d) = crate::fs::ops::read_file(fc, &rec_path) else {
+        return ctx.fail(format!("{name}: no such deployment"));
+    };
+    let text = String::from_utf8_lossy(&d).into_owned();
+    let want: usize = text.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+    if action == "status" {
+        let ready = (0..want).filter(|n| container::find(fc, &crate::fastman::kube::pod_name(&name, *n)).map(|c| c.live_state() == State::Running).unwrap_or(false)).count();
+        outln!(ctx, "deployment \"{name}\": {ready}/{want} pods ready");
+        return 0;
+    }
+    for n in 0..want {
+        let pod = crate::fastman::kube::pod_name(&name, n);
+        if let Ok(mut c) = container::find(fc, &pod) {
+            let _ = runtime::stop(fc, &pod, crate::proc::signal::SIGTERM);
+            match runtime::start(fc, &mut c, None) {
+                Ok(_) => outln!(ctx, "pod {pod} restarted"),
+                Err(e) => {
+                    ctx.fail_errno(&pod, e);
+                }
+            }
+        }
+    }
+    outln!(ctx, "deployment \"{name}\" restarted");
+    0
+}
+
+/// `kube describe <name>` — details of a deployment (its pods) or a service.
+fn kube_describe(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, sdir: &str, rest: &[String]) -> i32 {
+    let Some(name) = rest.iter().map(|s| bare_name(s)).next() else {
+        return ctx.fail("describe requires a name");
+    };
+    if let Ok(d) = crate::fs::ops::read_file(fc, &format!("{wdir}/{name}")) {
+        let text = String::from_utf8_lossy(&d).into_owned();
+        let mut it = text.lines();
+        let kind = it.next().unwrap_or("Deployment");
+        let want: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let image = it.next().unwrap_or("");
+        outln!(ctx, "Name:      {name}");
+        outln!(ctx, "Kind:      {kind}");
+        outln!(ctx, "Image:     {image}");
+        outln!(ctx, "Replicas:  {want} desired");
+        outln!(ctx, "Pods:");
+        for n in 0..want {
+            let pod = crate::fastman::kube::pod_name(&name, n);
+            match container::find(fc, &pod) {
+                Ok(c) => {
+                    let st = match c.live_state() {
+                        State::Running => "Running",
+                        State::Exited => "Exited",
+                        State::Created => "Pending",
+                    };
+                    outln!(ctx, "  {pod}  {st}  pid={}  restarts={}", c.pid, crate::fastman::kube::restart_count(&pod));
+                }
+                Err(_) => outln!(ctx, "  {pod}  (missing)"),
+            }
+        }
+        return 0;
+    }
+    if let Ok(d) = crate::fs::ops::read_file(fc, &format!("{sdir}/{name}")) {
+        let text = String::from_utf8_lossy(&d).into_owned();
+        let mut it = text.lines();
+        outln!(ctx, "Name:      {name}");
+        outln!(ctx, "Kind:      Service");
+        outln!(ctx, "Port:      {}", it.next().unwrap_or(""));
+        outln!(ctx, "TargetPort:{}", it.next().unwrap_or(""));
+        outln!(ctx, "Selector:  {}", it.next().unwrap_or(""));
+        return 0;
+    }
+    ctx.fail(format!("{name}: not found"))
 }
 
 /// Deep-copy RunOpts (it is not Clone: it owns Vecs the runtime consumes).
