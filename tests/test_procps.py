@@ -75,7 +75,8 @@ def test_free_layout(g):
     assert lines[0] == "               total        used        free      shared  buff/cache   available"
     assert re.match(r"^Mem: +\d+ +\d+ +\d+ +\d+ +\d+ +\d+$", lines[1])
     assert len(lines[1]) == len(lines[0])
-    assert re.match(r"^Swap: +0 +0 +0$", lines[2])
+    # A dedicated swap device is configured, so Swap has a real total now.
+    assert re.match(r"^Swap: +\d+ +\d+ +\d+$", lines[2])
     h = g.ok("free -h").splitlines()[1]
     assert re.match(r"^Mem: +\d+(\.\d)?Mi +", h), h
 

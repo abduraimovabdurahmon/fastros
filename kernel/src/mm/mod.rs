@@ -18,6 +18,7 @@ pub mod fault;
 pub mod frame;
 pub mod heap;
 pub mod kspace;
+pub mod swap;
 pub mod vmalloc;
 
 pub type PhysAddr = u64;

@@ -32,18 +32,25 @@ fn check(addr: usize, len: usize, write: bool) -> KResult<()> {
 
 pub fn copy_to(addr: usize, src: &[u8]) -> KResult<()> {
     check(addr, src.len(), true)?;
-    crate::arch::cpu::stac();
-    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src.len()) };
-    crate::arch::cpu::clac();
-    Ok(())
+    if is_kernel(addr) {
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src.len()) };
+        return Ok(());
+    }
+    // A user pointer is copied page-by-page through the physical direct map,
+    // never by dereferencing the user virtual address in the kernel: each page
+    // is faulted in (allocated, or swapped back from disk) immediately before it
+    // is written, so the kernel can never take an unresolvable fault on a
+    // demand-zero or swapped-out user page (which has no fault fixup).
+    crate::proc::current_aspace().ok_or(Errno::EFAULT)?.write(addr, src)
 }
 
 pub fn copy_from(addr: usize, dst: &mut [u8]) -> KResult<()> {
     check(addr, dst.len(), false)?;
-    crate::arch::cpu::stac();
-    unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, dst.as_mut_ptr(), dst.len()) };
-    crate::arch::cpu::clac();
-    Ok(())
+    if is_kernel(addr) {
+        unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, dst.as_mut_ptr(), dst.len()) };
+        return Ok(());
+    }
+    crate::proc::current_aspace().ok_or(Errno::EFAULT)?.read(addr, dst)
 }
 
 pub fn write_obj<T: Copy>(addr: usize, v: &T) -> KResult<()> {

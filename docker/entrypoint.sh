@@ -49,6 +49,14 @@ if [ ! -f "$disk" ]; then
     chown "$(stat -c %u:%g "$(dirname "$disk")")" "$disk" 2>/dev/null || true
 fi
 
+# A dedicated swap disk (guest sees it as `sdb`), used only for page reclaim.
+# It holds no filesystem and never persists — recreated blank every boot, and
+# kept container-local (never on the mounted host folder) so it owns no host
+# state. Attached as IDE primary slave (index=1).
+swap=${FASTROS_SWAP:-/tmp/fastros-swap.img}
+rm -f "$swap" 2>/dev/null || true
+truncate -s "${FASTROS_SWAP_SIZE:-512M}" "$swap"
+
 # KVM only helps when the host itself is x86_64 and /dev/kvm was passed in
 # (docker run --device /dev/kvm). Everywhere else QEMU emulates (TCG).
 kvm_usable() {
@@ -70,6 +78,7 @@ set -- -machine pc -accel "$accel" -m "${FASTROS_MEM:-1G}" -kernel "$kernel" \
        -display none -serial stdio -monitor "unix:$monitor,server=on,wait=off" \
        -netdev user,id=net0,hostfwd=tcp::22-:22 -device e1000,netdev=net0 \
        -drive "file=$disk,format=raw,if=ide,index=0,cache=writeback" \
+       -drive "file=$swap,format=raw,if=ide,index=1,cache=writeback" \
        -no-reboot \
        "$@"
 if [ "$accel" = kvm ]; then set -- -cpu host "$@"; else set -- -cpu max "$@"; fi

@@ -525,6 +525,8 @@ pub fn gen_file(f: &str) -> KResult<String> {
             let m = crate::mm::stats();
             let cache = crate::fs::bcache::cached_bytes();
             let avail = m.free_bytes + cache;
+            let (sw_used, sw_total) = crate::mm::swap::usage();
+            let page_kb = 4u64;
             let rows: [(&str, u64); 16] = [
                 ("MemTotal", kb(m.total_bytes)),
                 ("MemFree", kb(m.free_bytes)),
@@ -534,8 +536,8 @@ pub fn gen_file(f: &str) -> KResult<String> {
                 ("SwapCached", 0),
                 ("Active", kb(m.heap_bytes)),
                 ("Inactive", 0),
-                ("SwapTotal", 0),
-                ("SwapFree", 0),
+                ("SwapTotal", sw_total * page_kb),
+                ("SwapFree", (sw_total - sw_used) * page_kb),
                 ("Dirty", kb(crate::fs::bcache::dirty_bytes())),
                 ("Shmem", 0),
                 ("Slab", kb(m.slab_bytes)),
@@ -637,7 +639,13 @@ pub fn gen_file(f: &str) -> KResult<String> {
             }
         }
         "devices" => s.push_str("Character devices:\n  1 mem\n  4 /dev/vc/0\n  5 /dev/tty\n  5 /dev/console\n136 pts\n\nBlock devices:\n  8 sd\n"),
-        "swaps" => s.push_str("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"),
+        "swaps" => {
+            s.push_str("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
+            let (used, total) = crate::mm::swap::usage();
+            if total > 0 {
+                let _ = writeln!(s, "/dev/sdb\t\t\t\tpartition\t{}\t\t{}\t\t-2", total * 4, used * 4);
+            }
+        }
         "vmstat" => {
             let m = crate::mm::stats();
             let _ = writeln!(s, "nr_free_pages {}", m.free_bytes / 4096);

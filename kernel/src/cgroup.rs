@@ -18,9 +18,13 @@ pub const PAGE: u64 = 4096;
 pub struct Cgroup {
     /// 0 = unlimited.
     mem_limit_pages: AtomicU64,
+    /// Swap allowance in pages (0 = unlimited). Set equal to the memory limit,
+    /// so memory+swap ≈ 2× memory — the Docker `-m` default (memory-swap unset).
+    swap_limit_pages: AtomicU64,
     pids_limit: AtomicU32,
     /// Live counters.
     mem_pages: AtomicI64,
+    swap_pages: AtomicI64,
     pids: AtomicU32,
 }
 
@@ -31,14 +35,19 @@ pub fn create(cid: &str, mem_bytes: u64, pids: u32) {
     let cg = get(cid).unwrap_or_else(|| {
         let cg = Arc::new(Cgroup {
             mem_limit_pages: AtomicU64::new(0),
+            swap_limit_pages: AtomicU64::new(0),
             pids_limit: AtomicU32::new(0),
             mem_pages: AtomicI64::new(0),
+            swap_pages: AtomicI64::new(0),
             pids: AtomicU32::new(0),
         });
         CGROUPS.lock().insert(cid.to_string(), cg.clone());
         cg
     });
-    cg.mem_limit_pages.store(mem_bytes.div_ceil(PAGE), Ordering::Relaxed);
+    let mem_pages = mem_bytes.div_ceil(PAGE);
+    cg.mem_limit_pages.store(mem_pages, Ordering::Relaxed);
+    // Default swap allowance equals the memory limit (memory-swap = 2× memory).
+    cg.swap_limit_pages.store(mem_pages, Ordering::Relaxed);
     cg.pids_limit.store(pids, Ordering::Relaxed);
 }
 
@@ -99,6 +108,31 @@ pub fn uncharge_pages(cid: &str, n: u64) {
     }
     if let Some(cg) = get(cid) {
         cg.mem_pages.fetch_sub(n as i64, Ordering::AcqRel);
+    }
+}
+
+/// Charge one page to the container's swap allowance (on swap-out). False when
+/// the swap limit would be exceeded — the page then stays resident and the
+/// memory pressure ultimately surfaces as an OOM, so `-m` bounds total memory.
+pub fn try_charge_swap(cid: &str) -> bool {
+    let Some(cg) = get(cid) else { return true };
+    let limit = cg.swap_limit_pages.load(Ordering::Relaxed);
+    if limit == 0 {
+        return true;
+    }
+    if cg.swap_pages.fetch_add(1, Ordering::AcqRel) as u64 >= limit {
+        cg.swap_pages.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+pub fn uncharge_swap(cid: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(cg) = get(cid) {
+        cg.swap_pages.fetch_sub(n as i64, Ordering::AcqRel);
     }
 }
 

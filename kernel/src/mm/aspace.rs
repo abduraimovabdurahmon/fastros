@@ -8,6 +8,7 @@
 //! parent and child and only copies on the first write fault.
 
 use super::frame;
+use super::swap;
 use super::{align_down, align_up, kspace, PhysAddr, PAGE_SIZE, USER_END, USER_START};
 use crate::arch::paging::{self, flags, MapError};
 use crate::arch::{cpu, trap::TrapFrame};
@@ -135,6 +136,15 @@ pub struct AddressSpace {
     committed: AtomicU64,
 }
 
+/// A page-table entry marker for a swapped-out page: the PRESENT bit is clear
+/// (so the CPU faults on access) and this ignored bit is set to distinguish a
+/// swap entry from a never-touched (demand-zero) entry. The swap slot index is
+/// stored in bits [12..], leaving this bit and the low bits free.
+const PTE_SWAPPED: u64 = 1 << 10;
+
+/// How many pages one reclaim pass tries to free when memory is exhausted.
+const RECLAIM_BATCH: u64 = 32;
+
 /// Base of the mmap region (below the stack), matching a small ASLR-free
 /// Linux layout: stack at the top of the lower half, mmap below it.
 const MMAP_TOP: usize = 0x0000_7F00_0000_0000;
@@ -209,6 +219,21 @@ impl AddressSpace {
         self.committed.fetch_sub(n.min(self.committed.load(Ordering::Relaxed)), Ordering::Relaxed);
         if let Some(cid) = &*self.container.lock() {
             crate::cgroup::uncharge_pages(cid, n);
+        }
+    }
+
+    /// Charge one page to the cgroup's swap allowance (on eviction); false → the
+    /// memory+swap limit is reached, so the page must not be swapped out.
+    fn charge_swap(&self) -> bool {
+        match &*self.container.lock() {
+            Some(cid) => crate::cgroup::try_charge_swap(cid),
+            None => true,
+        }
+    }
+
+    fn uncharge_swap(&self, n: u64) {
+        if let Some(cid) = &*self.container.lock() {
+            crate::cgroup::uncharge_swap(cid, n);
         }
     }
 
@@ -378,8 +403,12 @@ impl AddressSpace {
         drop(regions);
         let mut va = start;
         let mut freed = 0u64;
+        let mut swapped = 0u64;
         while va < end {
-            if let Some((phys, fl)) = unsafe { paging::unmap_4k(self.pml4, va) } {
+            if free_swap_entry(self.pml4, va) {
+                // A swapped page: its slot is released; nothing resident to free.
+                swapped += 1;
+            } else if let Some((phys, fl)) = unsafe { paging::unmap_4k(self.pml4, va) } {
                 if fl & flags::PRESENT != 0 {
                     frame::page_put(phys);
                     freed += 1;
@@ -389,6 +418,7 @@ impl AddressSpace {
             va += PAGE_SIZE;
         }
         self.uncharge_pages(freed);
+        self.uncharge_swap(swapped);
         Ok(())
     }
 
@@ -542,6 +572,24 @@ impl AddressSpace {
         self.ensure_page(page, &r, write)
     }
 
+    /// Make every page of `[addr, addr+len)` present (allocating, or swapping
+    /// back in) so a subsequent direct kernel copy cannot fault. This is how
+    /// `uaccess` guarantees a user pointer is resolvable: an unresolvable page
+    /// (bad pointer, or a swap-in that fails under pressure) returns EFAULT here
+    /// instead of taking a kernel-mode fault that no fixup would catch.
+    pub fn fault_in_range(&self, addr: usize, len: usize, write: bool) -> KResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = addr.checked_add(len).ok_or(Errno::EFAULT)?;
+        let mut page = align_down(addr, PAGE_SIZE);
+        while page < end {
+            self.fault_in(page, write)?;
+            page += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
     fn ensure_page(&self, page: usize, r: &Region, write: bool) -> KResult<()> {
         unsafe {
             if let Some(e) = paging::leaf_entry(self.pml4, page) {
@@ -551,12 +599,20 @@ impl AddressSpace {
                     }
                     return Ok(());
                 }
+                // A swapped-out page: read it back from the swap device.
+                if *e & PTE_SWAPPED != 0 {
+                    return self.swap_in(page, e, r);
+                }
             }
         }
         // About to commit a new page into this space — charge the memory cgroup
-        // (per-space, so it balances with the uncharge on unmap/teardown).
+        // (per-space, so it balances with the uncharge on unmap/teardown). Under
+        // a full cgroup, reclaim (which uncharges swapped pages) may free budget.
         if !self.charge_page() {
-            return Err(Errno::ENOMEM);
+            self.reclaim(RECLAIM_BATCH);
+            if !self.charge_page() {
+                return Err(Errno::ENOMEM);
+            }
         }
         // Shared anonymous page: resolve it through the shared object so every
         // mapping (and every process after fork) sees the same frame. Keyed by
@@ -571,7 +627,13 @@ impl AddressSpace {
                     p
                 }
                 None => {
-                    let p = frame::alloc_user_page().ok_or(Errno::ENOMEM)?; // the object's reference
+                    let p = match self.alloc_pressure() {
+                        Some(p) => p,
+                        None => {
+                            self.uncharge_pages(1);
+                            return Err(Errno::ENOMEM);
+                        }
+                    }; // the object's reference
                     pages.insert(off, p);
                     frame::page_get(p); // this page table's reference
                     p
@@ -585,7 +647,13 @@ impl AddressSpace {
             cpu::invlpg(page);
             return Ok(());
         }
-        let phys = frame::alloc_user_page().ok_or(Errno::ENOMEM)?;
+        let phys = match self.alloc_pressure() {
+            Some(p) => p,
+            None => {
+                self.uncharge_pages(1);
+                return Err(Errno::ENOMEM);
+            }
+        };
         // File-backed page: fill from the file (zero tail past `length`).
         if let Some(b) = &r.backing {
             let page_off = (page - r.start) as u64;
@@ -622,6 +690,160 @@ impl AddressSpace {
             frame::page_put(old);
         }
         Ok(())
+    }
+
+    /// Read a swapped-out page back into a fresh frame and restore its PTE. The
+    /// leaf entry `e` currently holds the swap slot; on success it becomes a
+    /// present mapping again and the slot is freed. The page has already been
+    /// charged? No — swap-in charges here (a swapped page was uncharged on evict).
+    fn swap_in(&self, page: usize, e: *mut u64, r: &Region) -> KResult<()> {
+        let slot = (unsafe { *e } >> 12) as usize;
+        if !self.charge_page() {
+            self.reclaim(RECLAIM_BATCH);
+            if !self.charge_page() {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let phys = match self.alloc_pressure() {
+            Some(p) => p,
+            None => {
+                self.uncharge_pages(1);
+                return Err(Errno::ENOMEM);
+            }
+        };
+        // Read the slot straight into the new frame via the kernel direct map.
+        let dst = unsafe { &mut *(super::phys_to_virt(phys) as *mut [u8; PAGE_SIZE]) };
+        if !swap::read_slot(slot, dst) {
+            frame::page_put(phys);
+            self.uncharge_pages(1);
+            return Err(Errno::EIO);
+        }
+        let fl = to_page_flags(r.prot);
+        unsafe {
+            paging::map_4k(self.pml4, page, phys, fl, &mut alloc_table).map_err(map_err)?;
+        }
+        cpu::invlpg(page);
+        swap::free_slot(slot);
+        self.uncharge_swap(1); // the page is resident again, no longer in swap
+        Ok(())
+    }
+
+    /// Allocate a user frame, reclaiming (swapping out cold pages) once if the
+    /// allocator is exhausted, then retrying.
+    fn alloc_pressure(&self) -> Option<PhysAddr> {
+        if let Some(p) = frame::alloc_user_page() {
+            return Some(p);
+        }
+        self.reclaim(RECLAIM_BATCH);
+        frame::alloc_user_page()
+    }
+
+    /// Reclaim up to `target` anonymous-private pages of this space by writing
+    /// them to swap. Returns the number actually evicted (0 if swap is off).
+    ///
+    /// Two passes guarantee forward progress: the first honours the ACCESSED bit
+    /// (a second chance for recently-used pages), and if that frees too few, a
+    /// second pass evicts regardless — so a workload that just touched every page
+    /// can still be reclaimed instead of wedging the fault path.
+    fn reclaim(&self, target: u64) -> u64 {
+        if !swap::enabled() {
+            return 0;
+        }
+        let mut freed = self.reclaim_pass(target, false);
+        if freed < target {
+            freed += self.reclaim_pass(target - freed, true);
+        }
+        freed
+    }
+
+    fn reclaim_pass(&self, target: u64, force: bool) -> u64 {
+        let regions = self.regions.lock().clone();
+        let mut freed = 0u64;
+        // Only writable anonymous-private memory (heap, stack, data) is swapped.
+        // Executable/read-only pages — including a statically-loaded program's
+        // own code — are left resident so the running program is never paged out
+        // from under its own instruction fetches.
+        for r in regions.iter().filter(|r| r.backing.is_none() && r.shared.is_none() && r.prot.contains(Prot::WRITE)) {
+            let mut va = r.start;
+            while va < r.end {
+                if freed >= target {
+                    return freed;
+                }
+                if self.try_evict(va, force) {
+                    freed += 1;
+                }
+                va += PAGE_SIZE;
+            }
+        }
+        freed
+    }
+
+    /// Try to evict one anonymous-private page at `va` to swap. Only a present,
+    /// singly-owned, non-COW page whose ACCESSED bit is clear is taken; a page
+    /// touched since the last pass gets a second chance (its ACCESSED bit is
+    /// cleared and it is skipped). The page's contents are written to swap while
+    /// the mapping stays live, and the PTE is only replaced if the page was not
+    /// written during the (sleeping) I/O — so a concurrent write is never lost.
+    fn try_evict(&self, va: usize, force: bool) -> bool {
+        let phys;
+        {
+            let _irq = cpu::IrqGuard::new();
+            let e = match unsafe { paging::leaf_entry(self.pml4, va) } {
+                Some(e) => e,
+                None => return false,
+            };
+            let pte = unsafe { *e };
+            if pte & flags::PRESENT == 0 || pte & flags::COW != 0 {
+                return false;
+            }
+            let p = paging::entry_addr(pte);
+            if frame::page_count(p) != 1 {
+                return false; // shared with another space (e.g. lingering COW)
+            }
+            if !force && pte & flags::ACCESSED != 0 {
+                // Recently used: clear the bit and give it another chance.
+                unsafe { *e = pte & !flags::ACCESSED };
+                cpu::invlpg(va);
+                return false;
+            }
+            // Clear DIRTY so a concurrent write during the I/O is detectable.
+            unsafe { *e = pte & !flags::DIRTY };
+            cpu::invlpg(va);
+            phys = p;
+        }
+        // Write the page out (may sleep); the mapping is still live and readable.
+        let slot = match swap::store_page(phys) {
+            Some(s) => s,
+            None => return false,
+        };
+        // Commit only if nothing wrote the page while it was being staged.
+        {
+            let _irq = cpu::IrqGuard::new();
+            let e = match unsafe { paging::leaf_entry(self.pml4, va) } {
+                Some(e) => e,
+                None => {
+                    swap::free_slot(slot);
+                    return false;
+                }
+            };
+            let pte = unsafe { *e };
+            if pte & flags::PRESENT == 0 || paging::entry_addr(pte) != phys || pte & flags::DIRTY != 0 {
+                swap::free_slot(slot);
+                return false;
+            }
+            // Charge the swap allowance; if memory+swap is exhausted, keep the
+            // page resident (reclaim then frees nothing → the fault OOMs, so a
+            // `-m` limit still bounds total memory).
+            if !self.charge_swap() {
+                swap::free_slot(slot);
+                return false;
+            }
+            unsafe { *e = ((slot as u64) << 12) | PTE_SWAPPED };
+            cpu::invlpg(va);
+        }
+        frame::page_put(phys);
+        self.uncharge_pages(1);
+        true
     }
 
     /// Handle a user page fault. Returns true if it was resolved.
@@ -662,6 +884,13 @@ impl AddressSpace {
             let is_shared = r.shared.is_some();
             let mut va = r.start;
             while va < r.end {
+                // A swapped page must be brought back into the parent first, so
+                // the child inherits its contents (no shared swap slots).
+                if let Some(e) = unsafe { paging::leaf_entry(self.pml4, va) } {
+                    if unsafe { *e } & flags::PRESENT == 0 && unsafe { *e } & PTE_SWAPPED != 0 {
+                        let _ = self.swap_in(va, e, r);
+                    }
+                }
                 unsafe {
                     if let Some(e) = paging::leaf_entry(self.pml4, va) {
                         if *e & flags::PRESENT != 0 {
@@ -729,6 +958,23 @@ fn alloc_table() -> Option<PhysAddr> {
     frame::alloc_zeroed(0)
 }
 
+/// If `va` holds a swapped-out entry, release its swap slot and clear the entry.
+/// Returns true if it was a swap entry (so the caller skips the resident-page
+/// path). A non-present entry that is left cleared costs nothing.
+fn free_swap_entry(pml4: PhysAddr, va: usize) -> bool {
+    unsafe {
+        if let Some(e) = paging::leaf_entry(pml4, va) {
+            let pte = *e;
+            if pte & flags::PRESENT == 0 && pte & PTE_SWAPPED != 0 {
+                swap::free_slot((pte >> 12) as usize);
+                *e = 0;
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn map_err(e: MapError) -> Errno {
     match e {
         MapError::OutOfMemory => Errno::ENOMEM,
@@ -741,10 +987,13 @@ impl Drop for AddressSpace {
         // Free every user page, then the lower-half page tables.
         let regions = core::mem::take(&mut *self.regions.lock());
         let mut freed = 0u64;
+        let mut swapped = 0u64;
         for r in regions {
             let mut va = r.start;
             while va < r.end {
-                if let Some((phys, fl)) = unsafe { paging::unmap_4k(self.pml4, va) } {
+                if free_swap_entry(self.pml4, va) {
+                    swapped += 1; // release its swap slot
+                } else if let Some((phys, fl)) = unsafe { paging::unmap_4k(self.pml4, va) } {
                     if fl & flags::PRESENT != 0 {
                         frame::page_put(phys);
                         freed += 1;
@@ -754,6 +1003,7 @@ impl Drop for AddressSpace {
             }
         }
         self.uncharge_pages(freed);
+        self.uncharge_swap(swapped);
         free_lower_tables(self.pml4);
         frame::free(self.pml4, 0);
     }
