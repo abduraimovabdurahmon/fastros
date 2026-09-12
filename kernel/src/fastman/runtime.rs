@@ -222,6 +222,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         container: Some(c.id.clone()),
         aspace: None,
         ignored: 0,
+        sigactions: crate::proc::signal::default_table(),
         vfork: false,
     };
     let child = proc::start_user(spawn, space, frame)?;
@@ -384,6 +385,7 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         container: Some(c.id.clone()),
         aspace: None,
         ignored: 0,
+        sigactions: crate::proc::signal::default_table(),
         vfork: false,
     };
     let child = proc::start_user(spawn, space, frame)?;

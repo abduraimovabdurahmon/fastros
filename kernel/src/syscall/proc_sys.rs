@@ -4,6 +4,7 @@ use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::syscall::UserFrame;
 use crate::errno::{Errno, KResult};
 use crate::proc::{self, ExitStatus, Spawn, WaitFor};
+use crate::sched;
 use crate::sync::{SpinLock, WaitQueue, WaitResult};
 use crate::uaccess;
 use alloc::collections::BTreeMap;
@@ -22,6 +23,88 @@ pub fn umask(mask: u16) -> KResult<usize> {
 
 pub fn exit(code: i32, _group: bool) -> ! {
     proc::exit_current(ExitStatus::Exited(code));
+}
+
+// ── signal dispositions and masks ────────────────────────────────────────────
+
+use crate::proc::signal::{self, SigAction};
+
+/// `rt_sigaction(sig, act, oact, sigsetsize)`. The kernel ABI struct is
+/// {handler, flags, restorer, mask} — 32 bytes.
+pub fn rt_sigaction(sig: u32, act: usize, oact: usize, _sigsetsize: usize) -> KResult<usize> {
+    if sig < 1 || sig > 64 {
+        return Err(Errno::EINVAL);
+    }
+    let me = proc::current();
+    let prev = me.sigactions.lock()[sig as usize];
+    if oact != 0 {
+        uaccess::write_obj(oact, &prev.handler)?;
+        uaccess::write_obj(oact + 8, &prev.flags)?;
+        uaccess::write_obj(oact + 16, &prev.restorer)?;
+        uaccess::write_obj(oact + 24, &prev.mask)?;
+    }
+    if act != 0 {
+        // SIGKILL and SIGSTOP cannot be caught or ignored.
+        if sig == signal::SIGKILL || sig == signal::SIGSTOP {
+            return Err(Errno::EINVAL);
+        }
+        let na = SigAction {
+            handler: uaccess::read_obj(act)?,
+            flags: uaccess::read_obj(act + 8)?,
+            restorer: uaccess::read_obj(act + 16)?,
+            mask: uaccess::read_obj(act + 24)?,
+        };
+        me.sigactions.lock()[sig as usize] = na;
+        // Keep the fast-path "ignored" bitmask in sync so that a signal set to
+        // SIG_IGN (or SIG_DFL for a default-ignored signal) is dropped at post
+        // time, and a real handler re-enables posting.
+        let bit = 1u64 << (sig - 1);
+        let ignore = na.handler == signal::SIG_IGN || (na.handler == signal::SIG_DFL && signal::ignored_by_default(sig));
+        if ignore {
+            me.ignored.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            me.ignored.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+    Ok(0)
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
+pub fn rt_sigprocmask(how: i32, set: usize, oldset: usize, _sigsetsize: usize) -> KResult<usize> {
+    const SIG_BLOCK: i32 = 0;
+    const SIG_UNBLOCK: i32 = 1;
+    const SIG_SETMASK: i32 = 2;
+    let old = sched::with_current(|t| t.blocked());
+    if oldset != 0 {
+        uaccess::write_obj(oldset, &old)?;
+    }
+    if set != 0 {
+        let m: u64 = uaccess::read_obj(set)?;
+        let new = match how {
+            SIG_BLOCK => old | m,
+            SIG_UNBLOCK => old & !m,
+            SIG_SETMASK => m,
+            _ => return Err(Errno::EINVAL),
+        };
+        sched::with_current(|t| t.set_blocked(new));
+    }
+    Ok(0)
+}
+
+/// `rt_sigreturn`: restore the context a signal handler was set up over, and the
+/// blocked mask that was in force before the handler ran. Rewrites `frame` in
+/// place; the returned value becomes the resumed `rax`.
+pub fn rt_sigreturn(frame: &mut UserFrame) -> u64 {
+    let mut regs = signal::Regs::from_user(frame);
+    match signal::restore_frame(&mut regs) {
+        Ok(mask) => {
+            sched::with_current(|t| t.set_blocked(mask));
+            regs.store_user(frame);
+            regs.rax
+        }
+        // A corrupt sigframe means the process trampled its own stack: kill it.
+        Err(_) => proc::exit_current(ExitStatus::Signaled(signal::SIGSEGV)),
+    }
 }
 
 // ── interval timers (SIGALRM) ────────────────────────────────────────────────
@@ -182,6 +265,18 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
     let (new_space, new_frame) = proc::elf::load(&ctx, &data, &argv, &envp)?;
     // Point of no return: swap the address space and run the new image.
     me.fds.lock().close_on_exec();
+    // execve resets caught signals to their default; SIG_IGN dispositions and
+    // the blocked mask (per-task) persist across exec, as on Linux.
+    {
+        let ign = me.ignored.load(Ordering::Relaxed);
+        let mut t = me.sigactions.lock();
+        *t = signal::default_table();
+        for sig in 1..=64u32 {
+            if ign & (1 << (sig - 1)) != 0 {
+                t[sig as usize].handler = signal::SIG_IGN;
+            }
+        }
+    }
     *me.aspace.lock() = Some(new_space.clone());
     me.set_comm(path.rsplit('/').next().unwrap_or(&path));
     me.set_cmdline(argv);
@@ -219,6 +314,36 @@ pub fn wait4(pid: i64, status: usize, _options: i32, _rusage: usize) -> KResult<
 pub fn kill(pid: i64, sig: u32) -> KResult<usize> {
     proc::kill(&proc::current(), pid, sig)?;
     Ok(0)
+}
+
+/// `tkill(tid, sig)`: signal a single thread. Our processes are single-threaded
+/// (pid == tid), so a tid names its process; `raise`/`pthread_kill` land here.
+pub fn tkill(tid: i32, sig: u32) -> KResult<usize> {
+    if tid <= 0 || sig > 64 {
+        return Err(Errno::EINVAL);
+    }
+    let p = proc::find(tid as u32).ok_or(Errno::ESRCH)?;
+    if sig != 0 {
+        p.signal(sig);
+    }
+    Ok(0)
+}
+
+/// `tgkill(tgid, tid, sig)`: the thread-group form `raise()` actually uses.
+pub fn tgkill(_tgid: i32, tid: i32, sig: u32) -> KResult<usize> {
+    tkill(tid, sig)
+}
+
+/// `pause`: sleep until a signal arrives, then return EINTR (the pending signal
+/// is acted on at the syscall-return boundary).
+pub fn pause() -> KResult<usize> {
+    loop {
+        if sched::with_current(|t| t.signal_pending()) {
+            return Err(Errno::EINTR);
+        }
+        // Wakes early when a signal is delivered (send_signal wakes the task).
+        let _ = sched::sleep_ms(3_600_000);
+    }
 }
 
 // ── info ───────────────────────────────────────────────────────────────────

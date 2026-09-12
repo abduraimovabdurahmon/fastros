@@ -30,14 +30,19 @@ pub fn dispatch(frame: &mut UserFrame) {
     let a = frame.args();
     let r = handle(nr, a, frame);
     frame.rax = r;
-    // A signal that arrived during the call (or the EINTR it caused) may be
-    // fatal with no handler: act on it before returning to ring 3.
-    proc::deliver_user_signals();
+    // A signal that arrived during the call may run a user handler (which
+    // rewrites the frame to enter it) or, with no handler, take a fatal default
+    // action before returning to ring 3.
+    let mut regs = proc::signal::Regs::from_user(frame);
+    proc::deliver_user_signals(&mut regs);
+    regs.store_user(frame);
     // Give up the CPU if this task has used its slice, so a syscall-heavy loop
     // is as fair as a compute loop preempted by the timer.
     if crate::sched::need_resched() {
         crate::sched::schedule();
-        proc::deliver_user_signals();
+        let mut regs = proc::signal::Regs::from_user(frame);
+        proc::deliver_user_signals(&mut regs);
+        regs.store_user(frame);
     }
 }
 
@@ -161,6 +166,9 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         60 => proc_sys::exit(a[0] as i32, false),
         61 => ret(proc_sys::wait4(a[0] as i64, a[1] as usize, a[2] as i32, a[3] as usize)),
         62 => ret(proc_sys::kill(a[0] as i64, a[1] as u32)),
+        34 => ret(proc_sys::pause()),
+        200 => ret(proc_sys::tkill(a[0] as i32, a[1] as u32)),
+        234 => ret(proc_sys::tgkill(a[0] as i32, a[1] as i32, a[2] as u32)),
         63 => ret(proc_sys::uname(a[0] as usize)),
         96 => ret(proc_sys::gettimeofday(a[0] as usize, a[1] as usize)),
         99 => ret(proc_sys::sysinfo(a[0] as usize)),
@@ -194,10 +202,13 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         231 => proc_sys::exit(a[0] as i32, true),
         318 => ret(proc_sys::getrandom(a[0] as usize, a[1] as usize, a[2] as u32)),
 
-        // rt_sigaction, rt_sigprocmask, sigaltstack, set_robust_list, prlimit64,
-        // rseq, prctl, sched_setaffinity, fadvise64: accepted as no-ops so libc
-        // starts.
-        13 | 14 | 131 | 273 | 334 | 157 | 203 | 221 => 0,
+        // ── signal dispositions ──
+        13 => ret(proc_sys::rt_sigaction(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as usize)),
+        14 => ret(proc_sys::rt_sigprocmask(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize)),
+        15 => proc_sys::rt_sigreturn(frame),
+        // sigaltstack, set_robust_list, rseq, prctl, sched_setaffinity,
+        // fadvise64: accepted as no-ops so libc starts.
+        131 | 273 | 334 | 157 | 203 | 221 => 0,
         97 => ret(proc_sys::getrlimit(a[0] as u32, a[1] as usize)),
         160 => 0, // setrlimit: accepted, not enforced
         302 => ret(proc_sys::prlimit64(a[0] as i32, a[1] as u32, a[2] as usize, a[3] as usize)),

@@ -69,6 +69,9 @@ pub struct Task {
     wake_at: AtomicU64,
     /// Pending signals, one bit per signal number (1..=64 → bit n-1).
     signals: AtomicU64,
+    /// Blocked signals (`sigprocmask`); a pending blocked signal is not
+    /// delivered until unblocked. SIGKILL/SIGSTOP can never be blocked.
+    blocked: AtomicU64,
     pub exit_code: AtomicI32,
     exited: AtomicBool,
     /// Woken when the task exits (join).
@@ -123,6 +126,14 @@ impl Task {
     }
     pub fn pending_signals(&self) -> u64 {
         self.signals.load(Ordering::Acquire)
+    }
+    pub fn blocked(&self) -> u64 {
+        self.blocked.load(Ordering::Acquire)
+    }
+    /// Set the blocked mask (SIGKILL/SIGSTOP can never be blocked).
+    pub fn set_blocked(&self, mask: u64) {
+        let cant_block = (1 << (crate::proc::signal::SIGKILL - 1)) | (1 << (crate::proc::signal::SIGSTOP - 1));
+        self.blocked.store(mask & !cant_block, Ordering::Release);
     }
     /// Take (clear) one pending signal, lowest number first.
     pub fn take_signal(&self) -> Option<u32> {
@@ -220,6 +231,7 @@ fn new_task(tid: Tid, name: &str, stack: Option<KernelStack>, stack_top: usize, 
         entry: SpinLock::new(entry),
         wake_at: AtomicU64::new(0),
         signals: AtomicU64::new(0),
+        blocked: AtomicU64::new(0),
         exit_code: AtomicI32::new(0),
         exited: AtomicBool::new(false),
         exit_wq: WaitQueue::new(),

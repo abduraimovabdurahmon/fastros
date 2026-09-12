@@ -99,6 +99,9 @@ pub struct Process {
     /// Signals set to SIG_IGN (bit n-1 for signal n); inherited by children,
     /// as ignored dispositions survive fork and exec on Linux.
     pub ignored: AtomicU64,
+    /// Per-process signal dispositions (user handlers). Shared by all threads,
+    /// inherited across fork, reset to default (except ignores) across execve.
+    pub sigactions: SpinLock<signal::SigTable>,
     /// CPU time of the process when it exited.
     pub cpu_at_exit: AtomicU64,
     /// CPU time of reaped children and their descendants (cutime).
@@ -216,6 +219,7 @@ pub fn init(ns: Arc<MountNamespace>) {
             container: SpinLock::new(None),
             aspace: SpinLock::new(None),
             ignored: AtomicU64::new(0),
+            sigactions: SpinLock::new(signal::default_table()),
             cpu_at_exit: AtomicU64::new(0),
             children_cpu: AtomicU64::new(0),
             vfork_wq: WaitQueue::new(),
@@ -283,6 +287,8 @@ pub struct Spawn {
     pub aspace: Option<Arc<AddressSpace>>,
     /// Ignored signals (SIG_IGN), normally the parent's.
     pub ignored: u64,
+    /// Signal handler dispositions, inherited across fork.
+    pub sigactions: signal::SigTable,
     /// This child is a `vfork`/`posix_spawn` child: it must release the blocked
     /// parent when it execs or exits.
     pub vfork: bool,
@@ -306,6 +312,7 @@ impl Spawn {
             container: parent.container.lock().clone(),
             aspace: None,
             ignored: parent.ignored.load(Ordering::Relaxed),
+            sigactions: *parent.sigactions.lock(),
             vfork: false,
         }
     }
@@ -346,6 +353,7 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         container: SpinLock::new(s.container),
         aspace: SpinLock::new(s.aspace),
         ignored: AtomicU64::new(s.ignored),
+        sigactions: SpinLock::new(s.sigactions),
         cpu_at_exit: AtomicU64::new(0),
         children_cpu: AtomicU64::new(0),
         vfork_wq: WaitQueue::new(),
@@ -520,24 +528,65 @@ pub fn signal_current(sig: u32) {
 /// handler: a fatal default action terminates the process. (User-installed
 /// handlers are not supported yet, so every non-ignored signal is fatal.)
 /// Called from the syscall and interrupt return paths.
-pub fn deliver_user_signals() {
+pub fn deliver_user_signals(regs: &mut signal::Regs) {
     // Only meaningful for user processes.
     if current_aspace().is_none() {
         return;
     }
-    let pending = sched::with_current(|t| t.pending_signals());
-    if pending == 0 {
-        return;
-    }
-    for sig in 1..=64u32 {
-        if pending & (1 << (sig - 1)) == 0 {
-            continue;
+    loop {
+        let (pending, blocked) = sched::with_current(|t| (t.pending_signals(), t.blocked()));
+        // SIGKILL/SIGSTOP can never be blocked.
+        let deliverable = pending & !blocked;
+        if deliverable == 0 {
+            return;
         }
-        if signal::terminates_by_default(sig) {
+        let sig = deliverable.trailing_zeros() + 1;
+        if sig == signal::SIGKILL {
             exit_current(ExitStatus::Signaled(sig));
         }
-        // Ignored / stop signals: consume them so they don't spin.
+        // Consume this pending signal (clear_signal keeps SIGKILL, handled above).
         sched::with_current(|t| t.clear_signal(sig));
+        let act = current().sigactions.lock()[sig as usize];
+        match act.handler {
+            signal::SIG_IGN => continue,
+            signal::SIG_DFL => {
+                if signal::ignored_by_default(sig) || signal::stops_by_default(sig) {
+                    continue;
+                }
+                if signal::terminates_by_default(sig) {
+                    exit_current(ExitStatus::Signaled(sig));
+                }
+                continue;
+            }
+            _ => {
+                // A user handler with no restorer trampoline cannot be entered
+                // safely; fall back to the default action.
+                if act.restorer == 0 {
+                    if signal::terminates_by_default(sig) {
+                        exit_current(ExitStatus::Signaled(sig));
+                    }
+                    continue;
+                }
+                match signal::setup_frame(regs, sig, &act, blocked) {
+                    Ok(new) => {
+                        *regs = new;
+                        let mut newmask = blocked | act.mask;
+                        if act.flags & signal::SA_NODEFER == 0 {
+                            newmask |= 1 << (sig - 1);
+                        }
+                        sched::with_current(|t| t.set_blocked(newmask));
+                        if act.flags & signal::SA_RESETHAND != 0 {
+                            current().sigactions.lock()[sig as usize] = signal::SigAction::DFL;
+                        }
+                        // One handler per return-to-user boundary; the rest stay
+                        // pending and are delivered after this one's sigreturn.
+                        return;
+                    }
+                    // The user stack is unusable: nothing to catch this with.
+                    Err(_) => exit_current(ExitStatus::Signaled(signal::SIGSEGV)),
+                }
+            }
+        }
     }
 }
 

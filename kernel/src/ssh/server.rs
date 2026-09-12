@@ -847,6 +847,7 @@ impl Conn {
             container: None,
             aspace: None,
             ignored: 0,
+            sigactions: crate::proc::signal::default_table(),
             vfork: false,
         };
         let interactive = command.is_none() && tty_for_proc.is_some();

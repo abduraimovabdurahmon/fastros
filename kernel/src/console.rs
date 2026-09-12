@@ -81,6 +81,7 @@ pub fn start_getty() {
             container: None,
             aspace: None,
             ignored: 0,
+            sigactions: crate::proc::signal::default_table(),
             vfork: false,
         };
         let u = user.clone();

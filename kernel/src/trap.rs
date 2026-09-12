@@ -42,10 +42,14 @@ pub fn dispatch(tf: &mut TrapFrame) {
     // `tf` on this task's kernel stack, so `schedule()` may switch away and
     // resume us here later, and the user holds no kernel spinlocks.
     if tf.from_user() {
-        crate::proc::deliver_user_signals();
+        let mut regs = crate::proc::signal::Regs::from_trap(tf);
+        crate::proc::deliver_user_signals(&mut regs);
+        regs.store_trap(tf);
         if crate::sched::need_resched() {
             crate::sched::schedule();
-            crate::proc::deliver_user_signals();
+            let mut regs = crate::proc::signal::Regs::from_trap(tf);
+            crate::proc::deliver_user_signals(&mut regs);
+            regs.store_trap(tf);
         }
     }
 }
