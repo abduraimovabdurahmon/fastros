@@ -30,39 +30,65 @@ fn install(f: Arc<dyn File>, cloexec: bool) -> KResult<usize> {
 
 // ── sockaddr_in <-> IpEndpoint ──────────────────────────────────────────────
 
-/// Parse a `struct sockaddr_in` (16 bytes) from user memory.
+/// Parse a `struct sockaddr_in` (16 bytes) or `sockaddr_in6` (28 bytes) from
+/// user memory, dispatching on the address family.
 fn read_sockaddr(addr: usize, len: usize) -> KResult<IpEndpoint> {
-    if addr == 0 || len < 16 {
+    if addr == 0 || len < 2 {
+        return Err(Errno::EINVAL);
+    }
+    let family: u16 = uaccess::read_obj(addr)?;
+    if family == sockfile::AF_INET6 {
+        // sockaddr_in6 { u16 family; u16 port; u32 flowinfo; u8 addr[16]; u32 scope }.
+        if len < 24 {
+            return Err(Errno::EINVAL);
+        }
+        let mut b = [0u8; 24];
+        uaccess::copy_from(addr, &mut b)?;
+        let port = u16::from_be_bytes([b[2], b[3]]);
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&b[8..24]);
+        return Ok(IpEndpoint::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(a)), port));
+    }
+    if family != sockfile::AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if len < 16 {
         return Err(Errno::EINVAL);
     }
     let mut b = [0u8; 16];
     uaccess::copy_from(addr, &mut b)?;
-    let family = u16::from_ne_bytes([b[0], b[1]]);
-    if family != sockfile::AF_INET {
-        return Err(Errno::EAFNOSUPPORT);
-    }
     let port = u16::from_be_bytes([b[2], b[3]]);
     let ip = IpAddress::v4(b[4], b[5], b[6], b[7]);
     Ok(IpEndpoint::new(ip, port))
 }
 
-/// Write a `struct sockaddr_in` back to user memory, honouring the caller's
-/// buffer length and updating the `addrlen` out-parameter.
+/// Write a `struct sockaddr_in`/`sockaddr_in6` back to user memory, honouring
+/// the caller's buffer length and updating the `addrlen` out-parameter. The form
+/// written matches the endpoint's address family.
 fn write_sockaddr(ep: IpEndpoint, addr: usize, addrlen: usize) -> KResult<()> {
     if addr == 0 || addrlen == 0 {
         return Ok(());
     }
-    let mut b = [0u8; 16];
-    b[0..2].copy_from_slice(&sockfile::AF_INET.to_ne_bytes());
-    b[2..4].copy_from_slice(&ep.port.to_be_bytes());
-    let octets = match ep.addr {
-        IpAddress::Ipv4(a) => a.octets(),
+    let (buf, full): (Vec<u8>, u32) = match ep.addr {
+        IpAddress::Ipv4(a) => {
+            let mut b = alloc::vec![0u8; 16];
+            b[0..2].copy_from_slice(&sockfile::AF_INET.to_ne_bytes());
+            b[2..4].copy_from_slice(&ep.port.to_be_bytes());
+            b[4..8].copy_from_slice(&a.octets());
+            (b, 16)
+        }
+        IpAddress::Ipv6(a) => {
+            let mut b = alloc::vec![0u8; 28];
+            b[0..2].copy_from_slice(&sockfile::AF_INET6.to_ne_bytes());
+            b[2..4].copy_from_slice(&ep.port.to_be_bytes());
+            b[8..24].copy_from_slice(&a.octets());
+            (b, 28)
+        }
     };
-    b[4..8].copy_from_slice(&octets);
     let cap: u32 = uaccess::read_obj(addrlen)?;
-    let n = (cap as usize).min(b.len());
-    uaccess::copy_to(addr, &b[..n])?;
-    uaccess::write_obj(addrlen, &(16u32))?;
+    let n = (cap as usize).min(buf.len());
+    uaccess::copy_to(addr, &buf[..n])?;
+    uaccess::write_obj(addrlen, &full)?;
     Ok(())
 }
 
@@ -112,7 +138,7 @@ pub fn socket(domain: i32, ty: i32, _protocol: i32) -> KResult<usize> {
         }
         return install(UnixSocketFile::new(nonblock), cloexec);
     }
-    if domain != sockfile::AF_INET as i32 {
+    if domain != sockfile::AF_INET as i32 && domain != sockfile::AF_INET6 as i32 {
         return Err(Errno::EAFNOSUPPORT);
     }
     let dgram = match ty & 0xff {

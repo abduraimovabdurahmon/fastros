@@ -194,6 +194,7 @@ fn ms_str(ns: u64) -> String {
 fn fmt_addr(a: IpAddress) -> String {
     match a {
         IpAddress::Ipv4(v) => dns::fmt(v),
+        IpAddress::Ipv6(v) => alloc::format!("{v}"),
     }
 }
 
@@ -441,6 +442,7 @@ fn ep_str(ep: Option<(IpAddress, u16)>, numeric: bool, listen: bool) -> String {
             let host = match a {
                 IpAddress::Ipv4(v) if v.octets() == [0, 0, 0, 0] => if numeric { "0.0.0.0".to_string() } else { "*".to_string() },
                 IpAddress::Ipv4(v) => dns::fmt(v),
+                IpAddress::Ipv6(v) => alloc::format!("{v}"),
             };
             let port = if p == 0 || (listen && p == 0) { "*".to_string() } else { p.to_string() };
             alloc::format!("{host}:{port}")

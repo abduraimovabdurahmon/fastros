@@ -29,7 +29,7 @@ use device::PhysDevice;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address};
 
 pub use smoltcp::wire::{IpAddress, IpEndpoint};
 
@@ -128,16 +128,28 @@ pub fn ephemeral_port() -> u16 {
     }
 }
 
+/// Which interface addresses survive a DHCP (re)configuration: IPv4 loopback and
+/// every static IPv6 address (loopback ::1, the ULA, the link-local). Only the
+/// dynamic IPv4 address is replaced — dropping the IPv6 set would strip the ULA
+/// that AF_INET6 loopback traffic relies on for source selection and routing.
+fn keep_static_addr(c: &IpCidr) -> bool {
+    match c.address() {
+        IpAddress::Ipv4(v) => v.octets()[0] == 127,
+        IpAddress::Ipv6(_) => true,
+    }
+}
+
 impl Stack {
     fn sync_local_ips(&mut self) {
-        self.dev.local_ips = self
-            .iface
-            .ip_addrs()
-            .iter()
-            .filter_map(|c| match c.address() {
-                IpAddress::Ipv4(a) => Some(a),
-            })
-            .collect();
+        let addrs = self.iface.ip_addrs();
+        self.dev.local_ips = addrs.iter().filter_map(|c| match c.address() {
+            IpAddress::Ipv4(a) => Some(a),
+            _ => None,
+        }).collect();
+        self.dev.local_ips6 = addrs.iter().filter_map(|c| match c.address() {
+            IpAddress::Ipv6(a) => Some(a),
+            _ => None,
+        }).collect();
         let ips: Vec<[u8; 4]> = self.dev.local_ips.iter().map(|a| a.octets()).collect();
         crate::firewall::set_local_ips(&ips);
     }
@@ -185,7 +197,7 @@ impl Stack {
             None if self.cfg.dhcp => {
                 crate::kwarn!("net", "DHCP lease lost");
                 self.cfg.dhcp = false;
-                self.iface.update_ip_addrs(|a| a.retain(|c| matches!(c.address(), IpAddress::Ipv4(v) if v.octets()[0] == 127)));
+                self.iface.update_ip_addrs(|a| a.retain(|c| keep_static_addr(c)));
                 self.iface.routes_mut().remove_default_ipv4_route();
                 self.cfg.addr = None;
                 self.cfg.gateway = None;
@@ -199,7 +211,7 @@ impl Stack {
     /// Replace the interface address (keeps 127.0.0.1/8) and default route.
     pub fn set_address(&mut self, addr: Ipv4Cidr, gw: Option<Ipv4Address>) {
         self.iface.update_ip_addrs(|a| {
-            a.retain(|c| matches!(c.address(), IpAddress::Ipv4(v) if v.octets()[0] == 127));
+            a.retain(|c| keep_static_addr(c));
             let _ = a.push(IpCidr::Ipv4(addr));
         });
         self.iface.routes_mut().remove_default_ipv4_route();
@@ -279,6 +291,16 @@ pub fn init() {
     let mut iface = Interface::new(config, &mut dev, now());
     iface.update_ip_addrs(|a| {
         let _ = a.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+        // IPv6 loopback (::1) so AF_INET6 sockets work over loopback; a unique
+        // link-local (fe80::) lets the stack speak IPv6 on the wire via NDP.
+        // smoltcp refuses to route to ::1 (it has no loopback interface), so a
+        // stable ULA (fd00::1) is what AF_INET6 loopback traffic actually rides
+        // — resolved locally via NDP and looped back in the device.
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128));
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), 64));
+        let mac = dev.mac();
+        let ll = Ipv6Address::new(0xfe80, 0, 0, 0, ((mac[0] as u16 ^ 0x02) << 8) | mac[1] as u16, ((mac[2] as u16) << 8) | 0xff, 0xfe00 | mac[3] as u16, ((mac[4] as u16) << 8) | mac[5] as u16);
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(ll), 64));
     });
     let mut sockets = SocketSet::new(vec![]);
     let dhcp = dev.has_nic().then(|| sockets.add(dhcpv4::Socket::new()));

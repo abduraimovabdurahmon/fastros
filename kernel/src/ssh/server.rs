@@ -30,6 +30,7 @@ static PREAUTH: AtomicUsize = AtomicUsize::new(0);
 fn peer_ip(ep: &IpEndpoint) -> [u8; 4] {
     match ep.addr {
         IpAddress::Ipv4(a) => a.octets(),
+        IpAddress::Ipv6(_) => [0, 0, 0, 0],
     }
 }
 

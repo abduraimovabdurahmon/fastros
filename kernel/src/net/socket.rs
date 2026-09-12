@@ -57,7 +57,12 @@ impl TcpStream {
     pub fn connect(remote: IpEndpoint, timeout_ms: u64) -> KResult<TcpStream> {
         let h = {
             let mut st = stack().lock();
-            if st.cfg.addr.is_none() && !matches!(remote.addr, IpAddress::Ipv4(a) if a.octets()[0] == 127) {
+            // Loopback destinations are reachable even without a configured
+            // address: IPv4 127/8, IPv6 ::1, and our own ULA (fd00::/8) which is
+            // where AF_INET6 loopback traffic rides.
+            let loopback = matches!(remote.addr, IpAddress::Ipv4(a) if a.octets()[0] == 127)
+                || matches!(remote.addr, IpAddress::Ipv6(a) if a == smoltcp::wire::Ipv6Address::LOCALHOST || a.octets()[0] == 0xfd);
+            if st.cfg.addr.is_none() && !loopback {
                 return Err(Errno::ENETUNREACH);
             }
             let mut sock = new_tcp_socket();
@@ -472,7 +477,7 @@ pub struct TcpRow {
 fn hex_ep(addr: Option<IpAddress>, port: u16) -> alloc::string::String {
     let v = match addr {
         Some(IpAddress::Ipv4(a)) => u32::from_le_bytes(a.octets()),
-        None => 0,
+        _ => 0, // IPv6 sockets are not rendered in the IPv4 /proc/net/tcp table
     };
     alloc::format!("{:08X}:{:04X}", v, port)
 }

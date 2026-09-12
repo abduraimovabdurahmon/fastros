@@ -13,11 +13,15 @@ use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use smoltcp::wire::Ipv4Address;
+use smoltcp::wire::{Ipv4Address, Ipv6Address};
 
 const ETH_HDR: usize = 14;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
+const ETHERTYPE_IPV6: u16 = 0x86dd;
+const IPPROTO_ICMPV6: u8 = 58;
+const ICMPV6_NS: u8 = 135; // Neighbor Solicitation
+const ICMPV6_NA: u8 = 136; // Neighbor Advertisement
 
 pub struct PhysDevice {
     nic: Option<Box<dyn NetDevice>>,
@@ -25,6 +29,7 @@ pub struct PhysDevice {
     loopback: VecDeque<Vec<u8>>,
     /// Our addresses (kept in sync with the interface by the stack).
     pub local_ips: Vec<Ipv4Address>,
+    pub local_ips6: Vec<Ipv6Address>,
     rx_buf: Vec<u8>,
     pub lo_stats: NetStats,
     pub filtered_in: u64,
@@ -39,6 +44,7 @@ impl PhysDevice {
             mac,
             loopback: VecDeque::new(),
             local_ips: Vec::new(),
+            local_ips6: Vec::new(),
             rx_buf: vec![0; 2048],
             lo_stats: NetStats::default(),
             filtered_in: 0,
@@ -63,6 +69,62 @@ impl PhysDevice {
 
     fn is_local(&self, ip: Ipv4Address) -> bool {
         ip.octets()[0] == 127 || self.local_ips.contains(&ip)
+    }
+
+    fn is_local6(&self, ip: Ipv6Address) -> bool {
+        ip == Ipv6Address::LOCALHOST || self.local_ips6.contains(&ip)
+    }
+
+    /// Answer an IPv6 Neighbor Solicitation for one of our own addresses locally
+    /// (the mirror of the ARP reply above), so smoltcp can resolve the next hop
+    /// for a loopback IPv6 exchange without any real neighbour on the wire. A
+    /// solicitation from the unspecified address (`::`, i.e. DAD) is ignored so
+    /// our own address configuration is never seen as a duplicate.
+    fn ndp_reply(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        // Ethernet + IPv6(40) + ICMPv6 NS: type(1) code(1) csum(2) resv(4) target(16).
+        if frame.len() < ETH_HDR + 40 + 24 {
+            return None;
+        }
+        let ip = &frame[ETH_HDR..];
+        if ip[6] != IPPROTO_ICMPV6 {
+            return None;
+        }
+        let icmp = &frame[ETH_HDR + 40..];
+        if icmp[0] != ICMPV6_NS {
+            return None;
+        }
+        let src = ipv6(&ip[8..24]);
+        let target = ipv6(&icmp[8..24]);
+        if src.is_unspecified() || !self.is_local6(target) {
+            return None;
+        }
+        // Build the Neighbor Advertisement: reply unicast to the solicitor.
+        let mut out = vec![0u8; ETH_HDR + 40 + 32];
+        // Ethernet.
+        out[0..6].copy_from_slice(&frame[6..12]); // to solicitor's MAC
+        out[6..12].copy_from_slice(&self.mac);
+        out[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        // IPv6 header.
+        let payload_len: u16 = 32;
+        out[ETH_HDR] = 0x60; // version 6
+        out[ETH_HDR + 4..ETH_HDR + 6].copy_from_slice(&payload_len.to_be_bytes());
+        out[ETH_HDR + 6] = IPPROTO_ICMPV6;
+        out[ETH_HDR + 7] = 255; // hop limit
+        out[ETH_HDR + 8..ETH_HDR + 24].copy_from_slice(&target.octets()); // src = target
+        out[ETH_HDR + 24..ETH_HDR + 40].copy_from_slice(&src.octets()); // dst = solicitor
+        // ICMPv6 Neighbor Advertisement.
+        let na = ETH_HDR + 40;
+        out[na] = ICMPV6_NA;
+        out[na + 4] = 0x60; // flags: solicited + override
+        out[na + 8..na + 24].copy_from_slice(&target.octets());
+        // Target link-layer address option (type 2, len 1).
+        out[na + 24] = 2;
+        out[na + 25] = 1;
+        out[na + 26..na + 32].copy_from_slice(&self.mac);
+        // ICMPv6 checksum over the pseudo-header + message.
+        let csum = icmpv6_checksum(&target.octets(), &src.octets(), &out[na..na + 32]);
+        out[na + 2..na + 4].copy_from_slice(&csum.to_be_bytes());
+        Some(out)
     }
 
     /// Decide where an outgoing frame goes: back to us, or out of the NIC.
@@ -94,6 +156,22 @@ impl PhysDevice {
         if ethertype == ETHERTYPE_IPV4 && frame.len() >= ETH_HDR + 20 {
             let dst = ip4(&frame[ETH_HDR + 16..ETH_HDR + 20]);
             if self.is_local(dst) {
+                self.lo_stats.tx_packets += 1;
+                self.lo_stats.tx_bytes += frame.len() as u64;
+                self.lo_stats.rx_packets += 1;
+                self.lo_stats.rx_bytes += frame.len() as u64;
+                self.loopback.push_back(frame);
+                return;
+            }
+        }
+        if ethertype == ETHERTYPE_IPV6 && frame.len() >= ETH_HDR + 40 {
+            // Answer NDP for our own addresses ourselves (loopback resolution).
+            if let Some(na) = self.ndp_reply(&frame) {
+                self.loopback.push_back(na);
+                return;
+            }
+            let dst = ipv6(&frame[ETH_HDR + 24..ETH_HDR + 40]);
+            if self.is_local6(dst) {
                 self.lo_stats.tx_packets += 1;
                 self.lo_stats.tx_bytes += frame.len() as u64;
                 self.lo_stats.rx_packets += 1;
@@ -164,4 +242,35 @@ impl phy::Device for PhysDevice {
 
 fn ip4(b: &[u8]) -> Ipv4Address {
     Ipv4Address::new(b[0], b[1], b[2], b[3])
+}
+
+fn ipv6(b: &[u8]) -> Ipv6Address {
+    let mut a = [0u8; 16];
+    a.copy_from_slice(&b[..16]);
+    Ipv6Address::from(a)
+}
+
+/// The ICMPv6 checksum: a 16-bit ones-complement sum over the IPv6 pseudo-header
+/// (src, dst, upper-layer length, next-header = 58) followed by the message.
+fn icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], msg: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut add = |b: &[u8]| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            sum += u16::from_be_bytes([b[i], b[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < b.len() {
+            sum += (b[i] as u32) << 8;
+        }
+    };
+    add(src);
+    add(dst);
+    add(&(msg.len() as u32).to_be_bytes());
+    add(&[0, 0, 0, IPPROTO_ICMPV6]);
+    add(msg);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }

@@ -21,6 +21,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 /// Type flags OR-ed into the `socket()`/`accept4()` type argument.

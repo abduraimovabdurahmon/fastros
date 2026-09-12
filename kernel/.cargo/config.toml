@@ -3,6 +3,14 @@
 [build]
 target = "x86_64-unknown-none"
 
+# smoltcp sizes its interface tables at compile time (build.rs reads these).
+# The default of 2 addresses is too few: we carry IPv4 loopback + a DHCP/static
+# IPv4 address + IPv6 loopback (::1) + a ULA + a link-local. Raise the caps so
+# every address is actually assigned (extra pushes are otherwise dropped).
+[env]
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "8"
+SMOLTCP_IFACE_MAX_ROUTE_COUNT = "4"
+
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
