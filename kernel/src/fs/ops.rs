@@ -128,6 +128,12 @@ pub fn access(ctx: &Ctx, path: &str, mask: u32) -> KResult<()> {
 }
 
 pub fn mkdir(ctx: &Ctx, path: &str, mode: u16) -> KResult<()> {
+    // The root always exists; `mkdir /` is EEXIST, not EBUSY. `mkdir -p` walks
+    // every path prefix (busybox starts at `/`) and only tolerates EEXIST, so
+    // this is what lets `mkdir -p /a/b/c` work inside a container.
+    if path.trim_matches('/').is_empty() {
+        return Err(Errno::EEXIST);
+    }
     let (dir, name) = ctx.resolve_parent(path)?;
     if is_dot(&name) {
         return Err(Errno::EEXIST);
