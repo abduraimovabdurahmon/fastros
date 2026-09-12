@@ -39,6 +39,7 @@ mod proc;
 mod sched;
 mod syscall;
 mod shell;
+mod ftpd;
 mod ssh;
 mod sync;
 mod sysfs;
