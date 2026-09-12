@@ -8,6 +8,7 @@
 //! have changed a socket's state.
 
 pub mod device;
+pub mod ftp;
 pub mod http;
 pub mod tls;
 pub mod dns;

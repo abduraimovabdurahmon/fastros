@@ -10,6 +10,7 @@ pub mod fileops;
 pub mod files;
 pub mod findutils;
 pub mod fmtutil;
+pub mod ftp;
 pub mod grep;
 pub mod http;
 pub mod net;
@@ -47,6 +48,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("clear", basic::clear, "clear the terminal screen", ""),
     cmd!("cp", fileops::cp, "copy files and directories", "[-rapfinvuls] SOURCE... DEST"),
     cmd!("curl", http::curl, "transfer data from or to a server", "[-sSLIifO] [-X METHOD] [-H HEADER] [-d DATA] [-o FILE] [-w FMT] URL..."),
+    cmd!("ftp", ftp::ftp, "FTP client (ls/get/put or interactive)", "ls|get|put ftp://[user[:pass]@]host[:port]/path | HOST [PORT]"),
     cmd!("cut", textutils::cut, "remove sections from each line", "-b|-c|-f LIST [-d DELIM] [FILE]..."),
     cmd!("date", sysutil::date, "print or set the system date and time", "[-uR] [-d STRING] [-s STRING] [-I[FMT]] [+FORMAT]"),
     cmd!("df", sysutil::df, "report file system disk space usage", "[-ahHiTP] [-t TYPE] [-x TYPE] [-B SIZE] [FILE]..."),
