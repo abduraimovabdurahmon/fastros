@@ -195,6 +195,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         102 | 107 => proc::current().cred().uid as u64,
         104 | 108 => proc::current().cred().gid as u64,
         110 => proc::current_ppid_vpid() as u64,
+        98 => ret(proc_sys::getrusage(a[0] as i32, a[1] as usize)),
         111 => proc::current().pgid.load(core::sync::atomic::Ordering::Relaxed) as u64,
         112 => ret(proc_sys::setsid()),
         124 => proc::current().sid.load(core::sync::atomic::Ordering::Relaxed) as u64, // getsid

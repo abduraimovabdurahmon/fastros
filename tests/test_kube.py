@@ -21,7 +21,10 @@ int main(int argc, char **argv){
     int ls=socket(AF_INET,SOCK_STREAM,0); int one=1; setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=htonl(INADDR_ANY);
     if(bind(ls,(void*)&a,sizeof a)){perror("bind");return 1;} listen(ls,16);
-    char b[64]; int bn=snprintf(b,sizeof b,"kube pod alive pid=%d\n",(int)getpid());
+    /* Per-pod identity is the actual (remapped) bound port, unique per replica —
+       getpid() is 1 for every pod now that each is in its own PID namespace. */
+    struct sockaddr_in la; socklen_t ll=sizeof la; getsockname(ls,(void*)&la,&ll);
+    char b[64]; int bn=snprintf(b,sizeof b,"kube pod alive port=%d\n",(int)ntohs(la.sin_port));
     char r[192];
     int rn=snprintf(r,sizeof r,"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",bn,b);
     for(;;){int c=accept(ls,0,0); if(c<0)continue; char x[512]; read(c,x,sizeof x); write(c,r,rn); close(c);}
@@ -283,12 +286,12 @@ def test_kube_service_load_balancing(g, kube_setup):
             line = [l for l in pods.splitlines() if l.startswith(p)]
             assert line and "Running" in line[0], pods
         # Hit the Service repeatedly; collect the answering pids.
-        pids = set()
+        ports = set()
         for _ in range(12):
             out = g.out("curl -s -m 5 http://127.0.0.1:8090/", timeout=10)
-            m = re.search(r"pid=(\d+)", out)
+            m = re.search(r"port=(\d+)", out)
             if m:
-                pids.add(m.group(1))
-        assert len(pids) >= 2, f"expected load-balancing across pods, saw pids={pids}"
+                ports.add(m.group(1))
+        assert len(ports) >= 2, f"expected load-balancing across pods, saw ports={ports}"
     finally:
         g.run("fastman kube delete lb 2>/dev/null; true")

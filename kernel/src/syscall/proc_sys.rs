@@ -332,6 +332,25 @@ pub fn wait4(pid: i64, status: usize, options: i32, _rusage: usize) -> KResult<u
     }
 }
 
+/// `getrusage(who, usage)`: fill a `struct rusage` (144 bytes) with the CPU time
+/// and peak RSS. Zero-filling it fixes programs (postgres) that print garbage
+/// deltas when the call is a no-op.
+pub fn getrusage(who: i32, usage: usize) -> KResult<usize> {
+    const RUSAGE_CHILDREN: i32 = -1;
+    let p = proc::current();
+    let cpu_ns = if who == RUSAGE_CHILDREN { p.children_cpu.load(Ordering::Relaxed) } else { p.cpu_ns() };
+    let sec = (cpu_ns / 1_000_000_000) as i64;
+    let usec = ((cpu_ns % 1_000_000_000) / 1000) as i64;
+    let maxrss_kb = p.aspace.lock().as_ref().map(|a| a.rss_bytes() / 1024).unwrap_or(0) as i64;
+    let mut buf = [0u8; 144];
+    buf[0..8].copy_from_slice(&sec.to_le_bytes()); // ru_utime.tv_sec
+    buf[8..16].copy_from_slice(&usec.to_le_bytes()); // ru_utime.tv_usec
+    // ru_stime stays 0 (we bill everything as user time).
+    buf[32..40].copy_from_slice(&maxrss_kb.to_le_bytes()); // ru_maxrss (KiB)
+    uaccess::copy_to(usage, &buf)?;
+    Ok(0)
+}
+
 pub fn kill(pid: i64, sig: u32) -> KResult<usize> {
     // In a PID namespace, a positive pid is a vpid → translate to the global id
     // (so `kill 1` in a container hits its init, never the host's).

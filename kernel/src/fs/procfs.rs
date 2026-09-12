@@ -796,7 +796,15 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
     match f {
         "stat" => {
             let flags: u32 = if kthread { 0x0020_0040 } else { 0x0040_0100 };
-            let (vsize, rss) = if kthread { (0, 0) } else { (stack_bytes, stack_bytes / 4096) };
+            // Report the real address-space size and resident pages of a user
+            // process (kernel stacks included); kernel threads have neither.
+            let (vsize, rss) = if kthread {
+                (0, 0)
+            } else if let Some(asp) = p.as_ref().and_then(|p| p.aspace.lock().clone()) {
+                (asp.virt_bytes() + stack_bytes, asp.rss_bytes() / 4096 + stack_bytes / 4096)
+            } else {
+                (stack_bytes, stack_bytes / 4096)
+            };
             let _ = writeln!(
                 s,
                 "{dpid} ({comm}) {state} {dppid} {pgid} {sid} {tty_nr} {tpgid} {flags} 0 0 0 0 {utime} {stime} {cutime} 0 20 0 {nthreads} 0 {} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",

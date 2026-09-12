@@ -14,7 +14,7 @@ use crate::arch::{cpu, trap::TrapFrame};
 use crate::errno::{Errno, KResult};
 use crate::fs::file::File;
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -131,6 +131,8 @@ pub struct AddressSpace {
     mmap_top: SpinLock<usize>,
     /// The container this address space is charged to (memory cgroup), if any.
     container: SpinLock<Option<alloc::string::String>>,
+    /// Resident pages committed in this space (for RSS reporting).
+    committed: AtomicU64,
 }
 
 /// Base of the mmap region (below the stack), matching a small ASLR-free
@@ -165,6 +167,7 @@ impl AddressSpace {
             brk_base: AtomicUsize::new(0),
             mmap_top: SpinLock::new(MMAP_TOP),
             container: SpinLock::new(None),
+            committed: AtomicU64::new(0),
         }))
     }
 
@@ -177,15 +180,33 @@ impl AddressSpace {
         *self.container.lock() = cid;
     }
 
-    /// Charge one page to the cgroup; false → over the memory limit (ENOMEM).
+    /// Resident memory in bytes (committed pages) — for RSS reporting.
+    pub fn rss_bytes(&self) -> u64 {
+        self.committed.load(Ordering::Relaxed) * PAGE_SIZE as u64
+    }
+
+    /// Total mapped (virtual) size in bytes — the sum of the regions.
+    pub fn virt_bytes(&self) -> u64 {
+        self.regions.lock().iter().map(|r| (r.end - r.start) as u64).sum()
+    }
+
+    /// Charge one page (to the cgroup and the RSS counter); false → over the
+    /// memory limit (ENOMEM).
     fn charge_page(&self) -> bool {
-        match &*self.container.lock() {
-            Some(cid) => crate::cgroup::try_charge_page(cid),
-            None => true,
+        if let Some(cid) = &*self.container.lock() {
+            if !crate::cgroup::try_charge_page(cid) {
+                return false;
+            }
         }
+        self.committed.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn uncharge_pages(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.committed.fetch_sub(n.min(self.committed.load(Ordering::Relaxed)), Ordering::Relaxed);
         if let Some(cid) = &*self.container.lock() {
             crate::cgroup::uncharge_pages(cid, n);
         }
