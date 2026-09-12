@@ -23,7 +23,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::arch::x86_64::syscall::{enter_user, UserFrame};
 use crate::mm::aspace::AddressSpace;
 use fdtable::FdTable;
@@ -102,6 +102,10 @@ pub struct Process {
     pub cpu_at_exit: AtomicU64,
     /// CPU time of reaped children and their descendants (cutime).
     pub children_cpu: AtomicU64,
+    /// A `vfork`/`posix_spawn` parent blocks on this until the child execs or
+    /// exits; the child then releases it. Set at birth for a vfork child.
+    pub vfork_wq: WaitQueue,
+    pub vfork_pending: AtomicBool,
 }
 
 static PROCS: SpinLock<BTreeMap<Pid, Arc<Process>>> = SpinLock::new(BTreeMap::new());
@@ -119,6 +123,13 @@ impl Process {
     }
     pub fn cmdline(&self) -> Vec<String> {
         self.cmdline.lock().clone()
+    }
+    /// Release a `vfork`/`posix_spawn` parent blocked on this child (called when
+    /// the child execs — its address space has diverged — or exits).
+    pub fn vfork_release(&self) {
+        if self.vfork_pending.swap(false, Ordering::AcqRel) {
+            self.vfork_wq.wake_all();
+        }
     }
     pub fn set_cmdline(&self, args: Vec<String>) {
         *self.cmdline.lock() = args;
@@ -206,6 +217,8 @@ pub fn init(ns: Arc<MountNamespace>) {
             ignored: AtomicU64::new(0),
             cpu_at_exit: AtomicU64::new(0),
             children_cpu: AtomicU64::new(0),
+            vfork_wq: WaitQueue::new(),
+            vfork_pending: AtomicBool::new(false),
         })
     });
 }
@@ -269,6 +282,9 @@ pub struct Spawn {
     pub aspace: Option<Arc<AddressSpace>>,
     /// Ignored signals (SIG_IGN), normally the parent's.
     pub ignored: u64,
+    /// This child is a `vfork`/`posix_spawn` child: it must release the blocked
+    /// parent when it execs or exits.
+    pub vfork: bool,
 }
 
 impl Spawn {
@@ -289,6 +305,7 @@ impl Spawn {
             container: parent.container.lock().clone(),
             aspace: None,
             ignored: parent.ignored.load(Ordering::Relaxed),
+            vfork: false,
         }
     }
 }
@@ -330,6 +347,8 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         ignored: AtomicU64::new(s.ignored),
         cpu_at_exit: AtomicU64::new(0),
         children_cpu: AtomicU64::new(0),
+        vfork_wq: WaitQueue::new(),
+        vfork_pending: AtomicBool::new(s.vfork),
     });
     PROCS.lock().insert(pid, p.clone());
     s.parent.children.lock().push(p.clone());
@@ -373,6 +392,9 @@ pub fn exit_current(status: ExitStatus) -> ! {
         _ => status,
     };
     me.cpu_at_exit.store(me.cpu_ns(), Ordering::Relaxed);
+    // A vfork/posix_spawn child that exits without exec'ing still frees its
+    // parent.
+    me.vfork_release();
     me.fds.lock().clear();
     *me.ctty.lock() = None;
     *me.exit.lock() = Some(status);

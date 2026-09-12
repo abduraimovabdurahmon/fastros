@@ -43,14 +43,39 @@ pub fn fork(frame: &UserFrame) -> KResult<usize> {
 }
 
 const CLONE_VM: u64 = 0x100;
+const CLONE_VFORK: u64 = 0x4000;
 
-/// A subset of `clone`: without CLONE_VM it is `fork`. Thread creation
-/// (CLONE_VM, shared address space) is not supported yet.
-pub fn clone(flags: u64, _stack: u64, frame: &UserFrame) -> KResult<usize> {
-    if flags & CLONE_VM != 0 {
+/// `clone`. Plain `fork` semantics (a private, copy-on-write child) unless the
+/// caller asks for the `vfork`/`posix_spawn` pattern (CLONE_VM|CLONE_VFORK): the
+/// child runs on the provided stack and the parent is suspended until the child
+/// execs or exits. We honour that by making a normal COW child on the given
+/// stack and blocking the parent — functionally identical to vfork for its only
+/// real use (a child that only rearranges fds and immediately execs), without
+/// the hazard of two tasks sharing one address space.
+pub fn clone(flags: u64, stack: u64, frame: &UserFrame) -> KResult<usize> {
+    let vfork = flags & CLONE_VFORK != 0;
+    if flags & CLONE_VM != 0 && !vfork {
+        // Shared-address-space threads are not supported.
         return Err(Errno::ENOSYS);
     }
-    fork(frame)
+    let parent = proc::current();
+    let aspace = parent.aspace.lock().clone().ok_or(Errno::ENOSYS)?;
+    let child_space = aspace.fork()?;
+    let mut spawn = Spawn::from_parent(&parent, &parent.comm(), parent.cmdline());
+    spawn.vfork = vfork;
+    let mut child_frame = *frame;
+    child_frame.rax = 0;
+    if stack != 0 {
+        child_frame.rsp = stack;
+    }
+    let fs_base = crate::sched::with_current(|t| t.fs_base.load(core::sync::atomic::Ordering::Relaxed));
+    let child = proc::start_user_with(spawn, child_space, child_frame, fs_base)?;
+    if vfork {
+        // Suspend until the child execs (its address space diverges) or exits.
+        let c = child.clone();
+        let _ = c.vfork_wq.wait_until_interruptible(|| (!c.vfork_pending.load(core::sync::atomic::Ordering::Acquire) || c.is_zombie()).then_some(()), None);
+    }
+    Ok(child.pid as usize)
 }
 
 // ── execve ─────────────────────────────────────────────────────────────────
@@ -106,6 +131,8 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, 0) };
     new_space.activate();
     *frame = new_frame;
+    // The address space has diverged from any vfork/posix_spawn parent: free it.
+    me.vfork_release();
     Ok(0)
 }
 
