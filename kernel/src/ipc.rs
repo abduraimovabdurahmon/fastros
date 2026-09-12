@@ -36,14 +36,57 @@ struct ShmSeg {
 
 /// id → segment.
 static SEGS: SpinLock<BTreeMap<i32, Arc<ShmSeg>>> = SpinLock::new(BTreeMap::new());
-/// live attachments: (address-space pml4, attach address) → (id, size).
-static ATTACH: SpinLock<Vec<(u64, usize, i32, usize)>> = SpinLock::new(Vec::new());
+
+/// One live attachment.
+struct Attach {
+    pid: u32,
+    addr: usize,
+    shmid: i32,
+    size: usize,
+}
+/// Live attachments, so a segment's `nattch` can be decremented when a process
+/// detaches — or exits without detaching (the common case for a crash/kill).
+static ATTACH: SpinLock<Vec<Attach>> = SpinLock::new(Vec::new());
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
 
-fn aspace_key() -> KResult<(Arc<crate::mm::aspace::AddressSpace>, u64)> {
-    let sp = crate::proc::current_aspace().ok_or(Errno::EACCES)?;
-    let key = sp.pml4() as u64;
-    Ok((sp, key))
+fn current_space() -> KResult<Arc<crate::mm::aspace::AddressSpace>> {
+    crate::proc::current_aspace().ok_or(Errno::EACCES)
+}
+
+/// Drop `nattch` for one shmid; delete the segment if it hit zero and was
+/// already marked removed (IPC_RMID).
+fn detach_seg(shmid: i32) {
+    // Bind the lookup out of the lock first: an `if let SEGS.lock()...` would
+    // hold the guard across the whole block, and the inner remove would deadlock.
+    let seg = SEGS.lock().get(&shmid).cloned();
+    if let Some(seg) = seg {
+        if seg.nattch.fetch_sub(1, Ordering::AcqRel) == 1 && seg.removed.load(Ordering::Relaxed) {
+            SEGS.lock().remove(&shmid);
+        }
+    }
+}
+
+/// Release every System V shm attachment held by a process that is exiting.
+/// Without this a killed process (a postgres backend, or initdb's `--single`
+/// phases) would leave `nattch > 0` forever, and the next postmaster would
+/// refuse to start ("pre-existing shared memory block ... still in use").
+pub fn exit_process(pid: u32) {
+    let mut mine = Vec::new();
+    {
+        let mut att = ATTACH.lock();
+        let mut i = 0;
+        while i < att.len() {
+            if att[i].pid == pid {
+                let a = att.remove(i);
+                mine.push(a.shmid);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for shmid in mine {
+        detach_seg(shmid);
+    }
 }
 
 pub fn shmget(key: i32, size: usize, shmflg: i32) -> KResult<usize> {
@@ -79,7 +122,8 @@ pub fn shmget(key: i32, size: usize, shmflg: i32) -> KResult<usize> {
 
 pub fn shmat(shmid: i32, addr: usize, shmflg: i32) -> KResult<usize> {
     let seg = SEGS.lock().get(&shmid).cloned().ok_or(Errno::EINVAL)?;
-    let (sp, key) = aspace_key()?;
+    let sp = current_space()?;
+    let pid = crate::proc::current().pid;
     let prot = if shmflg & SHM_RDONLY != 0 {
         crate::mm::aspace::Prot::READ
     } else {
@@ -87,22 +131,21 @@ pub fn shmat(shmid: i32, addr: usize, shmflg: i32) -> KResult<usize> {
     };
     let va = sp.attach_shared(addr, seg.size, prot, seg.obj.clone())?;
     seg.nattch.fetch_add(1, Ordering::AcqRel);
-    ATTACH.lock().push((key, va, shmid, seg.size));
+    ATTACH.lock().push(Attach { pid, addr: va, shmid, size: seg.size });
     Ok(va)
 }
 
 pub fn shmdt(addr: usize) -> KResult<usize> {
-    let (sp, key) = aspace_key()?;
-    let mut att = ATTACH.lock();
-    let idx = att.iter().position(|&(k, a, _, _)| k == key && a == addr).ok_or(Errno::EINVAL)?;
-    let (_, _, shmid, size) = att.remove(idx);
-    drop(att);
+    let sp = current_space()?;
+    let pid = crate::proc::current().pid;
+    let (shmid, size) = {
+        let mut att = ATTACH.lock();
+        let idx = att.iter().position(|a| a.pid == pid && a.addr == addr).ok_or(Errno::EINVAL)?;
+        let a = att.remove(idx);
+        (a.shmid, a.size)
+    };
     let _ = sp.unmap(addr, size);
-    if let Some(seg) = SEGS.lock().get(&shmid).cloned() {
-        if seg.nattch.fetch_sub(1, Ordering::AcqRel) == 1 && seg.removed.load(Ordering::Relaxed) {
-            SEGS.lock().remove(&shmid);
-        }
-    }
+    detach_seg(shmid);
     Ok(0)
 }
 

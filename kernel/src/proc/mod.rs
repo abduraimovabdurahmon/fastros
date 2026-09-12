@@ -420,6 +420,7 @@ pub fn exit_current(status: ExitStatus) -> ! {
     // parent.
     me.vfork_release();
     itimer::clear(me.pid);
+    crate::ipc::exit_process(me.pid);
     me.fds.lock().clear();
     *me.ctty.lock() = None;
     *me.exit.lock() = Some(status);

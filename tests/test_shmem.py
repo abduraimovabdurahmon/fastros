@@ -91,6 +91,54 @@ def sysvshm_bin():
     return _compile(SYSVSHM)
 
 
+# A child that attaches a SysV segment and exits WITHOUT detaching must have its
+# attachment released by the kernel on exit — exercises the process-exit cleanup
+# path (which once deadlocked the kernel by re-locking the segment table).
+SYSVEXIT = r"""
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/wait.h>
+int main(void){
+    int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT|0600);
+    if (id < 0){ perror("shmget"); return 1; }
+    volatile long *m = shmat(id, 0, 0);          // parent attaches
+    if (m == (void*)-1){ perror("shmat"); return 1; }
+    for (int k = 0; k < 3; k++){
+        pid_t pid = fork();
+        if (pid == 0){
+            volatile long *c = shmat(id, 0, 0);  // child attaches, never detaches
+            if (c == (void*)-1) _exit(2);
+            c[0] = k;
+            _exit(0);                            // exit with segment still attached
+        }
+        int st; waitpid(pid, &st, 0);
+    }
+    struct shmid_ds ds;
+    shmctl(id, IPC_STAT, &ds);
+    printf("after 3 children: nattch=%lu\n", (unsigned long)ds.shm_nattch);
+    shmdt((void*)m);
+    shmctl(id, IPC_RMID, 0);
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def sysvexit_bin():
+    return _compile(SYSVEXIT)
+
+
+def test_sysv_exit_releases_attachment(g, sysvexit_bin):
+    g.ok("base64 -d > /tmp/sysvexit && chmod +x /tmp/sysvexit",
+         stdin=base64.b64encode(sysvexit_bin).decode())
+    out, err, st = g.run("fexec /tmp/sysvexit")
+    # Only the parent remains attached after each child exits (no leak, no panic).
+    assert "after 3 children: nattch=1" in out, out + err
+    assert st == 0
+
+
 def test_sysv_shared_memory(g, sysvshm_bin):
     g.ok("base64 -d > /tmp/sysvshm && chmod +x /tmp/sysvshm",
          stdin=base64.b64encode(sysvshm_bin).decode())
