@@ -48,7 +48,10 @@ pub fn mmap(addr: u64, len: usize, prot: u32, flags: u32, fd: i32, off: u64) -> 
     } else {
         None
     };
-    space.mmap(addr as usize, len, p, flags & MAP_FIXED != 0, file)
+    // MAP_SHARED|MAP_ANONYMOUS is genuinely shared (across fork): a database's
+    // main shared memory. A shared *file* mapping stays private for now.
+    let shared = flags & MAP_SHARED != 0 && flags & MAP_ANONYMOUS != 0;
+    space.mmap(addr as usize, len, p, flags & MAP_FIXED != 0, file, shared)
 }
 
 pub fn munmap(addr: usize, len: usize) -> KResult<usize> {

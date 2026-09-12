@@ -15,6 +15,7 @@ use crate::errno::{Errno, KResult};
 use crate::fs::file::File;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -74,8 +75,33 @@ fn shift_backing(b: &Option<FileBacking>, delta: usize) -> Option<FileBacking> {
     b.as_ref().map(|fb| fb.shifted(delta))
 }
 
-/// One contiguous mapping — a VMA. Either anonymous (demand-zeroed) or backed
-/// by a file (demand-filled, private). Every page is per-process private.
+/// A shared anonymous object: its pages are shared by every mapping of it,
+/// including across `fork`, so `MAP_SHARED | MAP_ANONYMOUS` memory is genuinely
+/// shared. This is what a database (postgres) and other IPC uses for its main
+/// shared-memory segment; combined with futexes keyed by physical frame, it
+/// gives working cross-process locks.
+pub struct SharedAnon {
+    /// page virtual address → backing frame (one owning reference each).
+    pages: SpinLock<BTreeMap<usize, PhysAddr>>,
+}
+
+impl SharedAnon {
+    fn new() -> Arc<SharedAnon> {
+        Arc::new(SharedAnon { pages: SpinLock::new(BTreeMap::new()) })
+    }
+}
+
+impl Drop for SharedAnon {
+    fn drop(&mut self) {
+        // Release the object's own reference to every frame it holds.
+        for phys in self.pages.get_mut().values() {
+            frame::page_put(*phys);
+        }
+    }
+}
+
+/// One contiguous mapping — a VMA. Anonymous private (demand-zeroed), file
+/// backed (demand-filled, private, copy-on-write), or shared anonymous.
 #[derive(Clone)]
 struct Region {
     start: usize,
@@ -85,6 +111,8 @@ struct Region {
     grows_down: bool,
     /// `Some` for a file-backed (MAP_PRIVATE) mapping.
     backing: Option<FileBacking>,
+    /// `Some` for a shared anonymous (`MAP_SHARED|MAP_ANONYMOUS`) mapping.
+    shared: Option<Arc<SharedAnon>>,
 }
 
 pub struct AddressSpace {
@@ -155,7 +183,22 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, end) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end, prot, grows_down, backing: None });
+        regions.push(Region { start, end, prot, grows_down, backing: None, shared: None });
+        Ok(())
+    }
+
+    /// Reserve a shared anonymous mapping (`MAP_SHARED|MAP_ANONYMOUS`): its
+    /// pages are shared across every mapping and across fork.
+    fn map_shared_region(&self, start: usize, end: usize, prot: Prot) -> KResult<()> {
+        let (start, end) = (align_down(start, PAGE_SIZE), align_up(end, PAGE_SIZE));
+        if start < USER_START || end > USER_END || start >= end {
+            return Err(Errno::EINVAL);
+        }
+        let mut regions = self.regions.lock();
+        if Self::overlaps(&regions, start, end) {
+            return Err(Errno::EEXIST);
+        }
+        regions.push(Region { start, end, prot, grows_down: false, backing: None, shared: Some(SharedAnon::new()) });
         Ok(())
     }
 
@@ -170,17 +213,18 @@ impl AddressSpace {
         if Self::overlaps(&regions, start, end) {
             return Err(Errno::EEXIST);
         }
-        regions.push(Region { start, end, prot, grows_down: false, backing: Some(FileBacking { file, offset, length }) });
+        regions.push(Region { start, end, prot, grows_down: false, backing: Some(FileBacking { file, offset, length }), shared: None });
         Ok(())
     }
 
     /// Place a mapping of `len` bytes, honouring a fixed `hint`. When `file`
     /// is `Some`, the mapping is private and filled from the file at `offset`.
-    pub fn mmap(&self, hint: usize, len: usize, prot: Prot, fixed: bool, file: Option<(Arc<dyn File>, u64)>) -> KResult<usize> {
+    pub fn mmap(&self, hint: usize, len: usize, prot: Prot, fixed: bool, file: Option<(Arc<dyn File>, u64)>, shared: bool) -> KResult<usize> {
         let len = align_up(len.max(1), PAGE_SIZE);
         let place = |this: &Self, start: usize| -> KResult<()> {
             match &file {
                 Some((f, off)) => this.map_file_region(start, start + len, prot, f.clone(), *off, len as u64),
+                None if shared => this.map_shared_region(start, start + len, prot),
                 None => this.map_region(start, start + len, prot, false),
             }
         };
@@ -261,7 +305,7 @@ impl AddressSpace {
                 out.push(Region { end: start, ..r.clone() });
             }
             let mid_start = start.max(r.start);
-            out.push(Region { start: mid_start, end: end.min(r.end), prot, grows_down: r.grows_down, backing: shift_backing(&r.backing, mid_start - r.start) });
+            out.push(Region { start: mid_start, end: end.min(r.end), prot, grows_down: r.grows_down, backing: shift_backing(&r.backing, mid_start - r.start), shared: r.shared.clone() });
             if end < r.end {
                 out.push(Region { start: end, backing: shift_backing(&r.backing, end - r.start), ..r.clone() });
             }
@@ -404,6 +448,30 @@ impl AddressSpace {
                 }
             }
         }
+        // Shared anonymous page: resolve it through the shared object so every
+        // mapping (and every process after fork) sees the same frame.
+        if let Some(sh) = &r.shared {
+            let mut pages = sh.pages.lock();
+            let phys = match pages.get(&page) {
+                Some(&p) => {
+                    frame::page_get(p); // this page table's reference
+                    p
+                }
+                None => {
+                    let p = frame::alloc_user_page().ok_or(Errno::ENOMEM)?; // the object's reference
+                    pages.insert(page, p);
+                    frame::page_get(p); // this page table's reference
+                    p
+                }
+            };
+            drop(pages);
+            let fl = to_page_flags(r.prot);
+            unsafe {
+                paging::map_4k(self.pml4, page, phys, fl, &mut alloc_table).map_err(map_err)?;
+            }
+            cpu::invlpg(page);
+            return Ok(());
+        }
         let phys = frame::alloc_user_page().ok_or(Errno::ENOMEM)?;
         // File-backed page: fill from the file (zero tail past `length`).
         if let Some(b) = &r.backing {
@@ -478,14 +546,17 @@ impl AddressSpace {
         let child = AddressSpace::new()?;
         let regions = self.regions.lock().clone();
         for r in &regions {
+            let is_shared = r.shared.is_some();
             let mut va = r.start;
             while va < r.end {
                 unsafe {
                     if let Some(e) = paging::leaf_entry(self.pml4, va) {
                         if *e & flags::PRESENT != 0 {
                             let phys = paging::entry_addr(*e);
-                            // Writable pages become read-only + COW in both copies.
-                            if *e & flags::WRITABLE != 0 {
+                            // Shared pages stay writable in both processes (that
+                            // is the point). Private writable pages become
+                            // read-only + copy-on-write in both copies.
+                            if !is_shared && *e & flags::WRITABLE != 0 {
                                 *e = (*e & !flags::WRITABLE) | flags::COW;
                                 cpu::invlpg(va);
                             }
@@ -527,7 +598,7 @@ impl AddressSpace {
             if let Some(r) = regions.iter_mut().find(|r| r.end == cur && r.start >= base && !r.grows_down) {
                 r.end = new;
             } else if !Self::overlaps(&regions, cur, new) {
-                regions.push(Region { start: base.max(cur), end: new, prot: Prot::READ | Prot::WRITE, grows_down: false, backing: None });
+                regions.push(Region { start: base.max(cur), end: new, prot: Prot::READ | Prot::WRITE, grows_down: false, backing: None, shared: None });
             } else {
                 return cur;
             }
