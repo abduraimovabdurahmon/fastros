@@ -799,7 +799,9 @@ fn logs(ctx: &mut Ctx, args: &[String]) -> i32 {
 }
 
 fn exec(ctx: &mut Ctx, args: &[String]) -> i32 {
-    // Skip -i/-t flags (accepted for compatibility; interactive TTY later).
+    // -i/-t/-it request an interactive session: wire the caller's terminal
+    // straight to the container command (so `sh`/`bash`/`psql` are usable).
+    let interactive = args.iter().any(|a| matches!(a.as_str(), "-i" | "-t" | "-it" | "-ti" | "--interactive" | "--tty"));
     let rest: Vec<String> = args.iter().filter(|a| !matches!(a.as_str(), "-i" | "-t" | "-it" | "-ti" | "--interactive" | "--tty")).cloned().collect();
     if rest.len() < 2 {
         return ctx.fail("exec requires a container and a command");
@@ -807,9 +809,27 @@ fn exec(ctx: &mut Ctx, args: &[String]) -> i32 {
     let name = rest[0].clone();
     let argv = rest[1..].to_vec();
     let fc = fs_ctx(ctx);
-    let tee = runtime::caller_stdout(&ctx.proc);
+    let itty = if interactive {
+        let fds = ctx.proc.fds.lock();
+        match (fds.get(0), fds.get(1), fds.get(2)) {
+            (Ok(stdin), Ok(stdout), Ok(stderr)) => {
+                drop(fds);
+                Some(runtime::ExecTty {
+                    stdin,
+                    stdout,
+                    stderr,
+                    tty: ctx.proc.ctty.lock().clone(),
+                    pgid: ctx.proc.pgid.load(core::sync::atomic::Ordering::Relaxed),
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let tee = if interactive { None } else { runtime::caller_stdout(&ctx.proc) };
     ctx.flush();
-    match runtime::exec(&fc, &name, argv, tee) {
+    match runtime::exec(&fc, &name, argv, tee, itty) {
         Ok(code) => code,
         Err(crate::errno::Errno::ENOTCONN) => ctx.fail(format!("container {name} is not running")),
         Err(e) => ctx.fail_errno("exec", e),

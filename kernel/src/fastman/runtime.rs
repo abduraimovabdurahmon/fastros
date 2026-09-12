@@ -343,7 +343,21 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool) -> KResult<()> {
 }
 
 /// `fastman exec`: run another program inside a running container.
-pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>) -> KResult<i32> {
+/// The caller's terminal, wired straight into an interactive (`-it`) exec so
+/// the container command reads keystrokes and writes to the real screen.
+pub struct ExecTty {
+    pub stdin: Arc<dyn File>,
+    pub stdout: Arc<dyn File>,
+    pub stderr: Arc<dyn File>,
+    /// The caller's controlling terminal (for window size, line discipline and
+    /// routing ^C to the foreground command), if it has one.
+    pub tty: Option<Arc<Tty>>,
+    /// The caller's process group, restored as the terminal's foreground group
+    /// once the interactive command exits.
+    pub pgid: u32,
+}
+
+pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>, itty: Option<ExecTty>) -> KResult<i32> {
     let c = super::container::find(ctx, name)?;
     if !c.is_alive() {
         return Err(Errno::ENOTCONN);
@@ -362,14 +376,24 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
     let (data, argv) = proc::elf::read_exec(&cctx, &real, &argv)?;
     let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
 
-    let (r, w) = pipe::pipe();
-    let r: Arc<dyn File> = r;
-    let w: Arc<dyn File> = w;
-    let null = crate::device::open_char(crate::fs::makedev(1, 3), flags::O_RDONLY)?;
     let mut fds = crate::proc::fdtable::FdTable::new();
-    fds.set(0, null, false);
-    fds.set(1, w.clone(), false);
-    fds.set(2, w, false);
+    // Interactive (`-it`): the container command owns the caller's terminal —
+    // stdin from the keyboard, stdout/stderr to the screen, no log capture.
+    // Otherwise stdin is /dev/null and output is teed to the caller and the log.
+    let (logger, interactive) = if let Some(t) = &itty {
+        fds.set(0, t.stdin.clone(), false);
+        fds.set(1, t.stdout.clone(), false);
+        fds.set(2, t.stderr.clone(), false);
+        (None, true)
+    } else {
+        let (r, w) = pipe::pipe();
+        let w: Arc<dyn File> = w;
+        let null = crate::device::open_char(crate::fs::makedev(1, 3), flags::O_RDONLY)?;
+        fds.set(0, null, false);
+        fds.set(1, w.clone(), false);
+        fds.set(2, w, false);
+        (Some(r as Arc<dyn File>), false)
+    };
     let spawn = Spawn {
         name: format!("exec:{}", c.name),
         args: argv,
@@ -378,9 +402,11 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         fs,
         fds,
         parent: crate::proc::kernel(),
+        // Interactive: its own foreground group under the caller's session, so
+        // ^C hits the command, not the fastman/shell waiting on it.
         pgid: None,
-        new_session: true,
-        ctty: None,
+        new_session: !interactive,
+        ctty: itty.as_ref().and_then(|t| t.tty.clone()),
         uts: crate::proc::kernel().uts.clone(),
         container: Some(c.id.clone()),
         aspace: None,
@@ -389,12 +415,24 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         vfork: false,
     };
     let child = proc::start_user(spawn, space, frame)?;
-    let pid = child.pid;
-    // Tee exec output straight to the caller (also captured in the log).
-    let logger = spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
-    let code = child.tasks().into_iter().next().map(|t| t.join()).unwrap_or(0);
-    logger.join();
-    let _ = pid;
+    let code = if let Some(t) = &itty {
+        // Hand the terminal to the interactive command, then take it back.
+        if let Some(tty) = &t.tty {
+            tty.set_fg_pgrp(child.pid);
+        }
+        let code = child.tasks().into_iter().next().map(|task| task.join()).unwrap_or(0);
+        if let Some(tty) = &t.tty {
+            tty.set_fg_pgrp(t.pgid);
+        }
+        code
+    } else {
+        // Tee exec output straight to the caller (also captured in the log).
+        let r = logger.unwrap();
+        let logger = spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
+        let code = child.tasks().into_iter().next().map(|task| task.join()).unwrap_or(0);
+        logger.join();
+        code
+    };
     Ok(code)
 }
 

@@ -41,6 +41,18 @@ SLEEPER = r"""
 int main(){ for(int i=0;;i++){ printf("tick %d\n", i); fflush(stdout); sleep(1);} }
 """
 
+# Reads stdin and echoes it back — proves `exec -it` wires the caller's stdin
+# (a non-interactive exec gives /dev/null, so this would read immediate EOF).
+CATR = r"""
+#include <stdio.h>
+#include <unistd.h>
+int main(){
+    char b[256]; int n = read(0, b, sizeof b);
+    if (n <= 0){ printf("STDIN_EOF\n"); return 0; }
+    printf("GOT:%.*s", n, b); return 0;
+}
+"""
+
 
 def _cc(src: str, out: str):
     with tempfile.TemporaryDirectory() as d:
@@ -58,6 +70,7 @@ def image_tar():
         _cc(HELLO, os.path.join(root, "bin", "hello"))
         _cc(PROBE, os.path.join(root, "bin", "probe"))
         _cc(SLEEPER, os.path.join(root, "bin", "sleeper"))
+        _cc(CATR, os.path.join(root, "bin", "catr"))
         open(os.path.join(root, "etc", "hostname"), "w").write("container-host\n")
         tar = os.path.join(d, "rootfs.tar.gz")
         subprocess.run(["tar", "czf", tar, "-C", root, "."], check=True)
@@ -120,6 +133,20 @@ def test_volume_bind(g, image):
     g.ok("mkdir -p /root/fmvol && echo hi > /root/fmvol/marker")
     out = g.ok(f"fastman run -v /root/fmvol:/data:ro {image} /bin/probe lsvol")
     assert "vol: marker" in out
+
+
+def test_exec_interactive_stdin(g, image):
+    # `fastman exec -it` must wire the caller's stdin to the container command.
+    # Before the fix stdin was /dev/null, so an interactive `sh` (or anything
+    # reading stdin) saw immediate EOF and exited doing nothing.
+    cid = g.ok(f"fastman run -d --name fmt_it {image} /bin/sleeper").strip()
+    import time
+    time.sleep(1)
+    try:
+        out = g.ok("fastman exec -it fmt_it /bin/catr", stdin="PING-42\n")
+        assert "GOT:PING-42" in out, out
+    finally:
+        g.run("fastman rm -f fmt_it")
 
 
 def test_rmi(g, image_tar):
