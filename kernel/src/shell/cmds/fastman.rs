@@ -183,6 +183,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "version" | "--version" | "-v" => version(ctx),
         "info" => info(ctx),
         "import" => import(ctx, &args[1..]),
+        "build" => build(ctx, &args[1..]),
         "images" | "image" | "ls" => images(ctx),
         "rmi" => rmi(ctx, &args[1..]),
         "run" => run(ctx, &args[1..]),
@@ -214,6 +215,7 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Images:"));
     outln!(ctx, "  import <name[:tag]>        import a rootfs tarball from stdin");
+    outln!(ctx, "  build -t <name[:tag]> -    build an image from a Dockerfile (context on stdin)");
     outln!(ctx, "  pull <ref>                 pull an image from a registry");
     outln!(ctx, "  images                     list images");
     outln!(ctx, "  rmi <image>                remove an image");
@@ -293,6 +295,69 @@ fn import(ctx: &mut Ctx, args: &[String]) -> i32 {
             0
         }
         Err(e) => ctx.fail_errno("import", e),
+    }
+}
+
+/// `fastman build -t name:tag [-f Dockerfile] [--build-arg K=V] -` — build an
+/// image from a Dockerfile. The build context (a tar/tar.gz containing the
+/// Dockerfile) is read from stdin.
+fn build(ctx: &mut Ctx, args: &[String]) -> i32 {
+    use crate::fastman::build::BuildOpts;
+    let mut opts = BuildOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" | "--tag" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) if opts.tag.is_empty() => opts.tag = v.clone(),
+                    Some(_) => {}
+                    None => return ctx.fail("-t needs a name[:tag]"),
+                }
+            }
+            "-f" | "--file" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => opts.dockerfile = v.clone(),
+                    None => return ctx.fail("-f needs a path"),
+                }
+            }
+            "--build-arg" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.split_once('=')) {
+                    Some((k, v)) => opts.build_args.push((k.to_string(), v.to_string())),
+                    None => return ctx.fail("--build-arg needs KEY=VALUE"),
+                }
+            }
+            "-" => {}
+            s if s.starts_with('-') => return ctx.fail(format!("unknown option '{s}'")),
+            _ => {} // a build-context path (unused: context comes on stdin)
+        }
+        i += 1;
+    }
+    if opts.tag.is_empty() {
+        return ctx.fail("build requires -t name[:tag]");
+    }
+    let data = match ctx.read_input("-") {
+        Ok(d) => d,
+        Err(e) => return ctx.fail_errno("stdin", e),
+    };
+    if data.is_empty() {
+        return ctx.fail("no build context on stdin (pipe a tar or tar.gz containing the Dockerfile)");
+    }
+    let fc = fs_ctx(ctx);
+    let tee = runtime::caller_stdout(&ctx.proc);
+    ctx.flush();
+    match crate::fastman::build::build(&fc, &opts, &data, tee) {
+        Ok(built) => {
+            outln!(ctx, "Successfully built {}", short(&built.image.id));
+            outln!(ctx, "Successfully tagged {}", built.image.key);
+            0
+        }
+        Err(crate::errno::Errno::ENOENT) => ctx.fail("build failed: base image not found (FROM) or a COPY source is missing"),
+        Err(crate::errno::Errno::EINVAL) => ctx.fail("build failed: the Dockerfile must start with a FROM instruction"),
+        Err(crate::errno::Errno::EIO) => ctx.fail("build failed: a RUN step exited non-zero"),
+        Err(e) => ctx.fail_errno("build", e),
     }
 }
 

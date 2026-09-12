@@ -126,9 +126,25 @@ pub struct Image {
     pub size: u64,
 }
 
-fn new_id() -> String {
+pub fn new_id() -> String {
     let b: [u8; 8] = crate::crypto::rng::array();
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Register an already-populated image directory (its `rootfs` tree must exist
+/// under `images_dir/<id>`) under `reference`: write its config and size and
+/// point the index at it. Used by `fastman build`, which fills the rootfs itself
+/// by committing an overlay build environment. Any prior image with the same
+/// key is replaced.
+pub fn commit(ctx: &Ctx, reference: &str, id: &str, size: u64, config: &ImageConfig) -> KResult<Image> {
+    let r = ImageRef::parse(reference).ok_or(Errno::EINVAL)?;
+    ops::write_file(ctx, &config_path(ctx, id), config.encode().as_bytes(), 0o600)?;
+    write_size(ctx, id, size);
+    let mut index = read_index(ctx);
+    index.retain(|(k, _)| *k != r.key());
+    index.push((r.key(), id.to_string()));
+    write_index(ctx, &index)?;
+    Ok(Image { id: id.to_string(), key: r.key(), created: crate::time::unix_now(), size })
 }
 
 /// Read the name:tag → id index.
