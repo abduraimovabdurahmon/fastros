@@ -208,6 +208,34 @@ pub fn ioctl(fd: i32, req: u32, arg: usize) -> KResult<usize> {
     fdt_get(fd)?.ioctl(req, arg)
 }
 
+/// `fsync`/`fdatasync`: flush the file's data to stable storage.
+pub fn fsync(fd: i32) -> KResult<usize> {
+    fdt_get(fd)?.sync()?;
+    Ok(0)
+}
+
+/// `ftruncate`: set the file length (grows with zeros, shrinks discarding).
+pub fn ftruncate(fd: i32, len: u64) -> KResult<usize> {
+    fdt_get(fd)?.truncate(len)?;
+    Ok(0)
+}
+
+/// `fallocate(fd, mode, offset, len)`: reserve space. With no flags this also
+/// extends the file to `offset+len`; KEEP_SIZE (and other modes) are accepted
+/// without changing the size. Databases (postgres WAL) rely on this succeeding.
+pub fn fallocate(fd: i32, mode: i32, offset: u64, len: u64) -> KResult<usize> {
+    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    let f = fdt_get(fd)?;
+    if mode == 0 {
+        let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
+        if end > f.stat()?.size {
+            f.truncate(end)?;
+        }
+    }
+    let _ = FALLOC_FL_KEEP_SIZE;
+    Ok(0)
+}
+
 /// `io_setup(2)`: hand back an AIO context id. We do not run real kernel AIO,
 /// but a server that only *initialises* an AIO context at startup (nginx with
 /// its default config, which serves via sendfile, not aio) must not fail here.

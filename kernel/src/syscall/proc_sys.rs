@@ -209,6 +209,33 @@ pub fn clock_nanosleep(_clk: u32, _flags: i32, req: usize, rem: usize) -> KResul
     nanosleep(req, rem)
 }
 
+/// `getresuid`/`getresgid`: report real=effective=saved = the current id.
+pub fn getresuid(ruid: usize, euid: usize, suid: usize) -> KResult<usize> {
+    let u = proc::current().cred().uid;
+    for p in [ruid, euid, suid] {
+        if p != 0 {
+            uaccess::write_obj(p, &u)?;
+        }
+    }
+    Ok(0)
+}
+
+pub fn getresgid(rgid: usize, egid: usize, sgid: usize) -> KResult<usize> {
+    let g = proc::current().cred().gid;
+    for p in [rgid, egid, sgid] {
+        if p != 0 {
+            uaccess::write_obj(p, &g)?;
+        }
+    }
+    Ok(0)
+}
+
+/// `getpgid(pid)`: the process group of `pid` (0 = the caller).
+pub fn getpgid(pid: i64) -> KResult<usize> {
+    let p = if pid == 0 { proc::current() } else { proc::find(pid as u32).ok_or(Errno::ESRCH)? };
+    Ok(p.pgid.load(core::sync::atomic::Ordering::Relaxed) as usize)
+}
+
 /// Resource limits. We enforce none, but programs (nginx) read `RLIMIT_NOFILE`
 /// to size their connection tables, so report a generous, sane value rather
 /// than zero.
