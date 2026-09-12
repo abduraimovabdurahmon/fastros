@@ -40,6 +40,8 @@ pub struct RunOpts {
     pub volumes: Vec<Volume>,
     pub network: String,
     pub detach: bool,
+    /// `--user uid[:gid]`: run the container process as this identity.
+    pub user: Option<(u32, u32)>,
 }
 
 /// Create a container from an image, building its writable rootfs.
@@ -83,6 +85,8 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         volumes: opts.volumes,
         network: if opts.network.is_empty() { String::from("bridge") } else { opts.network },
         detach: opts.detach,
+        uid: opts.user.map(|u| u.0).unwrap_or(0),
+        gid: opts.user.map(|u| u.1).unwrap_or(0),
     };
     c.save(ctx)?;
     Ok(c)
@@ -138,6 +142,16 @@ fn build_fs(ctx: &Ctx, c: &Container) -> KResult<FsContext> {
     Ok(FsContext { ns, root, cwd, umask: 0o022 })
 }
 
+/// The credentials the container process runs under: its `--user` identity, or
+/// the caller's when unset.
+fn container_cred(ctx: &Ctx, c: &Container) -> crate::fs::perm::Cred {
+    if c.uid != 0 || c.gid != 0 {
+        crate::fs::perm::Cred::user(c.uid, c.gid, Vec::new())
+    } else {
+        ctx.cred.clone()
+    }
+}
+
 /// A logger task copies the container's stdout/stderr to its log file and,
 /// for a foreground run, to the caller's terminal.
 fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Option<Arc<dyn File>>) -> alloc::sync::Arc<crate::sched::Task> {
@@ -170,8 +184,11 @@ fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Opti
 /// `tee` receives a copy of the output; the caller then waits on the pid.
 pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResult<(u32, alloc::sync::Arc<crate::sched::Task>)> {
     let fs = build_fs(ctx, c)?;
+    // The container process runs as its configured user (`--user`), defaulting
+    // to the caller's identity.
+    let ccred = container_cred(ctx, c);
     // Resolve the program inside the container.
-    let cctx = Ctx { fs: fs.clone(), cred: ctx.cred.clone() };
+    let cctx = Ctx { fs: fs.clone(), cred: ccred.clone() };
     let argv = c.cmd.clone();
     if argv.is_empty() {
         return Err(Errno::EINVAL);
@@ -194,7 +211,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         name: c.name.clone(),
         args: argv,
         env: env_pairs(&c.env),
-        cred: ctx.cred.clone(),
+        cred: ccred,
         fs,
         fds,
         parent: crate::proc::kernel(),
@@ -337,7 +354,8 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
     // would have a fresh, empty writable layer.
     let init = proc::find(c.pid).ok_or(Errno::ESRCH)?;
     let fs = init.fs.lock().clone();
-    let cctx = Ctx { fs: fs.clone(), cred: ctx.cred.clone() };
+    let ccred = container_cred(ctx, &c);
+    let cctx = Ctx { fs: fs.clone(), cred: ccred.clone() };
     let real = proc::elf::find_program(&cctx, &argv[0])?;
     let (data, argv) = proc::elf::read_exec(&cctx, &real, &argv)?;
     let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
@@ -354,7 +372,7 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         name: format!("exec:{}", c.name),
         args: argv,
         env: env_pairs(&c.env),
-        cred: ctx.cred.clone(),
+        cred: ccred,
         fs,
         fds,
         parent: crate::proc::kernel(),

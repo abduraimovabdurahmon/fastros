@@ -238,6 +238,7 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  -e KEY=VALUE       set an environment variable");
     outln!(ctx, "  -p HOST:CONT       publish a port");
     outln!(ctx, "  -v HOST:CONT[:ro]  bind-mount a volume");
+    outln!(ctx, "  -u uid[:gid]       run as this user (e.g. for postgres)");
     outln!(ctx, "  -w <dir>           working directory");
     outln!(ctx, "  --network <name>   network (default: bridge)");
     outln!(ctx);
@@ -348,6 +349,10 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, String, Vec<String>), String> 
                 i += 1;
                 o.workdir = Some(args.get(i).ok_or("-w needs a directory")?.clone());
             }
+            "-u" | "--user" => {
+                i += 1;
+                o.user = Some(parse_user(args.get(i).ok_or("-u needs a uid[:gid]")?)?);
+            }
             "--network" | "--net" => {
                 i += 1;
                 o.network = args.get(i).ok_or("--network needs a value")?.clone();
@@ -377,6 +382,20 @@ fn parse_port(s: &str) -> Result<Port, String> {
     };
     let (h, c) = spec.split_once(':').ok_or("port must be HOST:CONTAINER")?;
     Ok(Port { host: h.parse().map_err(|_| "bad host port")?, container: c.parse().map_err(|_| "bad container port")?, udp })
+}
+
+/// `--user uid[:gid]` (numeric only; gid defaults to uid).
+fn parse_user(s: &str) -> Result<(u32, u32), String> {
+    let (u, g) = match s.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (s, None),
+    };
+    let uid: u32 = u.parse().map_err(|_| "user must be a numeric uid[:gid]")?;
+    let gid: u32 = match g {
+        Some(g) => g.parse().map_err(|_| "bad gid")?,
+        None => uid,
+    };
+    Ok((uid, gid))
 }
 
 fn parse_volume(s: &str) -> Result<Volume, String> {
@@ -732,6 +751,7 @@ fn clone_opts(o: &RunOpts) -> RunOpts {
         volumes: o.volumes.clone(),
         network: o.network.clone(),
         detach: o.detach,
+        user: o.user,
     }
 }
 

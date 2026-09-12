@@ -180,5 +180,6 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         volumes: o.volumes.iter().map(|v| Volume { host: v.host.clone(), container: v.container.clone(), read_only: v.read_only }).collect(),
         network: o.network.clone(),
         detach: true,
+        user: o.user,
     }
 }

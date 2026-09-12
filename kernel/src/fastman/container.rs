@@ -65,6 +65,11 @@ pub struct Container {
     pub volumes: Vec<Volume>,
     pub network: String,
     pub detach: bool,
+    /// The uid/gid the container process runs as (0 = the caller's identity, the
+    /// default). `--user` sets these so an image that refuses to run as root
+    /// (postgres/initdb) can drop to its own user.
+    pub uid: u32,
+    pub gid: u32,
 }
 
 impl Container {
@@ -106,6 +111,7 @@ impl Container {
         s.push_str(&format!("workdir\t{}\n", self.workdir));
         s.push_str(&format!("network\t{}\n", self.network));
         s.push_str(&format!("detach\t{}\n", self.detach as u8));
+        s.push_str(&format!("user\t{}\t{}\n", self.uid, self.gid));
         for c in &self.cmd {
             s.push_str(&format!("cmd\t{c}\n"));
         }
@@ -138,6 +144,8 @@ impl Container {
             volumes: Vec::new(),
             network: String::from("bridge"),
             detach: false,
+            uid: 0,
+            gid: 0,
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -155,6 +163,10 @@ impl Container {
                 "workdir" => c.workdir = v.to_string(),
                 "network" => c.network = v.to_string(),
                 "detach" => c.detach = v == "1",
+                "user" => {
+                    c.uid = v.parse().unwrap_or(0);
+                    c.gid = it.next().unwrap_or("0").parse().unwrap_or(0);
+                }
                 "cmd" => c.cmd.push(v.to_string()),
                 "env" => c.env.push(v.to_string()),
                 "port" => {
