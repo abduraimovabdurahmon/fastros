@@ -72,6 +72,12 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         18 => ret(file::pwrite(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as u64)),
         19 => ret(file::readv(a[0] as i32, a[1] as usize, a[2] as usize)),
         20 => ret(file::writev(a[0] as i32, a[1] as usize, a[2] as usize)),
+        // preadv/pwritev (+ the RWF-flags "2" variants); offset is fully in a[3]
+        // on x86_64 (pos_h is always 0), flags in a[5] are accepted and ignored.
+        295 => ret(file::preadv(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i64)),
+        296 => ret(file::pwritev(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i64)),
+        327 => ret(file::preadv(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i64)),
+        328 => ret(file::pwritev(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i64)),
         21 => ret(file::access(a[0] as usize, a[1] as u32)),
         22 => ret(file::pipe(a[0] as usize, 0)),
         92 => ret(file::chown(a[0] as usize, a[1] as u32, a[2] as u32, true)),
@@ -176,6 +182,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         30 => ret(crate::ipc::shmat(a[0] as i32, a[1] as usize, a[2] as i32)),
         31 => ret(crate::ipc::shmctl(a[0] as i32, a[1] as i32, a[2] as usize)),
         67 => ret(crate::ipc::shmdt(a[0] as usize)),
+        // ── interval timers (SIGALRM) ──
+        36 => ret(proc_sys::getitimer(a[0] as i32, a[1] as usize)),
+        37 => ret(proc_sys::alarm(a[0] as u32)),
+        38 => ret(proc_sys::setitimer(a[0] as i32, a[1] as usize, a[2] as usize)),
         202 => ret(proc_sys::futex(a[0] as usize, a[1] as i32, a[2] as u32, a[3] as usize, a[4] as usize, a[5] as u32)),
         204 => ret(proc_sys::sched_getaffinity(a[0] as i32, a[1] as usize, a[2] as usize)),
         228 => ret(proc_sys::clock_gettime(a[0] as u32, a[1] as usize)),

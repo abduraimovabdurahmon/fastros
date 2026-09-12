@@ -24,6 +24,65 @@ pub fn exit(code: i32, _group: bool) -> ! {
     proc::exit_current(ExitStatus::Exited(code));
 }
 
+// ── interval timers (SIGALRM) ────────────────────────────────────────────────
+
+const ITIMER_REAL: i32 = 0;
+
+/// Read a `struct timeval` at `ptr` and return it in nanoseconds.
+fn timeval_ns(ptr: usize) -> KResult<u64> {
+    let sec: i64 = uaccess::read_obj(ptr)?;
+    let usec: i64 = uaccess::read_obj(ptr + 8)?;
+    Ok((sec.max(0) as u64) * 1_000_000_000 + (usec.max(0) as u64) * 1_000)
+}
+
+/// Write `ns` as a `struct timeval` at `ptr`.
+fn write_timeval(ptr: usize, ns: u64) -> KResult<()> {
+    uaccess::write_obj(ptr, &((ns / 1_000_000_000) as i64))?;
+    uaccess::write_obj(ptr + 8, &(((ns % 1_000_000_000) / 1_000) as i64))
+}
+
+/// `setitimer(which, new, old)`. Only `ITIMER_REAL` actually arms; `new` is a
+/// `struct itimerval { it_interval; it_value; }`.
+pub fn setitimer(which: i32, new: usize, old: usize) -> KResult<usize> {
+    let pid = proc::current().pid;
+    let (prev_remaining, prev_interval) = if which == ITIMER_REAL && new != 0 {
+        let interval_ns = timeval_ns(new)?;
+        let value_ns = timeval_ns(new + 16)?;
+        proc::itimer::set_real(pid, value_ns, interval_ns)
+    } else if which == ITIMER_REAL {
+        proc::itimer::get_real(pid) // new == NULL: query only
+    } else {
+        (0, 0) // VIRTUAL / PROF: accepted, never fires
+    };
+    if old != 0 {
+        write_timeval(old, prev_interval)?;
+        write_timeval(old + 16, prev_remaining)?;
+    }
+    Ok(0)
+}
+
+/// `getitimer(which, curr)`.
+pub fn getitimer(which: i32, curr: usize) -> KResult<usize> {
+    let (remaining, interval) = if which == ITIMER_REAL {
+        proc::itimer::get_real(proc::current().pid)
+    } else {
+        (0, 0)
+    };
+    if curr != 0 {
+        write_timeval(curr, interval)?;
+        write_timeval(curr + 16, remaining)?;
+    }
+    Ok(0)
+}
+
+/// `alarm(seconds)`: a one-shot `ITIMER_REAL`. Returns the seconds left on any
+/// previous alarm (rounded up).
+pub fn alarm(seconds: u32) -> KResult<usize> {
+    let pid = proc::current().pid;
+    let (prev_remaining, _) = proc::itimer::set_real(pid, seconds as u64 * 1_000_000_000, 0);
+    Ok(((prev_remaining + 999_999_999) / 1_000_000_000) as usize)
+}
+
 // ── fork / clone ───────────────────────────────────────────────────────────
 
 /// Duplicate the current user process: forked COW address space, copied fd

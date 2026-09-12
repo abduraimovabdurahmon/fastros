@@ -490,6 +490,9 @@ extern "C" fn task_entry() -> ! {
 /// Timer interrupt: wake expired sleepers, account the time slice.
 pub fn timer_tick() {
     let now = crate::time::now_ns();
+    // Fire expired ITIMER_REAL timers (SIGALRM). Done before taking the run
+    // queue lock so raising a signal never nests locks under RQ.
+    crate::proc::itimer::tick(now);
     let mut rq = RQ.lock();
     let mut i = 0;
     while i < rq.sleepers.len() {

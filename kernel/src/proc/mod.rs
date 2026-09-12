@@ -10,6 +10,7 @@
 
 pub mod elf;
 pub mod fdtable;
+pub mod itimer;
 pub mod signal;
 
 use crate::errno::{Errno, KResult};
@@ -395,6 +396,7 @@ pub fn exit_current(status: ExitStatus) -> ! {
     // A vfork/posix_spawn child that exits without exec'ing still frees its
     // parent.
     me.vfork_release();
+    itimer::clear(me.pid);
     me.fds.lock().clear();
     *me.ctty.lock() = None;
     *me.exit.lock() = Some(status);

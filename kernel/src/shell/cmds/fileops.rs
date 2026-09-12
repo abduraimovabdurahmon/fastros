@@ -536,7 +536,8 @@ fn copy_one(ctx: &mut Ctx, fs: &FsCtx, src: &str, dst: &str, o: &CpOpts) -> bool
             if o.preserve {
                 preserve_attrs(fs, dst, &m, true);
             } else {
-                let _ = ops::chmod(fs, dst, m.perm & !ctx.proc.fs.lock().umask, true);
+                let umask = ctx.proc.fs.lock().umask; // drop the lock before chmod may block
+                let _ = ops::chmod(fs, dst, m.perm & !umask, true);
             }
             ok
         }

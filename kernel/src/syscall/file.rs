@@ -109,10 +109,65 @@ pub fn writev(fd: i32, iov: usize, cnt: usize) -> KResult<usize> {
     Ok(total)
 }
 
+/// `preadv`/`preadv2`: vectored read at an explicit offset. A negative offset
+/// (`-1` split across two i32 args) means "use the current position", i.e.
+/// behave like `readv`. `flags` (RWF_*) are accepted and ignored. postgres
+/// uses this to refill buffers; the WAL zero-fill path uses `pwritev`.
+pub fn preadv(fd: i32, iov: usize, cnt: usize, off: i64) -> KResult<usize> {
+    if off < 0 {
+        return readv(fd, iov, cnt);
+    }
+    let f = fdt_get(fd)?;
+    let mut total = 0;
+    let mut pos = off as u64;
+    for (base, len) in read_iovec(iov, cnt)? {
+        if len == 0 {
+            continue;
+        }
+        let mut tmp = alloc::vec![0u8; len.min(1 << 20)];
+        let n = f.pread(pos, &mut tmp)?;
+        uaccess::copy_to(base, &tmp[..n])?;
+        total += n;
+        pos += n as u64;
+        if n < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// `pwritev`/`pwritev2`: vectored write at an explicit offset (the counterpart
+/// of [`preadv`]). This is postgres' WAL zero-fill path (`pg_pwrite_zeros`).
+pub fn pwritev(fd: i32, iov: usize, cnt: usize, off: i64) -> KResult<usize> {
+    if off < 0 {
+        return writev(fd, iov, cnt);
+    }
+    let f = fdt_get(fd)?;
+    let mut total = 0;
+    let mut pos = off as u64;
+    for (base, len) in read_iovec(iov, cnt)? {
+        if len == 0 {
+            continue;
+        }
+        let mut tmp = alloc::vec![0u8; len.min(1 << 20)];
+        uaccess::copy_from(base, &mut tmp)?;
+        let n = f.pwrite(pos, &tmp)?;
+        total += n;
+        pos += n as u64;
+        if n < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 fn do_open(path: &str, flags: u32, mode: u16) -> KResult<usize> {
     let p = proc::current();
     let ctx = ops::Ctx::of(&p);
-    let f = ops::open(&ctx, path, flags, mode & !(p.fs.lock().umask))?;
+    // Read umask into a local first: holding the fs lock across ops::open would
+    // panic if the open blocks on disk I/O (schedule() with a spinlock held).
+    let umask = p.fs.lock().umask;
+    let f = ops::open(&ctx, path, flags, mode & !umask)?;
     let cloexec = flags & crate::fs::file::flags::O_CLOEXEC != 0;
     let fd = p.fds.lock().alloc(f, cloexec, 0)?;
     Ok(fd as usize)
@@ -481,7 +536,8 @@ pub fn fchdir(fd: i32) -> KResult<usize> {
 pub fn mkdir(path: usize, mode: u16) -> KResult<usize> {
     let p = proc::current();
     let ctx = ops::Ctx::of(&p);
-    ops::mkdir(&ctx, &user_path(path)?, mode & !(p.fs.lock().umask))?;
+    let umask = p.fs.lock().umask; // release the fs lock before the blocking op
+    ops::mkdir(&ctx, &user_path(path)?, mode & !umask)?;
     Ok(0)
 }
 
