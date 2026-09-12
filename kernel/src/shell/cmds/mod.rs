@@ -54,6 +54,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("ftp", ftp::ftp, "FTP client (ls/get/put or interactive)", "ls|get|put ftp://[user[:pass]@]host[:port]/path | HOST [PORT]"),
     cmd!("scp", scp::scp, "secure copy over SSH (local↔remote, or remote side)", "[-r] [-P PORT] SRC DEST | [-t|-f] PATH"),
     cmd!("ssh", ssh::ssh, "OpenSSH client — run a remote command or shell", "[-p PORT] [user@]host [command...]"),
+    cmd!("ssh-keygen", ssh::ssh_keygen, "generate an ed25519 SSH key pair", ""),
     cmd!("sftp-server", sftp::sftp_server, "SFTP subsystem (run by sshd)", ""),
     cmd!("cut", textutils::cut, "remove sections from each line", "-b|-c|-f LIST [-d DELIM] [FILE]..."),
     cmd!("date", sysutil::date, "print or set the system date and time", "[-uR] [-d STRING] [-s STRING] [-I[FMT]] [+FORMAT]"),

@@ -35,6 +35,15 @@ pub struct Session {
     consumed: SpinLock<u32>,
     /// The server's ed25519 host key blob (for the caller to fingerprint).
     pub host_key: SpinLock<Vec<u8>>,
+    session_id: SpinLock<[u8; 32]>,
+}
+
+/// How the client authenticates: an ed25519 identity (tried first) and/or a
+/// password (fallback). At least one should be present.
+#[derive(Default)]
+pub struct Auth {
+    pub key: Option<(ed25519_dalek::SigningKey, Vec<u8>)>,
+    pub password: Option<String>,
 }
 
 fn proto<T>(m: &str) -> SResult<T> {
@@ -42,8 +51,9 @@ fn proto<T>(m: &str) -> SResult<T> {
 }
 
 impl Session {
-    /// Connect, key-exchange, authenticate with a password, and open a session.
-    pub fn open(host: &str, port: u16, user: &str, pass: &str, timeout_ms: u64) -> SResult<Arc<Session>> {
+    /// Connect, key-exchange, verify the host key against `expected` (if the
+    /// host is already known), authenticate, and open a session.
+    pub fn open(host: &str, port: u16, user: &str, auth: &Auth, expected_hostkey: Option<&[u8]>, timeout_ms: u64) -> SResult<Arc<Session>> {
         let ip = match dns::parse_ipv4(host) {
             Some(ip) => ip,
             None => *dns::resolve(host).map_err(|_| SshError::Io)?.first().ok_or(SshError::Io)?,
@@ -66,7 +76,15 @@ impl Session {
                 _ => return proto("expected KEXINIT"),
             }
         };
-        let (_h, host_key) = transport::client_kex(transport::CLIENT_VERSION, &server_version, &client_kexinit, &server_kexinit, &mut recv, &send)?;
+        let (h, host_key) = transport::client_kex(transport::CLIENT_VERSION, &server_version, &client_kexinit, &server_kexinit, &mut recv, &send)?;
+
+        // Host-key check: if we already know this host, the key must match.
+        if let Some(exp) = expected_hostkey {
+            if exp != host_key.as_slice() {
+                let _ = send.send(&transport::disconnect_msg(transport::reasons::BY_APPLICATION, "host key mismatch"));
+                return Err(SshError::Disconnected("REMOTE HOST KEY CHANGED — possible man-in-the-middle; refusing to connect".into()));
+            }
+        }
 
         let sess = Arc::new(Session {
             send,
@@ -81,11 +99,12 @@ impl Session {
             exit: SpinLock::new(None),
             consumed: SpinLock::new(0),
             host_key: SpinLock::new(host_key),
+            session_id: SpinLock::new(h),
         });
 
-        // Authenticate (password), then open a session channel — done inline so
-        // we can report failures before spawning the reader.
-        sess.authenticate(&mut recv, user, pass)?;
+        // Authenticate, then open a session channel — done inline so we can
+        // report failures before spawning the reader.
+        sess.authenticate(&mut recv, user, auth)?;
         sess.open_channel(&mut recv)?;
 
         // Hand the receiver to a background pump.
@@ -94,7 +113,7 @@ impl Session {
         Ok(sess)
     }
 
-    fn authenticate(&self, recv: &mut RecvHalf, user: &str, pass: &str) -> SResult<()> {
+    fn authenticate(&self, recv: &mut RecvHalf, user: &str, auth: &Auth) -> SResult<()> {
         let mut sr = Writer::msg(msg::SERVICE_REQUEST);
         sr.str("ssh-userauth");
         self.send.send(&sr.done())?;
@@ -106,14 +125,48 @@ impl Session {
                 _ => return proto("service request rejected"),
             }
         }
+        // Public key first (if we have an identity), then password.
+        if let Some((sk, blob)) = &auth.key {
+            if self.auth_pubkey(recv, user, sk, blob)? {
+                return Ok(());
+            }
+        }
+        if let Some(pass) = &auth.password {
+            if self.auth_password(recv, user, pass)? {
+                return Ok(());
+            }
+        }
+        Err(SshError::Disconnected("authentication failed (no accepted method — check password / authorized_keys)".into()))
+    }
+
+    fn auth_password(&self, recv: &mut RecvHalf, user: &str, pass: &str) -> SResult<bool> {
         let mut a = Writer::msg(msg::USERAUTH_REQUEST);
         a.str(user).str("ssh-connection").str("password").bool(false).str(pass);
         self.send.send(&a.done())?;
+        self.auth_result(recv)
+    }
+
+    fn auth_pubkey(&self, recv: &mut RecvHalf, user: &str, sk: &ed25519_dalek::SigningKey, blob: &[u8]) -> SResult<bool> {
+        // The signature covers session id + the request up to the public key.
+        let sid = *self.session_id.lock();
+        let mut signed = Writer::new();
+        signed.string(&sid).u8(msg::USERAUTH_REQUEST).str(user).str("ssh-connection").str("publickey").bool(true).str("ssh-ed25519").string(blob);
+        let sig = ed25519_dalek::Signer::sign(sk, &signed.done());
+        let mut sig_blob = Writer::new();
+        sig_blob.str("ssh-ed25519").string(&sig.to_bytes());
+        let mut a = Writer::msg(msg::USERAUTH_REQUEST);
+        a.str(user).str("ssh-connection").str("publickey").bool(true).str("ssh-ed25519").string(blob).string(&sig_blob.done());
+        self.send.send(&a.done())?;
+        self.auth_result(recv)
+    }
+
+    /// Read the reply to an auth attempt: Ok(true)=success, Ok(false)=failure.
+    fn auth_result(&self, recv: &mut RecvHalf) -> SResult<bool> {
         loop {
             let p = recv.read_packet(Some(30_000))?;
             match p[0] {
-                msg::USERAUTH_SUCCESS => return Ok(()),
-                msg::USERAUTH_FAILURE => return Err(SshError::Disconnected("authentication failed (wrong password?)".into())),
+                msg::USERAUTH_SUCCESS => return Ok(true),
+                msg::USERAUTH_FAILURE => return Ok(false),
                 msg::USERAUTH_BANNER | msg::IGNORE | msg::DEBUG => continue,
                 _ => return proto("unexpected auth reply"),
             }

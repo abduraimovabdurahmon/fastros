@@ -1,10 +1,12 @@
-//! `ssh` — connect to a remote host, authenticate, and run a command (or an
-//! interactive shell). Password auth: `-P <pass>`, the `SSHPASS` environment
-//! variable, or an interactive prompt.
+//! `ssh` — connect to a remote host, authenticate (public key then password),
+//! and run a command (or an interactive shell). Host keys are verified against
+//! `~/.ssh/known_hosts` (trust on first use); a changed key is refused.
 
-use crate::outln;
+use crate::fs::file::flags;
+use crate::fs::ops;
 use crate::shell::ctx::Ctx;
-use crate::ssh::client::Session;
+use crate::ssh::client::{Auth, Session};
+use crate::ssh::keys;
 use crate::ssh::transport::SshError;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -20,7 +22,6 @@ pub fn errmsg(e: &SshError) -> String {
     }
 }
 
-/// Parse `[user@]host` → (user, host). Default user: the current $USER or root.
 pub fn split_target(ctx: &Ctx, s: &str) -> (String, String) {
     match s.split_once('@') {
         Some((u, h)) => (u.to_string(), h.to_string()),
@@ -28,11 +29,19 @@ pub fn split_target(ctx: &Ctx, s: &str) -> (String, String) {
     }
 }
 
-/// Resolve the password: the SSHPASS environment variable, or a prompt.
-pub fn resolve_password(ctx: &mut Ctx) -> Option<String> {
-    if let Some(p) = ctx.env("SSHPASS") {
-        return Some(p);
-    }
+fn home(ctx: &Ctx) -> String {
+    ctx.env("HOME").filter(|h| h.starts_with('/')).unwrap_or_else(|| "/root".to_string())
+}
+
+/// Load the user's ed25519 identity (`~/.ssh/id_ed25519`), if present.
+fn load_identity(ctx: &Ctx) -> Option<(ed25519_dalek::SigningKey, Vec<u8>)> {
+    let path = alloc::format!("{}/.ssh/id_ed25519", home(ctx));
+    let fsx = ops::Ctx::of(&ctx.proc);
+    let data = ops::read_file(&fsx, &path).ok()?;
+    keys::parse_openssh_ed25519(&String::from_utf8_lossy(&data))
+}
+
+fn read_password_prompt(ctx: &mut Ctx) -> String {
     ctx.print("password: ");
     ctx.flush();
     let mut line = Vec::new();
@@ -49,7 +58,68 @@ pub fn resolve_password(ctx: &mut Ctx) -> Option<String> {
         }
     }
     ctx.print("\n");
-    Some(String::from_utf8_lossy(&line).into_owned())
+    String::from_utf8_lossy(&line).into_owned()
+}
+
+fn host_label(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        alloc::format!("[{host}]:{port}")
+    }
+}
+
+/// The stored host key for `host`, if `known_hosts` has one.
+fn load_known_host(ctx: &Ctx, host: &str, port: u16) -> Option<Vec<u8>> {
+    let path = alloc::format!("{}/.ssh/known_hosts", home(ctx));
+    let fsx = ops::Ctx::of(&ctx.proc);
+    let data = ops::read_file(&fsx, &path).ok()?;
+    let want = host_label(host, port);
+    for line in String::from_utf8_lossy(&data).lines() {
+        let mut it = line.split_whitespace();
+        let (h, kind, b64) = (it.next(), it.next(), it.next());
+        if let (Some(h), Some("ssh-ed25519"), Some(b64)) = (h, kind, b64) {
+            if h == want {
+                return fastros_codec::base64::decode(b64);
+            }
+        }
+    }
+    None
+}
+
+/// Record a host key on trust-on-first-use.
+fn remember_host(ctx: &mut Ctx, host: &str, port: u16, blob: &[u8]) {
+    let fsx = ops::Ctx::of(&ctx.proc);
+    let dir = alloc::format!("{}/.ssh", home(ctx));
+    let _ = ops::mkdir_all(&fsx, &dir, 0o700);
+    let path = alloc::format!("{dir}/known_hosts");
+    let line = alloc::format!("{} ssh-ed25519 {}\n", host_label(host, port), fastros_codec::base64::encode(blob));
+    let mut content = ops::read_file(&fsx, &path).unwrap_or_default();
+    content.extend_from_slice(line.as_bytes());
+    let _ = ops::write_file(&fsx, &path, &content, 0o644);
+}
+
+/// Connect, verify the host key (TOFU), and authenticate. Shared by ssh + scp.
+pub fn connect(ctx: &mut Ctx, user: &str, host: &str, port: u16) -> Result<Arc<Session>, i32> {
+    let key = load_identity(ctx);
+    let password = if let Some(p) = ctx.env("SSHPASS") {
+        Some(p)
+    } else if key.is_none() {
+        Some(read_password_prompt(ctx))
+    } else {
+        None
+    };
+    let auth = Auth { key, password };
+    let expected = load_known_host(ctx, host, port);
+    let known = expected.is_some();
+    let sess = Session::open(host, port, user, &auth, expected.as_deref(), 20_000).map_err(|e| ctx.fail(alloc::format!("ssh: {}", errmsg(&e))))?;
+    if !known {
+        let hk = sess.host_key.lock().clone();
+        let fp = crate::ssh::fingerprint(&hk);
+        remember_host(ctx, host, port, &hk);
+        ctx.eprint(&alloc::format!("Warning: permanently added '{}' (ED25519) to known hosts.\nHost key fingerprint: {}\n", host, fp));
+    }
+    Ok(sess)
 }
 
 pub fn ssh(ctx: &mut Ctx) -> i32 {
@@ -72,19 +142,14 @@ pub fn ssh(ctx: &mut Ctx) -> i32 {
         i += 1;
     }
     let Some(target) = target else {
-        return ctx.fail("usage: ssh [-p PORT] [user@]host [command...]  (password: SSHPASS env or prompt)");
+        return ctx.fail("usage: ssh [-p PORT] [user@]host [command...]  (auth: ~/.ssh/id_ed25519 or SSHPASS/prompt)");
     };
     let (user, host) = split_target(ctx, &target);
-    let Some(pass) = resolve_password(ctx) else {
-        return ctx.fail("no password");
-    };
 
-    let sess = match Session::open(&host, port, &user, &pass, 20_000) {
+    let sess = match connect(ctx, &user, &host, port) {
         Ok(s) => s,
-        Err(e) => return ctx.fail(alloc::format!("ssh: {}", errmsg(&e))),
+        Err(c) => return c,
     };
-    let fp = crate::ssh::client::fingerprint(&sess.host_key.lock());
-    ctx.eprint(&alloc::format!("Warning: host key for {host} is {fp} (not verified)\n"));
 
     let command = cmd.join(" ");
     let r = if command.is_empty() { sess.shell() } else { sess.exec(&command) };
@@ -92,12 +157,10 @@ pub fn ssh(ctx: &mut Ctx) -> i32 {
         return ctx.fail(alloc::format!("ssh: {}", errmsg(&e)));
     }
 
-    // Forward local stdin to the remote in the background.
     let sin = ctx.stdin();
     let s_in = sess.clone();
     crate::sched::spawn("ssh-stdin", move || pump_stdin(sin, s_in));
 
-    // Copy remote output to our stdout until the channel closes.
     let out = ctx.stdout();
     let mut buf = [0u8; 8192];
     loop {
@@ -133,4 +196,33 @@ fn pump_stdin(sin: Arc<dyn crate::fs::file::File>, sess: Arc<Session>) {
             }
         }
     }
+}
+
+/// `ssh-keygen` — generate `~/.ssh/id_ed25519` + `id_ed25519.pub`.
+pub fn ssh_keygen(ctx: &mut Ctx) -> i32 {
+    let dir = alloc::format!("{}/.ssh", home(ctx));
+    let priv_path = alloc::format!("{dir}/id_ed25519");
+    let pub_path = alloc::format!("{priv_path}.pub");
+    let fsx = ops::Ctx::of(&ctx.proc);
+    if ops::stat(&fsx, &priv_path, true).is_ok() {
+        return ctx.fail(alloc::format!("{priv_path} already exists"));
+    }
+    let sk = keys::generate();
+    let comment = alloc::format!("{}@fastros", ctx.env("USER").unwrap_or_else(|| "root".to_string()));
+    let _ = ops::mkdir_all(&fsx, &dir, 0o700);
+    if let Err(e) = write_file(&fsx, &priv_path, keys::to_openssh_pem(&sk, &comment).as_bytes(), 0o600) {
+        return ctx.fail_errno(&priv_path, e);
+    }
+    if let Err(e) = write_file(&fsx, &pub_path, keys::public_line(&sk, &comment).as_bytes(), 0o644) {
+        return ctx.fail_errno(&pub_path, e);
+    }
+    ctx.println(&alloc::format!("Your identification has been saved in {priv_path}"));
+    ctx.println(&alloc::format!("Your public key has been saved in {pub_path}"));
+    ctx.println(&alloc::format!("The key fingerprint is: {}", crate::ssh::fingerprint(&keys::public_blob(&sk))));
+    0
+}
+
+fn write_file(fsx: &ops::Ctx, path: &str, data: &[u8], mode: u16) -> crate::errno::KResult<()> {
+    let f = ops::open(fsx, path, flags::O_WRONLY | flags::O_CREAT | flags::O_TRUNC, mode)?;
+    f.write_all(data)
 }

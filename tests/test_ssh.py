@@ -42,3 +42,39 @@ def test_scp_local_only_errors(g):
     out, err, st = g.run("scp /tmp/a /tmp/b", timeout=20)
     assert st != 0
     assert "remote" in (out + err).lower()
+
+
+def test_ssh_known_hosts_tofu(g):
+    g.run("rm -f /root/.ssh/known_hosts")
+    out, err, st = g.run("SSHPASS=root ssh root@127.0.0.1 'echo hi'", timeout=40)
+    assert "permanently added" in (out + err).lower(), out + err
+    kh = g.ok("cat /root/.ssh/known_hosts")
+    assert kh.startswith("127.0.0.1 ssh-ed25519 "), kh
+    # Second connect: host known, no "permanently added".
+    out2, err2, _ = g.run("SSHPASS=root ssh root@127.0.0.1 'echo hi2'", timeout=40)
+    assert "permanently added" not in (out2 + err2).lower(), out2 + err2
+    assert "hi2" in out2
+
+
+def test_ssh_known_hosts_mismatch_refused(g):
+    # A wrong stored key must abort the connection.
+    bogus = "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIWRvbmd0cnVzdG1lZG9uZ3RydXN0bWVkb25ndHI=\n"
+    g.ok("mkdir -p /root/.ssh", timeout=20)
+    g.ok("cat > /root/.ssh/known_hosts", stdin=bogus)
+    out, err, st = g.run("SSHPASS=root ssh root@127.0.0.1 'echo NOPE'", timeout=40)
+    assert st != 0
+    assert "mismatch" in (out + err).lower() or "man-in" in (out + err).lower(), out + err
+    assert "NOPE" not in out
+    g.run("rm -f /root/.ssh/known_hosts")
+
+
+def test_ssh_keygen_and_pubkey_auth(g):
+    g.run("rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys /root/.ssh/known_hosts")
+    out = g.ok("ssh-keygen", timeout=30)
+    assert "saved in" in out and "fingerprint" in out.lower(), out
+    assert g.ok("test -f /root/.ssh/id_ed25519 && echo yes").strip() == "yes"
+    g.ok("cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys")
+    # No SSHPASS: must authenticate by public key.
+    out2, err2, st = g.run("ssh root@127.0.0.1 'echo PUBKEY_OK; whoami'", timeout=40)
+    assert "PUBKEY_OK" in out2, out2 + err2
+    assert "root" in out2, out2 + err2

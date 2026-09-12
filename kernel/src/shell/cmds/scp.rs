@@ -120,13 +120,7 @@ fn parse_remote(s: &str) -> Option<(String, String, String)> {
 }
 
 fn open_session(ctx: &mut Ctx, user: &str, host: &str, port: u16) -> Result<Arc<Session>, i32> {
-    let Some(pass) = super::ssh::resolve_password(ctx) else {
-        return Err(ctx.fail("scp: no password"));
-    };
-    match Session::open(host, port, user, &pass, 20_000) {
-        Ok(s) => Ok(s),
-        Err(e) => Err(ctx.fail(alloc::format!("scp: {}", super::ssh::errmsg(&e)))),
-    }
+    super::ssh::connect(ctx, user, host, port)
 }
 
 fn client_upload(ctx: &mut Ctx, local: &str, user: &str, host: &str, port: u16, rpath: &str, recursive: bool) -> i32 {
