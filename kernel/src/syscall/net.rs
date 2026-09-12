@@ -286,12 +286,22 @@ pub fn getsockopt(fd: i32, level: i32, optname: i32, optval: usize, optlen: usiz
 pub fn sendto(fd: i32, buf: usize, len: usize, _flags: i32, addr: usize, addrlen: usize) -> KResult<usize> {
     let mut data = alloc::vec![0u8; len.min(1 << 20)];
     uaccess::copy_from(buf, &mut data)?;
+    // A connected AF_UNIX stream socket: send == write.
+    if is_unix(fd) {
+        return fdt_get(fd)?.write(&data);
+    }
     let to = if addr != 0 && addrlen >= 16 { Some(read_sockaddr(addr, addrlen)?) } else { None };
     with_sock(fd, |s| s.sendto(&data, to))
 }
 
 pub fn recvfrom(fd: i32, buf: usize, len: usize, _flags: i32, addr: usize, addrlen: usize) -> KResult<usize> {
     let mut data = alloc::vec![0u8; len.min(1 << 20)];
+    // A connected AF_UNIX stream socket: recv == read (no source address).
+    if is_unix(fd) {
+        let n = fdt_get(fd)?.read(&mut data)?;
+        uaccess::copy_to(buf, &data[..n])?;
+        return Ok(n);
+    }
     let (n, from) = with_sock(fd, |s| s.recvfrom(&mut data))?;
     uaccess::copy_to(buf, &data[..n])?;
     if addr != 0 {

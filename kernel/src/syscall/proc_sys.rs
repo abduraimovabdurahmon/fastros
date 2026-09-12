@@ -302,7 +302,8 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
 
 // ── wait / kill ────────────────────────────────────────────────────────────
 
-pub fn wait4(pid: i64, status: usize, _options: i32, _rusage: usize) -> KResult<usize> {
+pub fn wait4(pid: i64, status: usize, options: i32, _rusage: usize) -> KResult<usize> {
+    const WNOHANG: i32 = 1;
     let me = proc::current();
     let which = match pid {
         p if p > 0 => WaitFor::Pid(p as u32),
@@ -310,7 +311,11 @@ pub fn wait4(pid: i64, status: usize, _options: i32, _rusage: usize) -> KResult<
         0 => WaitFor::Group(me.pgid.load(core::sync::atomic::Ordering::Relaxed)),
         g => WaitFor::Group((-g) as u32),
     };
-    match proc::wait(&me, which, false)? {
+    // WNOHANG: reap only an already-exited child, never block. postgres'
+    // postmaster polls with wait4(-1, WNOHANG) in its reaper; blocking here would
+    // trap the whole event loop and it would never accept connections.
+    let nohang = options & WNOHANG != 0;
+    match proc::wait(&me, which, nohang)? {
         Some((cpid, st)) => {
             if status != 0 {
                 uaccess::write_obj(status, &st.wait_status())?;
