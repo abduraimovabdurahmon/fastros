@@ -58,6 +58,25 @@ pub unsafe fn wrmsr(msr: u32, v: u64) {
     }
 }
 
+/// Save the FPU/SSE register file (x87 + XMM + MXCSR) to a 512-byte, 16-byte
+/// aligned area. Used to preserve a task's floating-point state across context
+/// switches and signal handlers; the kernel itself is soft-float and never
+/// touches these registers otherwise.
+///
+/// # Safety
+/// `area` must point to writable, 16-byte-aligned storage of at least 512 bytes.
+pub unsafe fn fxsave(area: *mut u8) {
+    unsafe { asm!("fxsave [{}]", in(reg) area, options(nostack)) };
+}
+
+/// Restore an FPU/SSE register file saved by [`fxsave`].
+///
+/// # Safety
+/// `area` must point to a valid 16-byte-aligned FXSAVE image of at least 512 bytes.
+pub unsafe fn fxrstor(area: *const u8) {
+    unsafe { asm!("fxrstor [{}]", in(reg) area, options(nostack, readonly)) };
+}
+
 macro_rules! creg {
     ($read:ident, $write:ident, $reg:literal) => {
         #[inline]

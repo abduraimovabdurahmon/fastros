@@ -57,11 +57,30 @@ impl TaskState {
 
 type Entry = Box<dyn FnOnce() + Send + 'static>;
 
+/// A per-task FPU/SSE save area (x87 + XMM). 16-byte aligned for FXSAVE.
+#[repr(C, align(16))]
+pub struct FpuState([u8; 512]);
+
+impl FpuState {
+    /// A clean initial FPU state: FCW = 0x037F (the x87 default) and
+    /// MXCSR = 0x1F80 (all SSE exceptions masked, round-to-nearest); the rest
+    /// zero. Restoring this gives a new task a well-defined FPU, so the first
+    /// task to run never inherits stale registers.
+    fn clean() -> FpuState {
+        let mut a = [0u8; 512];
+        a[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+        a[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+        FpuState(a)
+    }
+}
+
 pub struct Task {
     pub tid: Tid,
     name: SpinLock<String>,
     state: AtomicU8,
     saved_rsp: UnsafeCell<usize>,
+    /// Saved FPU/SSE registers while this task is not the one running on the CPU.
+    fpu: UnsafeCell<FpuState>,
     stack: SpinLock<Option<KernelStack>>,
     stack_top: usize,
     entry: SpinLock<Option<Entry>>,
@@ -226,6 +245,7 @@ fn new_task(tid: Tid, name: &str, stack: Option<KernelStack>, stack_top: usize, 
         name: SpinLock::new(String::from(name)),
         state: AtomicU8::new(TaskState::Ready as u8),
         saved_rsp: UnsafeCell::new(rsp),
+        fpu: UnsafeCell::new(FpuState::clean()),
         stack: SpinLock::new(stack),
         stack_top,
         entry: SpinLock::new(entry),
@@ -449,6 +469,14 @@ pub fn schedule() {
             unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, next.fs_base.load(Ordering::Relaxed)) };
         }
         CURRENT.store(Arc::as_ptr(&next) as *mut Task, Ordering::Release);
+        // Preserve the outgoing task's FPU/SSE registers and load the incoming
+        // task's. The kernel is soft-float, so the live FPU state belongs to
+        // whatever user context last ran; without this, a preempted task's
+        // floating-point/SIMD registers are silently clobbered by the next task.
+        unsafe {
+            cpu::fxsave((*prev.fpu.get()).0.as_mut_ptr());
+            cpu::fxrstor((*next.fpu.get()).0.as_ptr());
+        }
         let p = prev.saved_rsp.get();
         let n = unsafe { *next.saved_rsp.get() };
         rq.current = Some(next);

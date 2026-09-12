@@ -192,13 +192,13 @@ struct FxArea([u8; FXSAVE_SIZE]);
 /// soft-float and never touches it) into a kernel buffer.
 fn fxsave() -> FxArea {
     let mut a = FxArea([0u8; FXSAVE_SIZE]);
-    unsafe { core::arch::asm!("fxsave [{}]", in(reg) a.0.as_mut_ptr(), options(nostack)) };
+    unsafe { crate::arch::x86_64::cpu::fxsave(a.0.as_mut_ptr()) };
     a
 }
 
 /// Restore an FPU/SSE state saved by [`fxsave`].
 fn fxrstor(a: &FxArea) {
-    unsafe { core::arch::asm!("fxrstor [{}]", in(reg) a.0.as_ptr(), options(nostack, readonly)) };
+    unsafe { crate::arch::x86_64::cpu::fxrstor(a.0.as_ptr()) };
 }
 
 /// Write a `struct sigcontext` (mcontext) for `r` into `buf` at `UC_MCTX`.
