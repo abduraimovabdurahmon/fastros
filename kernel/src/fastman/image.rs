@@ -153,6 +153,30 @@ pub fn rootfs_path(ctx: &Ctx, id: &str) -> String {
     format!("{}/{id}/rootfs", store::images_dir(ctx))
 }
 
+/// Path of the cached on-disk size (bytes, decimal text). Computing it means
+/// walking the whole extracted rootfs, so it is recorded once at pull time and
+/// read back cheaply by `image ls`.
+fn size_path(ctx: &Ctx, id: &str) -> String {
+    format!("{}/{id}/size", store::images_dir(ctx))
+}
+
+fn write_size(ctx: &Ctx, id: &str, bytes: u64) {
+    let _ = ops::write_file(ctx, &size_path(ctx, id), alloc::format!("{bytes}").as_bytes(), 0o600);
+}
+
+/// Read the cached size; if absent (an image from before this was recorded),
+/// compute it once by walking the tree and cache the result.
+fn read_size(ctx: &Ctx, id: &str) -> u64 {
+    if let Ok(d) = ops::read_file(ctx, &size_path(ctx, id)) {
+        if let Ok(n) = String::from_utf8_lossy(&d).trim().parse::<u64>() {
+            return n;
+        }
+    }
+    let bytes = tree_size(ctx, &rootfs_path(ctx, id));
+    write_size(ctx, id, bytes);
+    bytes
+}
+
 pub fn load_config(ctx: &Ctx, id: &str) -> ImageConfig {
     ops::read_file(ctx, &config_path(ctx, id))
         .map(|d| ImageConfig::decode(&String::from_utf8_lossy(&d)))
@@ -183,6 +207,7 @@ pub fn import(ctx: &Ctx, reference: &str, data: &[u8], config: ImageConfig) -> K
     ops::mkdir(ctx, &rootfs, 0o755)?;
     let st = super::extract::layer(ctx, &rootfs, data, ctx.cred.uid, ctx.cred.gid)?;
     ops::write_file(ctx, &config_path(ctx, &id), config.encode().as_bytes(), 0o600)?;
+    write_size(ctx, &id, st.bytes);
     // Update the index (replacing any existing image with the same key).
     let mut index = read_index(ctx);
     index.retain(|(k, _)| *k != r.key());
@@ -207,6 +232,7 @@ pub fn store_layers(ctx: &Ctx, reference: &str, layers: &[Vec<u8>], config: Imag
         bytes += st.bytes;
     }
     ops::write_file(ctx, &config_path(ctx, &id), config.encode().as_bytes(), 0o600)?;
+    write_size(ctx, &id, bytes);
     let mut index = read_index(ctx);
     index.retain(|(k, _)| *k != r.key());
     index.push((r.key(), id.clone()));
@@ -221,7 +247,7 @@ pub fn list(ctx: &Ctx) -> Vec<Image> {
         .filter_map(|(key, id)| {
             let dir = format!("{}/{id}", store::images_dir(ctx));
             let created = ops::stat(ctx, &dir, true).map(|m| m.mtime.sec as u64).unwrap_or(0);
-            let size = tree_size(ctx, &rootfs_path(ctx, &id));
+            let size = read_size(ctx, &id);
             Some(Image { id, key, created, size })
         })
         .collect()

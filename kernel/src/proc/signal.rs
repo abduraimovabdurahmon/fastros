@@ -179,8 +179,27 @@ impl Regs {
 // `struct ucontext` / `struct sigcontext` (x86_64) offsets we build and read.
 const UC_SIZE: usize = 512;
 const UC_MCTX: usize = 40; // offsetof(ucontext, uc_mcontext)
+const UC_FPSTATE: usize = 40 + 184; // sigcontext.fpstate pointer
 const UC_SIGMASK: usize = 40 + 256; // offsetof(ucontext, uc_sigmask)
 const SIGINFO_SIZE: usize = 128;
+const FXSAVE_SIZE: usize = 512;
+
+/// A 16-byte-aligned FXSAVE area (FXSAVE/FXRSTOR require 16-byte alignment).
+#[repr(C, align(16))]
+struct FxArea([u8; FXSAVE_SIZE]);
+
+/// Save the current FPU/SSE state (the interrupted user's — the kernel is
+/// soft-float and never touches it) into a kernel buffer.
+fn fxsave() -> FxArea {
+    let mut a = FxArea([0u8; FXSAVE_SIZE]);
+    unsafe { core::arch::asm!("fxsave [{}]", in(reg) a.0.as_mut_ptr(), options(nostack)) };
+    a
+}
+
+/// Restore an FPU/SSE state saved by [`fxsave`].
+fn fxrstor(a: &FxArea) {
+    unsafe { core::arch::asm!("fxrstor [{}]", in(reg) a.0.as_ptr(), options(nostack, readonly)) };
+}
 
 /// Write a `struct sigcontext` (mcontext) for `r` into `buf` at `UC_MCTX`.
 fn write_mcontext(buf: &mut [u8], r: &Regs) {
@@ -252,6 +271,8 @@ pub fn setup_frame(regs: &Regs, sig: u32, act: &SigAction, old_mask: u64) -> KRe
     sp &= !15;
     sp -= SIGINFO_SIZE;
     let info = sp;
+    sp -= FXSAVE_SIZE;
+    let fpstate = sp; // FPU/SSE save area (16-aligned)
     sp -= UC_SIZE;
     let uc = sp; // 16-aligned
     sp -= 8;
@@ -262,9 +283,16 @@ pub fn setup_frame(regs: &Regs, sig: u32, act: &SigAction, old_mask: u64) -> KRe
     si[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
     uaccess::copy_to(info, &si)?;
 
-    // ucontext: mcontext with the saved regs + the old blocked mask.
+    // Save the interrupted FPU/SSE state so the handler (user code that uses
+    // XMM) cannot corrupt it; sigreturn restores it. Without this, an async
+    // signal silently garbles floating-point/SIMD state of the interrupted code.
+    let fx = fxsave();
+    uaccess::copy_to(fpstate, &fx.0)?;
+
+    // ucontext: mcontext with the saved regs, the fpstate pointer and old mask.
     let mut ucb = [0u8; UC_SIZE];
     write_mcontext(&mut ucb, regs);
+    ucb[UC_FPSTATE..UC_FPSTATE + 8].copy_from_slice(&(fpstate as u64).to_le_bytes());
     ucb[UC_SIGMASK..UC_SIGMASK + 8].copy_from_slice(&old_mask.to_le_bytes());
     uaccess::copy_to(uc, &ucb)?;
 
@@ -289,6 +317,15 @@ pub fn restore_frame(regs: &mut Regs) -> KResult<u64> {
     let uc = regs.rsp as usize;
     let saved = read_mcontext(uc)?;
     let mask = read_sigmask(uc)?;
+    // Restore the FPU/SSE state the handler ran over.
+    let mut fpptr = [0u8; 8];
+    uaccess::copy_from(uc + UC_FPSTATE, &mut fpptr)?;
+    let fpstate = u64::from_le_bytes(fpptr) as usize;
+    if fpstate != 0 {
+        let mut fx = FxArea([0u8; FXSAVE_SIZE]);
+        uaccess::copy_from(fpstate, &mut fx.0)?;
+        fxrstor(&fx);
+    }
     *regs = saved;
     Ok(mask)
 }
