@@ -14,6 +14,7 @@ pub mod dns;
 pub mod filter;
 pub mod socket;
 pub mod sockfile;
+pub mod unix;
 
 use crate::drivers::net::e1000;
 use crate::sync::{Mutex, Once, WaitQueue};

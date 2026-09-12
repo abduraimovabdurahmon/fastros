@@ -66,9 +66,52 @@ fn write_sockaddr(ep: IpEndpoint, addr: usize, addrlen: usize) -> KResult<()> {
     Ok(())
 }
 
+// ── AF_UNIX helpers ──────────────────────────────────────────────────────────
+
+use crate::net::unix::{UnixSocketFile, AF_UNIX};
+
+/// The address family in a `sockaddr` (first 2 bytes), or 0.
+fn sockaddr_family(addr: usize, len: usize) -> u16 {
+    if addr == 0 || len < 2 {
+        return 0;
+    }
+    uaccess::read_obj::<u16>(addr).unwrap_or(0)
+}
+
+/// Read the path from a `sockaddr_un` (family@0, NUL-terminated path@2).
+fn read_sun_path(addr: usize, len: usize) -> KResult<alloc::string::String> {
+    if len < 3 {
+        return Err(Errno::EINVAL);
+    }
+    let n = (len - 2).min(108);
+    let mut b = alloc::vec![0u8; n];
+    uaccess::copy_from(addr + 2, &mut b)?;
+    let end = b.iter().position(|&c| c == 0).unwrap_or(n);
+    Ok(alloc::string::String::from_utf8_lossy(&b[..end]).into_owned())
+}
+
+fn with_unix<R>(fd: i32, f: impl FnOnce(&UnixSocketFile) -> KResult<R>) -> KResult<R> {
+    let file = fdt_get(fd)?;
+    let s = file.as_any().downcast_ref::<UnixSocketFile>().ok_or(Errno::ENOTSOCK)?;
+    f(s)
+}
+
+fn is_unix(fd: i32) -> bool {
+    fdt_get(fd).map(|f| f.as_any().is::<UnixSocketFile>()).unwrap_or(false)
+}
+
 // ── socket syscalls ─────────────────────────────────────────────────────────
 
 pub fn socket(domain: i32, ty: i32, _protocol: i32) -> KResult<usize> {
+    let nonblock = ty & sockfile::SOCK_NONBLOCK != 0;
+    let cloexec = ty & sockfile::SOCK_CLOEXEC != 0;
+    if domain == AF_UNIX as i32 {
+        // Only SOCK_STREAM named/abstract sockets; SOCK_DGRAM AF_UNIX is rare.
+        if ty & 0xff != sockfile::SOCK_STREAM {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        return install(UnixSocketFile::new(nonblock), cloexec);
+    }
     if domain != sockfile::AF_INET as i32 {
         return Err(Errno::EAFNOSUPPORT);
     }
@@ -77,23 +120,36 @@ pub fn socket(domain: i32, ty: i32, _protocol: i32) -> KResult<usize> {
         sockfile::SOCK_DGRAM => true,
         _ => return Err(Errno::EINVAL),
     };
-    let nonblock = ty & sockfile::SOCK_NONBLOCK != 0;
-    let cloexec = ty & sockfile::SOCK_CLOEXEC != 0;
     install(SocketFile::new(dgram, nonblock), cloexec)
 }
 
 pub fn bind(fd: i32, addr: usize, len: usize) -> KResult<usize> {
+    if sockaddr_family(addr, len) == AF_UNIX {
+        let path = read_sun_path(addr, len)?;
+        with_unix(fd, |s| s.bind(&path))?;
+        return Ok(0);
+    }
     let ep = read_sockaddr(addr, len)?;
     with_sock(fd, |s| s.bind(ep.port))?;
     Ok(0)
 }
 
 pub fn listen(fd: i32, backlog: i32) -> KResult<usize> {
-    with_sock(fd, |s| s.listen(backlog.max(0) as usize))?;
+    let b = backlog.max(0) as usize;
+    if is_unix(fd) {
+        with_unix(fd, |s| s.listen(b))?;
+        return Ok(0);
+    }
+    with_sock(fd, |s| s.listen(b))?;
     Ok(0)
 }
 
 pub fn connect(fd: i32, addr: usize, len: usize) -> KResult<usize> {
+    if sockaddr_family(addr, len) == AF_UNIX || is_unix(fd) {
+        let path = read_sun_path(addr, len)?;
+        with_unix(fd, |s| s.connect(&path))?;
+        return Ok(0);
+    }
     let ep = read_sockaddr(addr, len)?;
     with_sock(fd, |s| s.connect(ep))?;
     Ok(0)
@@ -102,6 +158,14 @@ pub fn connect(fd: i32, addr: usize, len: usize) -> KResult<usize> {
 fn do_accept(fd: i32, addr: usize, addrlen: usize, flags: i32) -> KResult<usize> {
     let nonblock = flags & sockfile::SOCK_NONBLOCK != 0;
     let cloexec = flags & sockfile::SOCK_CLOEXEC != 0;
+    if is_unix(fd) {
+        let child = with_unix(fd, |s| s.accept(nonblock))?;
+        // A connected AF_UNIX peer has no address; report zero-length.
+        if addrlen != 0 {
+            let _ = uaccess::write_obj(addrlen, &0u32);
+        }
+        return install(child, cloexec);
+    }
     let (child, peer) = with_sock(fd, |s| s.accept(nonblock))?;
     if addr != 0 {
         write_sockaddr(peer, addr, addrlen)?;
@@ -137,19 +201,47 @@ pub fn socketpair(_domain: i32, ty: i32, _protocol: i32, sv: usize) -> KResult<u
     Ok(0)
 }
 
+/// Write a `sockaddr_un { u16 family; char path[] }` and update `addrlen`.
+fn write_sun(path: &str, addr: usize, addrlen: usize) -> KResult<()> {
+    if addr == 0 || addrlen == 0 {
+        return Ok(());
+    }
+    let mut b = alloc::vec![0u8; 2 + path.len() + 1];
+    b[0..2].copy_from_slice(&AF_UNIX.to_le_bytes());
+    b[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    let cap: u32 = uaccess::read_obj(addrlen)?;
+    let n = (cap as usize).min(b.len());
+    uaccess::copy_to(addr, &b[..n])?;
+    uaccess::write_obj(addrlen, &(b.len() as u32))?;
+    Ok(())
+}
+
 pub fn getsockname(fd: i32, addr: usize, addrlen: usize) -> KResult<usize> {
+    if is_unix(fd) {
+        let path = with_unix(fd, |s| Ok(s.local_path()))?.unwrap_or_default();
+        write_sun(&path, addr, addrlen)?;
+        return Ok(0);
+    }
     let ep = with_sock(fd, |s| Ok(s.local_addr()))?.unwrap_or_else(|| IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), 0));
     write_sockaddr(ep, addr, addrlen)?;
     Ok(0)
 }
 
 pub fn getpeername(fd: i32, addr: usize, addrlen: usize) -> KResult<usize> {
+    if is_unix(fd) {
+        // Connected AF_UNIX peers are anonymous; report an empty sun path.
+        write_sun("", addr, addrlen)?;
+        return Ok(0);
+    }
     let ep = with_sock(fd, |s| s.peer_addr().ok_or(Errno::ENOTCONN))?;
     write_sockaddr(ep, addr, addrlen)?;
     Ok(0)
 }
 
 pub fn shutdown(fd: i32, how: i32) -> KResult<usize> {
+    if is_unix(fd) {
+        return Ok(0); // closing the fd tears the duplex down; accept the call
+    }
     with_sock(fd, |s| s.shutdown(how))?;
     Ok(0)
 }
@@ -158,12 +250,17 @@ pub fn shutdown(fd: i32, how: i32) -> KResult<usize> {
 /// `TCP_NODELAY` and `SO_KEEPALIVE` already match the stack's behaviour, so
 /// acknowledging them is safe and lets servers start.
 pub fn setsockopt(fd: i32, _level: i32, _optname: i32, _optval: usize, _optlen: usize) -> KResult<usize> {
+    if is_unix(fd) {
+        return Ok(0);
+    }
     with_sock(fd, |_| Ok(()))?;
     Ok(0)
 }
 
 pub fn getsockopt(fd: i32, level: i32, optname: i32, optval: usize, optlen: usize) -> KResult<usize> {
-    with_sock(fd, |_| Ok(()))?;
+    if !is_unix(fd) {
+        with_sock(fd, |_| Ok(()))?;
+    }
     const SOL_SOCKET: i32 = 1;
     const SO_TYPE: i32 = 3;
     // Report no pending error (0), or SOCK_STREAM for SO_TYPE — enough for libc.
