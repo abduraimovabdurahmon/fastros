@@ -242,10 +242,12 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         // Credential setters: a rootless container already runs under the
         // caller's identity and is sandboxed regardless, so a server dropping
         // privileges (nginx worker setgid/setuid/setgroups) succeeds as a no-op
-        // instead of failing and exiting. setuid=105 setgid=106 setpgid=109
+        // instead of failing and exiting. setuid=105 setgid=106
         // setreuid=113 setregid=114 setgroups=116 setresuid=117 setresgid=119
         // setfsuid=122 setfsgid=123 setsid handled elsewhere.
         105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 => 0,
+        // setpgid: job-control shells (bash) put each pipeline in its own group.
+        109 => ret(proc_sys::setpgid(a[0] as i64, a[1] as i64)),
         // getgroups: no supplementary groups.
         115 => 0,
 

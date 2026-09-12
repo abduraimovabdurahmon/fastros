@@ -462,6 +462,28 @@ pub fn getpgid(pid: i64) -> KResult<usize> {
     Ok(p.pgid.load(core::sync::atomic::Ordering::Relaxed) as usize)
 }
 
+/// `setpgid(pid, pgid)`: put a process into a process group — the mechanism a
+/// job-control shell (bash) uses to place each pipeline in its own group. A
+/// `pid` of 0 means the caller; a `pgid` of 0 means "use `pid`" (become a group
+/// leader). Only the caller or one of its children may be moved, and a child
+/// that has already `execve`'d cannot. We don't enforce the session checks, but
+/// implementing this (rather than ENOSYS) stops bash printing
+/// "child setpgid: Function not implemented" on every command.
+pub fn setpgid(pid: i64, pgid: i64) -> KResult<usize> {
+    if pid < 0 || pgid < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let me = proc::current();
+    let target = if pid == 0 || pid as u32 == me.pid { me.clone() } else { proc::find(pid as u32).ok_or(Errno::ESRCH)? };
+    // Only self or a child may be repositioned.
+    if target.pid != me.pid && target.ppid.load(Ordering::Relaxed) != me.pid {
+        return Err(Errno::ESRCH);
+    }
+    let new = if pgid == 0 { target.pid } else { pgid as u32 };
+    target.pgid.store(new, Ordering::Relaxed);
+    Ok(0)
+}
+
 /// `setsid`: start a new session and process group led by the caller, detaching
 /// its controlling terminal. Daemons (postgres' pg_ctl) rely on this to
 /// background themselves. Fails with EPERM if the caller already leads a group.
