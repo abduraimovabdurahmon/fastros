@@ -67,6 +67,7 @@ impl File for EventFd {
                 .map_err(|e| if e == WaitResult::Interrupted { Errno::EINTR } else { Errno::EAGAIN })?;
         };
         self.wq.wake_all();
+        crate::net::wake_pollers();
         buf[..8].copy_from_slice(&val.to_ne_bytes());
         Ok(8)
     }
@@ -96,6 +97,7 @@ impl File for EventFd {
                 .map_err(|e| if e == WaitResult::Interrupted { Errno::EINTR } else { Errno::EAGAIN })?;
         }
         self.wq.wake_all();
+        crate::net::wake_pollers();
         Ok(8)
     }
 

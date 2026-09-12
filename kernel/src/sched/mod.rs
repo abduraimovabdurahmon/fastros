@@ -139,6 +139,8 @@ impl Task {
         }
         self.signals.fetch_or(1 << (sig - 1), Ordering::AcqRel);
         wake(self);
+        // A signalfd being watched by poll/epoll becomes readable now.
+        crate::net::wake_pollers();
     }
     pub fn signal_pending(&self) -> bool {
         self.signals.load(Ordering::Acquire) != 0

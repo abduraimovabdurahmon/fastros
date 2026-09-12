@@ -46,6 +46,7 @@ impl Pipe {
             }
         }
         self.wq.wake_all();
+        crate::net::wake_pollers();
         let acc = if write { flags::O_WRONLY } else { flags::O_RDONLY };
         Arc::new(PipeEnd {
             pipe: self.clone(),
@@ -159,6 +160,7 @@ impl File for PipeEnd {
                 .map_err(interrupted)?;
         };
         self.pipe.wq.wake_all();
+        crate::net::wake_pollers();
         Ok(n)
     }
 
@@ -197,6 +199,7 @@ impl File for PipeEnd {
                 written += n;
             }
             self.pipe.wq.wake_all();
+        crate::net::wake_pollers();
         }
         Ok(written)
     }
@@ -376,5 +379,6 @@ impl Drop for PipeEnd {
             }
         }
         self.pipe.wq.wake_all();
+        crate::net::wake_pollers();
     }
 }

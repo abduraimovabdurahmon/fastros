@@ -31,8 +31,19 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4C
 
 pub use smoltcp::wire::{IpAddress, IpEndpoint};
 
-/// Woken after every poll that may have changed socket state.
+/// The universal I/O-readiness wait queue: `poll`/`select`/`epoll_wait` sleep
+/// here, so EVERY source of fd readiness must wake it — sockets (via `netd`),
+/// and also pipes, eventfds and signalfds (used as latches by servers like
+/// postgres). A pipe write that does not wake this queue leaves an epoll/poll
+/// waiter asleep until its timeout, which stalls latch-driven event loops.
 pub static SOCK_WQ: WaitQueue = WaitQueue::new();
+
+/// Wake everything blocked in `poll`/`select`/`epoll_wait`. Call after any
+/// change that makes a non-socket fd (pipe, eventfd, signalfd) readable or
+/// writable; socket changes are already covered by `netd`.
+pub fn wake_pollers() {
+    SOCK_WQ.wake_all();
+}
 static NETD_WQ: WaitQueue = WaitQueue::new();
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
