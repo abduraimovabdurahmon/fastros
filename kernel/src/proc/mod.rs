@@ -410,10 +410,105 @@ pub fn start_user_with(mut s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame
     Ok(p)
 }
 
+/// Create a new thread in the current process: a task sharing the process's
+/// address space, fds and signal handlers, with its own stack, TLS and tid.
+/// `stack` is the new user stack, `tls` the thread pointer (CLONE_SETTLS),
+/// `ptid`/`ctid_set` receive the new tid, `ctid_clear` is cleared+futex-woken on
+/// exit (CLONE_CHILD_CLEARTID). Returns the new tid.
+pub fn start_thread(
+    stack: u64,
+    tls: Option<u64>,
+    ptid: usize,
+    ctid_set: usize,
+    ctid_clear: usize,
+    frame: &UserFrame,
+) -> KResult<usize> {
+    let parent = current();
+    let aspace = parent.aspace.lock().clone().ok_or(Errno::ENOSYS)?;
+    let mut tframe = *frame;
+    tframe.rax = 0; // the child's clone() returns 0
+    tframe.rsp = stack;
+    let fs_base = match tls {
+        Some(t) => t,
+        None => sched::with_current(|t| t.fs_base.load(Ordering::Relaxed)),
+    };
+    let tid;
+    {
+        // Fully set up the task before it can be scheduled (no preemption).
+        let _irq = crate::arch::cpu::IrqGuard::new();
+        let task = sched::make_task(&parent.comm(), move || {
+            unsafe { enter_user(&tframe) };
+            sched::exit_current(0);
+        })
+        .ok_or(Errno::ENOMEM)?;
+        task.cr3.store(aspace.pml4(), Ordering::Release);
+        task.fs_base.store(fs_base, Ordering::Release);
+        task.owner.store(parent.pid, Ordering::Release);
+        if ctid_clear != 0 {
+            task.clear_child_tid.store(ctid_clear as u64, Ordering::Release);
+        }
+        tid = task.tid;
+        parent.tasks.lock().push(task.clone());
+        sched::make_ready(&task);
+    }
+    // Tid writes into the shared address space (safe to fault now).
+    if ptid != 0 {
+        let _ = crate::uaccess::write_obj(ptid, &(tid as i32));
+    }
+    if ctid_set != 0 {
+        let _ = crate::uaccess::write_obj(ctid_set, &(tid as i32));
+    }
+    Ok(tid as usize)
+}
+
+/// Terminate the calling *thread*. If it is the last thread, the whole process
+/// exits; otherwise the other threads keep running.
+pub fn exit_thread(code: i32) -> ! {
+    let me = current();
+    let mytid = sched::current_tid();
+    let remaining = {
+        let mut t = me.tasks.lock();
+        t.retain(|x| x.tid != mytid);
+        t.len()
+    };
+    if remaining == 0 {
+        // Last thread: tear down the process. Restore the task so exit_current
+        // sees a consistent list.
+        me.tasks.lock().push(sched::current());
+        exit_current(ExitStatus::Exited(code));
+    }
+    // A joined thread's clear_child_tid word is zeroed and futex-woken.
+    let ctid = sched::with_current(|t| t.clear_child_tid.load(Ordering::Relaxed)) as usize;
+    if ctid != 0 {
+        let _ = crate::uaccess::write_obj(ctid, &0u32);
+        crate::syscall::proc_sys::futex_wake_addr(ctid);
+    }
+    sched::exit_current(code);
+}
+
 /// Terminate the current process. Never returns.
 pub fn exit_current(status: ExitStatus) -> ! {
     let me = current();
     assert!(me.pid != 0, "kernel threads exit through sched::exit_current");
+    // Idempotent across threads: the first caller claims the teardown by setting
+    // `exit`; a sibling woken by the SIGKILL below sees it set and just ends
+    // itself. Claiming under the lock makes this race-free against preemption.
+    {
+        let mut ex = me.exit.lock();
+        if ex.is_some() {
+            drop(ex);
+            sched::exit_current(status.shell_code());
+        }
+        *ex = Some(status); // refined (signal adjustment) further down
+    }
+    // Ask any sibling threads to die; they unwind on SIGKILL and re-enter here,
+    // short-circuiting above.
+    let mytid = sched::current_tid();
+    for t in me.tasks.lock().iter() {
+        if t.tid != mytid {
+            t.send_signal(signal::SIGKILL);
+        }
+    }
     // A fatal signal that interrupted the work decides how we "died".
     let status = match (status, sched::with_current(|t| t.pending_signals())) {
         (ExitStatus::Exited(_), pending) if pending != 0 => {

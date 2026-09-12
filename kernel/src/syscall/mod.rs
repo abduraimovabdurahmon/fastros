@@ -9,7 +9,7 @@
 mod file;
 mod mem;
 mod net;
-mod proc_sys;
+pub mod proc_sys;
 
 use crate::arch::x86_64::syscall::UserFrame;
 use crate::errno::{Errno, KResult};
@@ -180,10 +180,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         }
         35 => ret(proc_sys::nanosleep(a[0] as usize, a[1] as usize)),
         39 => proc::current().pid as u64,
-        56 => ret(proc_sys::clone(a[0], a[1], frame)),
+        56 => ret(proc_sys::clone(a[0], a[1], a[2] as usize, a[3] as usize, a[4], frame)),
         57 | 58 => ret(proc_sys::fork(frame)),
         59 => ret(proc_sys::execve(a[0] as usize, a[1] as usize, a[2] as usize, frame)),
-        60 => proc_sys::exit(a[0] as i32, false),
+        60 => crate::proc::exit_thread(a[0] as i32),
         61 => ret(proc_sys::wait4(a[0] as i64, a[1] as usize, a[2] as i32, a[3] as usize)),
         62 => ret(proc_sys::kill(a[0] as i64, a[1] as u32)),
         34 => ret(proc_sys::pause()),
@@ -204,7 +204,9 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         186 => crate::proc::current_tid() as u64,
         201 => crate::time::unix_now(),
         218 => {
-            // set_tid_address: we have no clear_child_tid; return the tid.
+            // set_tid_address(ptr): record clear_child_tid for this thread and
+            // return the tid.
+            crate::sched::with_current(|t| t.clear_child_tid.store(a[0], core::sync::atomic::Ordering::Release));
             crate::proc::current_tid() as u64
         }
         // ── System V shared memory ──

@@ -196,19 +196,25 @@ pub fn fork(frame: &UserFrame) -> KResult<usize> {
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_VFORK: u64 = 0x4000;
+const CLONE_SETTLS: u64 = 0x80000;
+const CLONE_PARENT_SETTID: u64 = 0x100000;
+const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+const CLONE_CHILD_SETTID: u64 = 0x1000000;
 
-/// `clone`. Plain `fork` semantics (a private, copy-on-write child) unless the
-/// caller asks for the `vfork`/`posix_spawn` pattern (CLONE_VM|CLONE_VFORK): the
-/// child runs on the provided stack and the parent is suspended until the child
-/// execs or exits. We honour that by making a normal COW child on the given
-/// stack and blocking the parent — functionally identical to vfork for its only
-/// real use (a child that only rearranges fds and immediately execs), without
-/// the hazard of two tasks sharing one address space.
-pub fn clone(flags: u64, stack: u64, frame: &UserFrame) -> KResult<usize> {
+/// `clone`. CLONE_VM without CLONE_VFORK creates a thread (a task sharing the
+/// process's address space, fds and signal handlers — pthread_create). The
+/// vfork/posix_spawn pattern (CLONE_VM|CLONE_VFORK) makes a COW child on the
+/// given stack and suspends the parent until it execs or exits. Otherwise it is
+/// a plain copy-on-write `fork`.
+pub fn clone(flags: u64, stack: u64, ptid: usize, ctid: usize, tls: u64, frame: &UserFrame) -> KResult<usize> {
     let vfork = flags & CLONE_VFORK != 0;
     if flags & CLONE_VM != 0 && !vfork {
-        // Shared-address-space threads are not supported.
-        return Err(Errno::ENOSYS);
+        // Thread creation.
+        let tls_opt = (flags & CLONE_SETTLS != 0).then_some(tls);
+        let ptid_p = if flags & CLONE_PARENT_SETTID != 0 { ptid } else { 0 };
+        let ctid_set = if flags & CLONE_CHILD_SETTID != 0 { ctid } else { 0 };
+        let ctid_clear = if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 };
+        return proc::start_thread(stack, tls_opt, ptid_p, ctid_set, ctid_clear, frame);
     }
     let parent = proc::current();
     let aspace = parent.aspace.lock().clone().ok_or(Errno::ENOSYS)?;
@@ -617,6 +623,19 @@ fn futex_deadline(ptr: usize, absolute: bool) -> KResult<Option<u64>> {
     let nsec: i64 = uaccess::read_obj(ptr + 8)?;
     let ns = (sec.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(nsec.max(0) as u64);
     Ok(Some(if absolute { ns } else { crate::time::now_ns().saturating_add(ns) }))
+}
+
+/// Wake any waiters on the futex at `uaddr` (used for a thread's clear_child_tid
+/// on exit, so `pthread_join` returns).
+pub fn futex_wake_addr(uaddr: usize) {
+    if let Some(space) = proc::current_aspace() {
+        if let Ok(key) = space.phys_translate(uaddr) {
+            if let Some(b) = futex_existing(key) {
+                b.generation.fetch_add(1, Ordering::Release);
+                b.wq.wake_all();
+            }
+        }
+    }
 }
 
 pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, _uaddr2: usize, _val3: u32) -> KResult<usize> {

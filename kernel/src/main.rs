@@ -37,7 +37,7 @@ mod panic;
 mod power;
 mod proc;
 mod sched;
-mod syscall;
+pub mod syscall;
 mod shell;
 mod ftpd;
 mod ssh;

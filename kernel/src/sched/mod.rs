@@ -104,6 +104,9 @@ pub struct Task {
     pub cr3: AtomicU64,
     /// User thread pointer (FS base) for this task, restored on switch.
     pub fs_base: AtomicU64,
+    /// `clear_child_tid` (set_tid_address / CLONE_CHILD_CLEARTID): on thread
+    /// exit, zero this user word and futex-wake it, so `pthread_join` wakes.
+    pub clear_child_tid: AtomicU64,
 }
 
 // `saved_rsp` is only touched by the scheduler with interrupts disabled.
@@ -271,6 +274,7 @@ fn new_task(tid: Tid, name: &str, stack: Option<KernelStack>, stack_top: usize, 
         created_ns: crate::time::now_ns(),
         cr3: AtomicU64::new(0),
         fs_base: AtomicU64::new(0),
+        clear_child_tid: AtomicU64::new(0),
     })
 }
 
@@ -294,14 +298,27 @@ pub fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
 }
 
 pub fn try_spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Option<Arc<Task>> {
+    let t = make_task(name, f)?;
+    RQ.lock().ready.push_back(t.clone());
+    Some(t)
+}
+
+/// Create a task but DON'T make it runnable yet — the caller must finish setting
+/// it up (cr3, fs_base, owner) and then call [`make_ready`]. This closes the
+/// race where a new thread could be scheduled before its page tables are set.
+pub fn make_task(name: &str, f: impl FnOnce() + Send + 'static) -> Option<Arc<Task>> {
     let stack = KernelStack::new(KSTACK_PAGES)?;
     let top = stack.top();
     let rsp = prepare_stack(top);
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let t = new_task(tid, name, Some(stack), top, rsp, Some(Box::new(f)));
     TASKS.lock().insert(tid, t.clone());
-    RQ.lock().ready.push_back(t.clone());
     Some(t)
+}
+
+/// Make a task created with [`make_task`] runnable.
+pub fn make_ready(t: &Arc<Task>) {
+    RQ.lock().ready.push_back(t.clone());
 }
 
 /// The running task.
