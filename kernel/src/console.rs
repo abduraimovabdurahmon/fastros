@@ -83,6 +83,7 @@ pub fn start_getty() {
             ignored: 0,
             sigactions: crate::proc::signal::default_table(),
             vfork: false,
+            pidns: None,
         };
         let u = user.clone();
         if let Ok(p) = crate::proc::spawn(spawn, move || crate::shell::login_shell_main(u)) {

@@ -857,6 +857,7 @@ impl Conn {
             ignored: 0,
             sigactions: crate::proc::signal::default_table(),
             vfork: false,
+            pidns: None,
         };
         let interactive = command.is_none() && tty_for_proc.is_some();
         let u2 = user.clone();

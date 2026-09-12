@@ -110,6 +110,11 @@ pub struct Process {
     /// exits; the child then releases it. Set at birth for a vfork child.
     pub vfork_wq: WaitQueue,
     pub vfork_pending: AtomicBool,
+    /// PID namespace (a container's private pid view), if any.
+    pub pidns: SpinLock<Option<Arc<PidNs>>>,
+    /// This process's id within its PID namespace (its "virtual" pid). Equals
+    /// the global pid when the process is not in a namespace.
+    pub vpid: AtomicU32,
 }
 
 static PROCS: SpinLock<BTreeMap<Pid, Arc<Process>>> = SpinLock::new(BTreeMap::new());
@@ -250,6 +255,8 @@ pub fn init(ns: Arc<MountNamespace>) {
             children_cpu: AtomicU64::new(0),
             vfork_wq: WaitQueue::new(),
             vfork_pending: AtomicBool::new(false),
+            pidns: SpinLock::new(None),
+            vpid: AtomicU32::new(0),
         })
     });
 }
@@ -293,6 +300,73 @@ pub fn all() -> Vec<Arc<Process>> {
     PROCS.lock().values().cloned().collect()
 }
 
+/// A PID namespace: a container's private view of process ids. The container's
+/// init is vpid 1; descendants get fresh local ids. Maps translate between the
+/// global pid (the kernel's real id) and the namespace-local vpid.
+pub struct PidNs {
+    next: AtomicU32,
+    to_local: SpinLock<alloc::collections::BTreeMap<Pid, u32>>,
+    to_global: SpinLock<alloc::collections::BTreeMap<u32, Pid>>,
+}
+
+impl PidNs {
+    pub fn new() -> Arc<PidNs> {
+        Arc::new(PidNs {
+            next: AtomicU32::new(1),
+            to_local: SpinLock::new(alloc::collections::BTreeMap::new()),
+            to_global: SpinLock::new(alloc::collections::BTreeMap::new()),
+        })
+    }
+    /// Register `global` and return its new local vpid.
+    fn add(&self, global: Pid) -> u32 {
+        let local = self.next.fetch_add(1, Ordering::Relaxed);
+        self.to_local.lock().insert(global, local);
+        self.to_global.lock().insert(local, global);
+        local
+    }
+    fn remove(&self, global: Pid) {
+        if let Some(local) = self.to_local.lock().remove(&global) {
+            self.to_global.lock().remove(&local);
+        }
+    }
+    pub fn local_of(&self, global: Pid) -> Option<u32> {
+        self.to_local.lock().get(&global).copied()
+    }
+    pub fn global_of(&self, local: u32) -> Option<Pid> {
+        self.to_global.lock().get(&local).copied()
+    }
+    /// Every global pid in this namespace.
+    pub fn members(&self) -> Vec<Pid> {
+        self.to_local.lock().keys().copied().collect()
+    }
+}
+
+/// The current process's PID namespace, if it is in one (a container).
+pub fn current_pidns() -> Option<Arc<PidNs>> {
+    current().pidns.lock().clone()
+}
+
+/// The parent's id as seen in the caller's PID namespace (0 if the parent is
+/// outside it — e.g. a container's init).
+pub fn current_ppid_vpid() -> u32 {
+    let me = current();
+    let ppid = me.ppid.load(Ordering::Relaxed);
+    let ns = me.pidns.lock().clone();
+    match ns {
+        Some(ns) => ns.local_of(ppid).unwrap_or(0),
+        None => ppid,
+    }
+}
+
+/// Translate a pid the caller supplied (its namespace's vpid) to a global pid.
+/// Outside a namespace the pid is already global.
+pub fn to_global_pid(vpid: Pid) -> Pid {
+    match current_pidns() {
+        Some(ns) => ns.global_of(vpid as u32).map(|g| g as Pid).unwrap_or(vpid),
+        None => vpid,
+    }
+}
+
 /// Everything a new process inherits or is given.
 pub struct Spawn {
     pub name: String,
@@ -318,6 +392,9 @@ pub struct Spawn {
     /// This child is a `vfork`/`posix_spawn` child: it must release the blocked
     /// parent when it execs or exits.
     pub vfork: bool,
+    /// PID namespace to join (inherited from the parent; a fresh one for a
+    /// container's init, None for host processes).
+    pub pidns: Option<Arc<PidNs>>,
 }
 
 impl Spawn {
@@ -340,6 +417,7 @@ impl Spawn {
             ignored: parent.ignored.load(Ordering::Relaxed),
             sigactions: *parent.sigactions.lock(),
             vfork: false,
+            pidns: parent.pidns.lock().clone(),
         }
     }
 }
@@ -397,7 +475,13 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         children_cpu: AtomicU64::new(0),
         vfork_wq: WaitQueue::new(),
         vfork_pending: AtomicBool::new(s.vfork),
+        pidns: SpinLock::new(s.pidns.clone()),
+        vpid: AtomicU32::new(pid),
     });
+    // In a PID namespace, the process gets a namespace-local vpid (init = 1).
+    if let Some(ns) = &s.pidns {
+        p.vpid.store(ns.add(pid), Ordering::Release);
+    }
     PROCS.lock().insert(pid, p.clone());
     s.parent.children.lock().push(p.clone());
     task.owner.store(pid, Ordering::Release);
@@ -586,6 +670,10 @@ pub fn exit_current(status: ExitStatus) -> ! {
     if let Some(c) = me.container.lock().clone() {
         let n = me.tasks.lock().len() as u32;
         crate::cgroup::sub_pid(&c, n);
+    }
+    // Leave the PID namespace.
+    if let Some(ns) = me.pidns.lock().clone() {
+        ns.remove(me.pid);
     }
     me.tasks.lock().clear();
     drop(parent);

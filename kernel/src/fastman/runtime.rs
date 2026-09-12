@@ -247,6 +247,8 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         ignored: 0,
         sigactions: crate::proc::signal::default_table(),
         vfork: false,
+        // A container's init starts a fresh PID namespace (it becomes vpid 1).
+        pidns: Some(crate::proc::PidNs::new()),
     };
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
@@ -438,6 +440,8 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         ignored: 0,
         sigactions: crate::proc::signal::default_table(),
         vfork: false,
+        // Join the running container's PID namespace.
+        pidns: init.pidns.lock().clone(),
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = if let Some(t) = &itty {

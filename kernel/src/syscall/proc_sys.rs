@@ -333,6 +333,9 @@ pub fn wait4(pid: i64, status: usize, options: i32, _rusage: usize) -> KResult<u
 }
 
 pub fn kill(pid: i64, sig: u32) -> KResult<usize> {
+    // In a PID namespace, a positive pid is a vpid → translate to the global id
+    // (so `kill 1` in a container hits its init, never the host's).
+    let pid = if pid > 0 { proc::to_global_pid(pid as u32) as i64 } else { pid };
     proc::kill(&proc::current(), pid, sig)?;
     Ok(0)
 }

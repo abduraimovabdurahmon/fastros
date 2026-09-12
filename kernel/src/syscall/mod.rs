@@ -179,7 +179,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
             0
         }
         35 => ret(proc_sys::nanosleep(a[0] as usize, a[1] as usize)),
-        39 => proc::current().pid as u64,
+        39 => proc::current().vpid.load(core::sync::atomic::Ordering::Relaxed) as u64,
         56 => ret(proc_sys::clone(a[0], a[1], a[2] as usize, a[3] as usize, a[4], frame)),
         57 | 58 => ret(proc_sys::fork(frame)),
         59 => ret(proc_sys::execve(a[0] as usize, a[1] as usize, a[2] as usize, frame)),
@@ -194,7 +194,7 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         99 => ret(proc_sys::sysinfo(a[0] as usize)),
         102 | 107 => proc::current().cred().uid as u64,
         104 | 108 => proc::current().cred().gid as u64,
-        110 => proc::current().ppid.load(core::sync::atomic::Ordering::Relaxed) as u64,
+        110 => proc::current_ppid_vpid() as u64,
         111 => proc::current().pgid.load(core::sync::atomic::Ordering::Relaxed) as u64,
         112 => ret(proc_sys::setsid()),
         124 => proc::current().sid.load(core::sync::atomic::Ordering::Relaxed) as u64, // getsid

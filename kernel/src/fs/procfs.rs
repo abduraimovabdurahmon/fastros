@@ -219,8 +219,22 @@ impl Inode for PInode {
                 if name == "self" {
                     return Ok(self.mk(Node::SelfLink));
                 }
-                if let Ok(pid) = name.parse::<u32>() {
-                    return if task_exists(pid) { Ok(self.mk(Node::PidDir(pid))) } else { Err(Errno::ENOENT) };
+                if let Ok(vpid) = name.parse::<u32>() {
+                    // In a PID namespace the name is a vpid → resolve to the
+                    // global pid (and reject pids outside the namespace).
+                    return match proc::current_pidns() {
+                        Some(ns) => match ns.global_of(vpid) {
+                            Some(g) if task_exists(g as u32) => Ok(self.mk(Node::PidDir(g as u32))),
+                            _ => Err(Errno::ENOENT),
+                        },
+                        None => {
+                            if task_exists(vpid) {
+                                Ok(self.mk(Node::PidDir(vpid)))
+                            } else {
+                                Err(Errno::ENOENT)
+                            }
+                        }
+                    };
                 }
                 if let Some(f) = ROOT_FILES.iter().find(|&&f| f == name) {
                     return Ok(self.mk(Node::File(f)));
@@ -285,12 +299,30 @@ impl Inode for PInode {
                 out.push(e("net", Node::Dir("net"), FileType::Directory));
                 out.push(e("sys", Node::Dir("sys"), FileType::Directory));
                 out.push(e("self", Node::SelfLink, FileType::Symlink));
-                let mut pids: Vec<u32> = proc::all().iter().map(|p| p.pid).collect();
-                pids.extend(proc::kernel_threads().iter().map(|t| t.tid).filter(|&t| t != 0));
-                pids.sort_unstable();
-                pids.dedup();
-                for p in pids {
-                    out.push(e(&p.to_string(), Node::PidDir(p), FileType::Directory));
+                // In a PID namespace (a container) show only its own processes,
+                // named by their namespace-local vpid; otherwise show every
+                // global pid plus kernel threads.
+                match proc::current_pidns() {
+                    Some(ns) => {
+                        let mut vpids: Vec<(u32, u32)> = ns
+                            .members()
+                            .into_iter()
+                            .filter_map(|g| ns.local_of(g).map(|v| (v, g)))
+                            .collect();
+                        vpids.sort_unstable();
+                        for (v, g) in vpids {
+                            out.push(e(&v.to_string(), Node::PidDir(g), FileType::Directory));
+                        }
+                    }
+                    None => {
+                        let mut pids: Vec<u32> = proc::all().iter().map(|p| p.pid).collect();
+                        pids.extend(proc::kernel_threads().iter().map(|t| t.tid).filter(|&t| t != 0));
+                        pids.sort_unstable();
+                        pids.dedup();
+                        for p in pids {
+                            out.push(e(&p.to_string(), Node::PidDir(p), FileType::Directory));
+                        }
+                    }
                 }
             }
             Node::Dir("net") => {
@@ -337,7 +369,7 @@ impl Inode for PInode {
 
     fn readlink(&self) -> KResult<String> {
         match &self.node {
-            Node::SelfLink => Ok(proc::current().pid.to_string()),
+            Node::SelfLink => Ok(proc::current().vpid.load(Ordering::Relaxed).to_string()),
             Node::PidLink(pid, what) => {
                 let p = proc::find(*pid).ok_or(Errno::ENOENT)?;
                 let fs = p.fs.lock();
@@ -754,6 +786,12 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
     let (utime, stime) = if kthread { (0, ticks(cpu_ns)) } else { (ticks(cpu_ns), 0) };
     let cutime = p.as_ref().map(|p| ticks(p.children_cpu.load(Ordering::Relaxed))).unwrap_or(0);
     let state = state_letter(pid);
+    // Report ids as the reader's PID namespace sees them (a container's own
+    // vpids; init is 1). Outside a namespace these are the global pids.
+    let (dpid, dppid) = match proc::current_pidns() {
+        Some(ns) => (ns.local_of(pid).unwrap_or(pid), ns.local_of(ppid).unwrap_or(0)),
+        None => (pid, ppid),
+    };
     let mut s = String::new();
     match f {
         "stat" => {
@@ -761,7 +799,7 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
             let (vsize, rss) = if kthread { (0, 0) } else { (stack_bytes, stack_bytes / 4096) };
             let _ = writeln!(
                 s,
-                "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} {flags} 0 0 0 0 {utime} {stime} {cutime} 0 20 0 {nthreads} 0 {} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+                "{dpid} ({comm}) {state} {dppid} {pgid} {sid} {tty_nr} {tpgid} {flags} 0 0 0 0 {utime} {stime} {cutime} 0 20 0 {nthreads} 0 {} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
                 ticks(start_ns)
             );
         }
@@ -779,7 +817,7 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
             let _ = writeln!(s, "Name:\t{comm}");
             let _ = writeln!(s, "Umask:\t{:04o}", p.as_ref().map(|p| p.fs.lock().umask).unwrap_or(0o022));
             let _ = writeln!(s, "State:\t{state_name}");
-            let _ = writeln!(s, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0");
+            let _ = writeln!(s, "Tgid:\t{dpid}\nNgid:\t0\nPid:\t{dpid}\nPPid:\t{dppid}\nTracerPid:\t0");
             let _ = writeln!(s, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}");
             let _ = writeln!(s, "FDSize:\t64");
             let g: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
