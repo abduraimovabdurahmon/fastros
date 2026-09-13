@@ -40,6 +40,7 @@ mod proc;
 mod sched;
 pub mod syscall;
 mod shell;
+mod smp;
 mod ftpd;
 mod ssh;
 mod sync;

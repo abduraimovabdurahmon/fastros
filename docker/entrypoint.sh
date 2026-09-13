@@ -74,7 +74,7 @@ esac
 # port and drives the disk as IDE primary master.
 # `-cpu max` under TCG gives the guest RDRAND, SMEP, SMAP and UMIP.
 monitor=/tmp/fastros-monitor.sock
-set -- -machine pc -accel "$accel" -m "${FASTROS_MEM:-1G}" -kernel "$kernel" \
+set -- -machine pc -accel "$accel" -smp "${FASTROS_CPUS:-2}" -m "${FASTROS_MEM:-1G}" -kernel "$kernel" \
        -display none -serial stdio -monitor "unix:$monitor,server=on,wait=off" \
        -netdev user,id=net0,hostfwd=tcp::22-:22 -device e1000,netdev=net0 \
        -drive "file=$disk,format=raw,if=ide,index=0,cache=writeback" \
