@@ -185,6 +185,8 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "import" => import(ctx, &args[1..]),
         "build" => build(ctx, &args[1..]),
         "images" | "image" | "ls" => images(ctx),
+        "tag" => tag(ctx, &args[1..]),
+        "history" => history(ctx, &args[1..]),
         "rmi" => rmi(ctx, &args[1..]),
         "run" => run(ctx, &args[1..]),
         "ps" => ps(ctx, &args[1..]),
@@ -206,6 +208,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "ip" => container_ip(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
+        "system" => system(ctx, &args[1..]),
         "compose" => compose(ctx, &args[1..]),
         "kube" | "kubectl" | "k" => kube(ctx, &args[1..]),
         "apply" => kube(ctx, &{ let mut v = alloc::vec!["apply".to_string()]; v.extend_from_slice(&args[1..]); v }),
@@ -231,7 +234,9 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  build -t <name[:tag]> -    build an image from a Dockerfile (context on stdin)");
     outln!(ctx, "  pull <ref>                 pull an image from a registry");
     outln!(ctx, "  images                     list images");
-    outln!(ctx, "  rmi <image>                remove an image");
+    outln!(ctx, "  tag <src> <dst>            add a new name for an image");
+    outln!(ctx, "  history <image>            show an image's history");
+    outln!(ctx, "  rmi <image>                remove an image (untags if shared)");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Containers:"));
     outln!(ctx, "  run [opts] <image> [cmd]   create and start a container");
@@ -243,7 +248,13 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  cp SRC DST                 copy files to/from a container (<container>:<path>)");
     outln!(ctx, "  stop <container>           stop a container");
     outln!(ctx, "  restart <container>...     stop then start a container");
+    outln!(ctx, "  kill [-s SIG] <container>  send a signal (default KILL)");
+    outln!(ctx, "  pause / unpause <ctr>      freeze / resume a container");
+    outln!(ctx, "  rename <old> <new>         rename a container");
+    outln!(ctx, "  wait <container>...        wait for exit, print the code");
+    outln!(ctx, "  update [-m..] <container>  change resource limits");
     outln!(ctx, "  rm [-f] <container>        remove a container");
+    outln!(ctx, "  system df|info|prune       disk usage / info / clean exited");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Compose (multi-container stacks):"));
     outln!(ctx, "  compose [-f file] up       start all services in a compose file");
@@ -415,6 +426,79 @@ fn images(ctx: &mut Ctx) -> i32 {
     }
     t.render(ctx, &s);
     0
+}
+
+/// `fastman tag <src> <dst>` — add a new name for an existing image.
+fn tag(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let a: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if a.len() != 2 {
+        return ctx.fail("tag requires SOURCE and TARGET image names");
+    }
+    let fc = fs_ctx(ctx);
+    match image::tag(&fc, a[0], a[1]) {
+        Ok(()) => 0,
+        Err(e) => ctx.fail_errno("tag", e),
+    }
+}
+
+/// `fastman history <image>` — the image's build history. fastman flattens each
+/// image to a single rootfs, so this reports one entry (the image itself).
+fn history(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let Some(name) = args.iter().find(|a| !a.starts_with('-')) else {
+        return ctx.fail("history requires an image");
+    };
+    let fc = fs_ctx(ctx);
+    let Some(id) = image::resolve(&fc, name) else {
+        return ctx.fail(format!("no such image: {name}"));
+    };
+    let cfg = image::load_config(&fc, &id);
+    let img = image::list(&fc).into_iter().find(|i| i.id == id);
+    let s = style_of(ctx);
+    let created = img.as_ref().map(|i| ago(i.created)).unwrap_or_else(|| "-".into());
+    let size = img.as_ref().map(|i| human_size(i.size)).unwrap_or_else(|| "-".into());
+    let created_by = {
+        let j = cfg.argv(&[]).join(" ");
+        if j.len() > 40 { format!("{}…", &j[..39]) } else { j }
+    };
+    let mut t = Table::new(&["IMAGE", "CREATED", "CREATED BY", "SIZE"]);
+    t.row(alloc::vec![short(&id).to_string(), created, created_by, size]);
+    t.render(ctx, &s);
+    0
+}
+
+/// `fastman system df|info` — a summary of images and containers.
+fn system(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let sub = args.iter().find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("df");
+    let fc = fs_ctx(ctx);
+    let s = style_of(ctx);
+    match sub {
+        "df" => {
+            let images = image::list(&fc);
+            let img_size: u64 = images.iter().map(|i| i.size).sum();
+            let conts = container::list(&fc);
+            let running = conts.iter().filter(|c| c.is_alive()).count();
+            let mut t = Table::new(&["TYPE", "TOTAL", "ACTIVE", "SIZE"]);
+            t.row(alloc::vec!["Images".into(), format!("{}", images.len()), format!("{running}"), human_size(img_size)]);
+            t.row(alloc::vec!["Containers".into(), format!("{}", conts.len()), format!("{running}"), "-".into()]);
+            t.render(ctx, &s);
+            0
+        }
+        "info" => info(ctx),
+        "prune" => {
+            // Remove exited containers (safe, guest-local; images are kept).
+            let mut n = 0;
+            for c in container::list(&fc) {
+                if !c.is_alive() {
+                    if runtime::remove(&fc, &c.id, false).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+            outln!(ctx, "Deleted Containers: {n}");
+            0
+        }
+        other => ctx.fail(format!("unknown system command '{other}' (df|info|prune)")),
+    }
 }
 
 fn rmi(ctx: &mut Ctx, args: &[String]) -> i32 {
@@ -913,6 +997,20 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
         }
         "get" => {
             let what = rest.first().map(|s| s.as_str()).unwrap_or("all");
+            if what == "nodes" || what == "node" || what == "no" {
+                // A single-node "cluster": this FastROS host.
+                let mut t = Table::new(&["NAME", "STATUS", "ROLES", "CPUS", "VERSION"]);
+                let host = crate::proc::host_uts().hostname.lock().clone();
+                t.row(alloc::vec![
+                    host,
+                    s.green("Ready"),
+                    "control-plane".into(),
+                    format!("{}", crate::smp::present_count()),
+                    format!("fastros-{}", env!("CARGO_PKG_VERSION")),
+                ]);
+                t.render(ctx, &s);
+                return 0;
+            }
             let pods = what == "pods" || what == "po" || what == "all";
             let deps = what == "deployments" || what == "deploy" || what == "all";
             let svcs = what == "services" || what == "svc" || what == "all";

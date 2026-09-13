@@ -373,6 +373,27 @@ def test_healthcheck(g):
     g.run("fastman rm -f fmt_h2")
 
 
+def test_tag_and_history(g, image):
+    """`tag` adds a name sharing the image; `history` shows the image."""
+    out = g.ok("fastman images")
+    src_id = [l.split()[2] for l in out.splitlines()[1:] if l.startswith("fmtest")][0]
+    g.ok("fastman tag fmtest:latest fmcopy:v9")
+    rows = g.ok("fastman images").splitlines()[1:]
+    copy = [l for l in rows if l.startswith("fmcopy")]
+    assert copy and copy[0].split()[2] == src_id  # same IMAGE ID (shared rootfs)
+    # Removing the extra tag keeps the original usable.
+    g.ok("fastman rmi fmcopy:v9")
+    assert g.run(f"fastman run {image} /bin/hello")[2] == 0
+    assert src_id in g.ok("fastman history fmtest:latest")
+
+
+def test_system_df(g, image):
+    out = g.ok("fastman system df")
+    assert out.splitlines()[0].split()[:1] == ["TYPE"]
+    assert any(l.startswith("Images") for l in out.splitlines())
+    assert any(l.startswith("Containers") for l in out.splitlines())
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.

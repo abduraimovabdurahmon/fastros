@@ -295,3 +295,11 @@ def test_kube_service_load_balancing(g, kube_setup):
         assert len(ports) >= 2, f"expected load-balancing across pods, saw ports={ports}"
     finally:
         g.run("fastman kube delete lb 2>/dev/null; true")
+
+
+def test_kube_get_nodes(g):
+    """`kube get nodes` reports the single FastROS node as Ready."""
+    out = g.ok("fastman kube get nodes")
+    assert out.splitlines()[0].split()[:2] == ["NAME", "STATUS"], out
+    row = out.splitlines()[1].split()
+    assert row[1] == "Ready" and "control-plane" in out, out

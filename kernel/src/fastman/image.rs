@@ -288,13 +288,42 @@ pub fn list(ctx: &Ctx) -> Vec<Image> {
         .collect()
 }
 
-/// Remove an image by reference or id.
+/// Add a new tag (`dst`) pointing at the same image as `src`. The rootfs is
+/// shared — no copy — exactly like `docker tag`.
+pub fn tag(ctx: &Ctx, src: &str, dst: &str) -> KResult<()> {
+    let id = resolve(ctx, src).ok_or(Errno::ENOENT)?;
+    let r = ImageRef::parse(dst).ok_or(Errno::EINVAL)?;
+    let mut index = read_index(ctx);
+    index.retain(|(k, _)| *k != r.key());
+    index.push((r.key(), id));
+    write_index(ctx, &index)
+}
+
+/// Remove an image by reference or id. Removing one tag while other tags still
+/// point at the image just untags it (Docker's behaviour); the rootfs is
+/// deleted only when the last reference is gone.
 pub fn remove(ctx: &Ctx, name: &str) -> KResult<()> {
     let id = resolve(ctx, name).ok_or(Errno::ENOENT)?;
     let mut index = read_index(ctx);
-    index.retain(|(_, i)| *i != id);
+    let key = ImageRef::parse(name).map(|r| r.key());
+    // If `name` names a specific existing tag, drop just that tag; otherwise
+    // (an id / short id) drop every tag of the image.
+    let untagged = match &key {
+        Some(k) if index.iter().any(|(ik, _)| ik == k) => {
+            index.retain(|(ik, _)| ik != k);
+            true
+        }
+        _ => false,
+    };
+    if !untagged {
+        index.retain(|(_, i)| *i != id);
+    }
+    let still_referenced = index.iter().any(|(_, i)| *i == id);
     write_index(ctx, &index)?;
-    ops::remove_tree(ctx, &format!("{}/{id}", store::images_dir(ctx)))
+    if !still_referenced {
+        ops::remove_tree(ctx, &format!("{}/{id}", store::images_dir(ctx)))?;
+    }
+    Ok(())
 }
 
 fn tree_size(ctx: &Ctx, dir: &str) -> u64 {
