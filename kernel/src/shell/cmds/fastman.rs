@@ -194,6 +194,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "inspect" => inspect(ctx, &args[1..]),
         "stats" => stats(ctx, &args[1..]),
         "restart" => restart(ctx, &args[1..]),
+        "cp" => cp(ctx, &args[1..]),
         "ip" => container_ip(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
@@ -231,6 +232,7 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  inspect <container>...     print a container's config + state as JSON");
     outln!(ctx, "  stats [container...]       live resource usage (CPU, memory, PIDs)");
     outln!(ctx, "  exec [-it] <container> <cmd>  run a command in a container");
+    outln!(ctx, "  cp SRC DST                 copy files to/from a container (<container>:<path>)");
     outln!(ctx, "  stop <container>           stop a container");
     outln!(ctx, "  restart <container>...     stop then start a container");
     outln!(ctx, "  rm [-f] <container>        remove a container");
@@ -1504,6 +1506,118 @@ fn restart(ctx: &mut Ctx, args: &[String]) -> i32 {
         }
     }
     st
+}
+
+/// The final path component (Docker `cp` appends this when the destination is
+/// an existing directory).
+fn basename(p: &str) -> &str {
+    p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
+}
+
+/// The parent directory of a path (for `mkdir -p` before writing a file).
+fn parent_dir(p: &str) -> String {
+    let t = p.trim_end_matches('/');
+    match t.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => t[..i].to_string(),
+        None => ".".to_string(),
+    }
+}
+
+/// If `arg` is `<container>:<path>` for an existing container, return it.
+fn split_container(fc: &crate::fs::ops::Ctx, arg: &str) -> Option<(container::Container, String)> {
+    let (maybe, path) = arg.split_once(':')?;
+    // A host path has slashes or is relative; a container ref is a bare name.
+    if maybe.is_empty() || maybe.contains('/') {
+        return None;
+    }
+    container::find(fc, maybe).ok().map(|c| (c, path.to_string()))
+}
+
+/// An `ops::Ctx` pointed at a *running* container's filesystem (its live
+/// overlay). The writable layer is a tmpfs that exists only while the container
+/// runs, so `cp` requires the container to be up.
+fn container_ctx(ctx: &Ctx, c: &container::Container) -> Result<crate::fs::ops::Ctx, i32> {
+    if !c.is_alive() {
+        return Err(-1);
+    }
+    match crate::proc::find(c.pid) {
+        Some(init) => Ok(crate::fs::ops::Ctx { fs: init.fs.lock().clone(), cred: crate::fs::perm::Cred::root() }),
+        None => Err(-1),
+    }
+}
+
+/// Recursively copy `from:from_path` to `to:to_path` (files and directories).
+fn copy_tree(from: &crate::fs::ops::Ctx, from_path: &str, to: &crate::fs::ops::Ctx, to_path: &str) -> crate::errno::KResult<()> {
+    use crate::fs::ops;
+    let md = ops::stat(from, from_path, true)?;
+    if md.kind == crate::fs::FileType::Directory {
+        ops::mkdir_all(to, to_path, md.perm | 0o700)?;
+        for e in ops::list_dir(from, from_path)? {
+            if e.name == "." || e.name == ".." {
+                continue;
+            }
+            copy_tree(from, &format!("{from_path}/{}", e.name), to, &format!("{to_path}/{}", e.name))?;
+        }
+    } else {
+        // Regular file (symlinks/devices are dereferenced by stat's follow).
+        let data = ops::read_file(from, from_path)?;
+        ops::mkdir_all(to, &parent_dir(to_path), 0o755)?;
+        ops::write_file(to, to_path, &data, md.perm & 0o777)?;
+    }
+    Ok(())
+}
+
+/// `fastman cp SRC DST` — copy between a container and the host, where exactly
+/// one of SRC/DST is `<container>:<path>` (Docker's `docker cp`). The container
+/// must be running.
+fn cp(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let paths: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if paths.len() != 2 {
+        return ctx.fail("cp requires SRC and DST (one as <container>:<path>)");
+    }
+    let (src, dst) = (paths[0].as_str(), paths[1].as_str());
+    let fc = fs_ctx(ctx);
+    let src_c = split_container(&fc, src);
+    let dst_c = split_container(&fc, dst);
+
+    // Resolve the destination Docker-style: into an existing directory, append
+    // the source's basename; otherwise the destination is the target name.
+    let resolve_dst = |to: &crate::fs::ops::Ctx, from_path: &str, to_path: &str| -> String {
+        match crate::fs::ops::stat(to, to_path, true) {
+            Ok(m) if m.kind == crate::fs::FileType::Directory => format!("{}/{}", to_path.trim_end_matches('/'), basename(from_path)),
+            _ => to_path.to_string(),
+        }
+    };
+
+    let result = match (src_c, dst_c) {
+        (Some((c, cpath)), None) => {
+            // container -> host
+            match container_ctx(ctx, &c) {
+                Ok(cc) => {
+                    let dstp = resolve_dst(&fc, &cpath, dst);
+                    copy_tree(&cc, &cpath, &fc, &dstp)
+                }
+                Err(_) => return ctx.fail(format!("container {} is not running", c.name)),
+            }
+        }
+        (None, Some((c, cpath))) => {
+            // host -> container
+            match container_ctx(ctx, &c) {
+                Ok(cc) => {
+                    let dstp = resolve_dst(&cc, src, &cpath);
+                    copy_tree(&fc, src, &cc, &dstp)
+                }
+                Err(_) => return ctx.fail(format!("container {} is not running", c.name)),
+            }
+        }
+        (Some(_), Some(_)) => return ctx.fail("copying between two containers is not supported"),
+        (None, None) => return ctx.fail("one of SRC or DST must be <container>:<path>"),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => ctx.fail_errno("cp", e),
+    }
 }
 
 fn exec(ctx: &mut Ctx, args: &[String]) -> i32 {

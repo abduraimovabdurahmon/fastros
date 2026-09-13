@@ -221,6 +221,61 @@ def test_stats(g, image):
     g.run("fastman rm -f fmt_st")
 
 
+def test_cp_host_to_container_and_back(g, image):
+    """`fastman cp` copies files between the host FS and a running container,
+    both directions (Docker's `docker cp`). Verified by round-trip, since the
+    minimal test image ships no shell/cat to read files from inside."""
+    import time
+    g.ok(f"fastman run -d --name fmt_cp {image} /bin/sleeper")
+    time.sleep(1)
+    # host -> container (into /root, which the image doesn't ship: parent is made)
+    g.ok("echo hello-from-host > /tmp/fmt_hf.txt")
+    g.ok("fastman cp /tmp/fmt_hf.txt fmt_cp:/root/hf.txt")
+    # container -> host: read the same bytes back out
+    g.ok("fastman cp fmt_cp:/root/hf.txt /tmp/fmt_back.txt")
+    assert g.ok("cat /tmp/fmt_back.txt").strip() == "hello-from-host"
+    # container -> host of a file the image ships (/etc/hostname = container-host)
+    g.ok("fastman cp fmt_cp:/etc/hostname /tmp/fmt_out.txt")
+    assert "container-host" in g.ok("cat /tmp/fmt_out.txt")
+    g.run("fastman rm -f fmt_cp")
+
+
+def test_cp_into_existing_dir_appends_basename(g, image):
+    """Copying into an existing directory keeps the source's basename."""
+    import time
+    g.ok(f"fastman run -d --name fmt_cpd {image} /bin/sleeper")
+    time.sleep(1)
+    g.ok("echo appended > /tmp/fmt_named.txt")
+    g.ok("fastman cp /tmp/fmt_named.txt fmt_cpd:/etc")  # /etc exists -> /etc/fmt_named.txt
+    # It must be readable back at /etc/fmt_named.txt exactly.
+    g.ok("fastman cp fmt_cpd:/etc/fmt_named.txt /tmp/fmt_named_back.txt")
+    assert g.ok("cat /tmp/fmt_named_back.txt").strip() == "appended"
+    g.run("fastman rm -f fmt_cpd")
+
+
+def test_cp_directory(g, image):
+    """`fastman cp` copies a directory tree (container -> host)."""
+    import time
+    g.ok(f"fastman run -d --name fmt_cpdir {image} /bin/sleeper")
+    time.sleep(1)
+    g.run("rm -rf /tmp/fmt_bin")
+    g.ok("fastman cp fmt_cpdir:/bin /tmp/fmt_bin")
+    listing = g.ok("ls /tmp/fmt_bin")
+    assert "hello" in listing and "sleeper" in listing, listing
+    g.run("fastman rm -f fmt_cpdir")
+
+
+def test_cp_requires_running_container(g, image):
+    """cp on a stopped container fails cleanly (the writable layer is ephemeral)."""
+    import time
+    g.ok(f"fastman run -d --name fmt_cps {image} /bin/hello")  # exits at once
+    time.sleep(1)
+    g.ok("echo y > /tmp/fmt_cps_src.txt")
+    out, err, st = g.run("fastman cp /tmp/fmt_cps_src.txt fmt_cps:/root/x")
+    assert st != 0 and "not running" in (out + err)
+    g.run("fastman rm -f fmt_cps")
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.
