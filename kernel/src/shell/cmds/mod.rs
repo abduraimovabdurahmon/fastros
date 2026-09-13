@@ -4,6 +4,7 @@ pub mod account;
 pub mod archive;
 pub mod basic;
 pub mod diff;
+pub mod editor;
 pub mod fastman;
 pub mod fileinfo;
 pub mod fileops;
@@ -105,6 +106,7 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("mkfifo", fileops::mkfifo, "make named pipes", "[-m MODE] NAME..."),
     cmd!("mktemp", fileops::mktemp, "create a temporary file or directory", "[-dqu] [-p DIR] [TEMPLATE]"),
     cmd!("more", pager::more, "file perusal filter for viewing text", "[-s] [-n LINES] [FILE]..."),
+    cmd!("nano", editor::nano, "a small full-screen text editor", "[FILE]"),
     cmd!("mount", sysutil::mount, "mount a filesystem", "[-t TYPE] [-o OPTIONS] [--bind] SOURCE TARGET"),
     cmd!("mv", fileops::mv, "move (rename) files", "[-finvu] SOURCE... DEST"),
     cmd!("nc", net::nc, "arbitrary TCP and UDP connections and listens", "[-lukvnz] [-w SECS] [HOST] PORT"),
@@ -167,6 +169,8 @@ pub static COMMANDS: &[CommandDef] = &[
     cmd!("userdel", account::userdel, "delete a user account", "[-r] [-f] LOGIN"),
     cmd!("usermod", account::usermod, "modify a user account", "[-aG GROUPS] [-s SHELL] [-d HOME] [-c COMMENT] [-g GROUP] [-l NAME] [-L|-U] LOGIN"),
     cmd!("users", procps::users, "print the user names of users currently logged in", ""),
+    cmd!("vi", editor::nano, "edit a file (the nano-style editor)", "[FILE]"),
+    cmd!("vim", editor::nano, "edit a file (the nano-style editor)", "[FILE]"),
     cmd!("vmstat", procps::vmstat, "report virtual memory statistics", "[DELAY [COUNT]]"),
     cmd!("w", procps::w, "show who is logged on and what they are doing", "[-hs] [USER]"),
     cmd!("wall", sysutil::wall, "write a message to all users", "[MESSAGE]"),
