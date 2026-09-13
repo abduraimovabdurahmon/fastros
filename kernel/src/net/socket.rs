@@ -64,6 +64,9 @@ impl TcpStream {
     /// Connect from a specific network namespace (used by the port-publish proxy
     /// to reach a container's server inside its own namespace).
     pub fn connect_in(ns: Arc<NetNs>, remote: IpEndpoint, timeout_ms: u64) -> KResult<TcpStream> {
+        // A bridge container reaching an external address egresses via the host
+        // stack (SNAT) — its connection is made from the host's identity.
+        let ns = ns.egress_ns(remote.addr);
         let h = {
             let mut st = ns.stack().lock();
             // Loopback destinations are reachable even without a configured
@@ -372,13 +375,16 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     pub fn bind(port: Option<u16>) -> KResult<UdpSocket> {
+        Self::bind_in(netns::current(), port)
+    }
+
+    pub fn bind_in(ns: Arc<NetNs>, port: Option<u16>) -> KResult<UdpSocket> {
         let port = port.unwrap_or_else(super::ephemeral_port);
         let mut sock = udp::Socket::new(
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16384]),
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16384]),
         );
         sock.bind(port).map_err(|_| Errno::EADDRINUSE)?;
-        let ns = netns::current();
         let h = ns.stack().lock().sockets.add(sock);
         Ok(UdpSocket { h, port, ns })
     }

@@ -173,8 +173,14 @@ impl SocketFile {
                 Sock::Udp(u) => u.clone(),
                 Sock::UdpIdle => {
                     drop(g);
-                    // An unbound UDP socket sends from an ephemeral port.
-                    let u = Arc::new(UdpSocket::bind(None)?);
+                    // An unbound UDP socket sends from an ephemeral port. A bridge
+                    // container sending to an external address (e.g. a DNS server)
+                    // egresses via the host stack so the reply comes back to it.
+                    let ns = match &to {
+                        Some(ep) => crate::net::netns::current().egress_ns(ep.addr),
+                        None => crate::net::netns::current(),
+                    };
+                    let u = Arc::new(UdpSocket::bind_in(ns, None)?);
                     *self.inner.lock() = Sock::Udp(u.clone());
                     u
                 }

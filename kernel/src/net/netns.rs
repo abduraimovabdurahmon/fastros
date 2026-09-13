@@ -58,6 +58,32 @@ impl NetNs {
     pub fn is_host(&self) -> bool {
         matches!(self.kind, Kind::Host)
     }
+
+    /// The namespace an outbound connection to `dest` should actually use.
+    ///
+    /// A **bridge** namespace routes an *external* destination through the host
+    /// stack — the connection is made from the host's address, so the container
+    /// reaches the internet with the host's identity (Docker's MASQUERADE/SNAT).
+    /// Loopback and on-bridge peers stay in the namespace; a `--network none`
+    /// namespace stays fully isolated (external destinations remain unreachable);
+    /// the host namespace is unchanged.
+    pub fn egress_ns(self: &Arc<Self>, dest: super::IpAddress) -> Arc<NetNs> {
+        use super::IpAddress;
+        let is_loopback = match dest {
+            IpAddress::Ipv4(a) => a.octets()[0] == 127,
+            IpAddress::Ipv6(a) => a == smoltcp::wire::Ipv6Address::LOCALHOST || a.octets()[0] == 0xfd,
+        };
+        let on_bridge = matches!(dest, IpAddress::Ipv4(a) if a.octets()[0] == 10 && a.octets()[1] == 88);
+        if self.is_host() || is_loopback {
+            return self.clone();
+        }
+        // Only a bridge namespace gets outbound via the host; a peer on the same
+        // bridge stays local.
+        if self.bridge.is_some() && !on_bridge {
+            return host();
+        }
+        self.clone()
+    }
 }
 
 static HOST: Once<Arc<NetNs>> = Once::new();
