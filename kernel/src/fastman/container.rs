@@ -80,6 +80,15 @@ pub struct Container {
     /// `--cap-drop`), as `CAP_*` bitmasks.
     pub cap_add: u64,
     pub cap_drop: u64,
+    /// Health check (Docker HEALTHCHECK / `--health-*`). `health_cmd` is a shell
+    /// command run via `/bin/sh -c`; empty means no health check. `health_status`
+    /// is the live result: "" (none), "starting", "healthy" or "unhealthy".
+    pub health_cmd: String,
+    pub health_interval: u32,
+    pub health_timeout: u32,
+    pub health_retries: u32,
+    pub health_status: String,
+    pub health_fails: u32,
 }
 
 impl Container {
@@ -155,6 +164,16 @@ impl Container {
         if self.pids_limit != 0 {
             s.push_str(&format!("pids_limit\t{}\n", self.pids_limit));
         }
+        if !self.health_cmd.is_empty() {
+            s.push_str(&format!("health_cmd\t{}\n", self.health_cmd));
+            s.push_str(&format!("health_interval\t{}\n", self.health_interval));
+            s.push_str(&format!("health_timeout\t{}\n", self.health_timeout));
+            s.push_str(&format!("health_retries\t{}\n", self.health_retries));
+        }
+        if !self.health_status.is_empty() {
+            s.push_str(&format!("health_status\t{}\n", self.health_status));
+            s.push_str(&format!("health_fails\t{}\n", self.health_fails));
+        }
         s
     }
 
@@ -182,6 +201,12 @@ impl Container {
             pids_limit: 0,
             cap_add: 0,
             cap_drop: 0,
+            health_cmd: String::new(),
+            health_interval: 0,
+            health_timeout: 0,
+            health_retries: 0,
+            health_status: String::new(),
+            health_fails: 0,
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -224,6 +249,12 @@ impl Container {
                 "pids_limit" => c.pids_limit = v.parse().unwrap_or(0),
                 "cap_add" => c.cap_add = v.parse().unwrap_or(0),
                 "cap_drop" => c.cap_drop = v.parse().unwrap_or(0),
+                "health_cmd" => c.health_cmd = v.to_string(),
+                "health_interval" => c.health_interval = v.parse().unwrap_or(0),
+                "health_timeout" => c.health_timeout = v.parse().unwrap_or(0),
+                "health_retries" => c.health_retries = v.parse().unwrap_or(0),
+                "health_status" => c.health_status = v.to_string(),
+                "health_fails" => c.health_fails = v.parse().unwrap_or(0),
                 _ => {}
             }
         }

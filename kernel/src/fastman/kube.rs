@@ -202,6 +202,10 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         cap_add: o.cap_add,
         cap_drop: o.cap_drop,
         rm: false,
+        health_cmd: o.health_cmd.clone(),
+        health_interval: o.health_interval,
+        health_timeout: o.health_timeout,
+        health_retries: o.health_retries,
     }
 }
 
@@ -225,6 +229,10 @@ pub fn opts_from_container(c: &super::container::Container, name: String) -> Run
         cap_add: c.cap_add,
         cap_drop: c.cap_drop,
         rm: false,
+        health_cmd: c.health_cmd.clone(),
+        health_interval: c.health_interval,
+        health_timeout: c.health_timeout,
+        health_retries: c.health_retries,
     }
 }
 

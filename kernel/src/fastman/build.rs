@@ -37,6 +37,8 @@ enum Insn {
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
     User(String),
+    /// HEALTHCHECK: a shell command plus timings (seconds); empty cmd = NONE.
+    Health { cmd: String, interval: u32, timeout: u32, retries: u32 },
     /// EXPOSE / LABEL / MAINTAINER / STOPSIGNAL / … — recorded but inert.
     Noop,
 }
@@ -200,6 +202,12 @@ fn build_inner(ctx: &Ctx, opts: &BuildOpts, cdir: &str, insns: &[Insn], out: Opt
             }
             Insn::Cmd(v) => cfg.cmd = v.iter().map(|s| expand(s, &vars)).collect(),
             Insn::Entrypoint(v) => cfg.entrypoint = v.iter().map(|s| expand(s, &vars)).collect(),
+            Insn::Health { cmd, interval, timeout, retries } => {
+                cfg.health_cmd = expand(cmd, &vars);
+                cfg.health_interval = *interval;
+                cfg.health_timeout = *timeout;
+                cfg.health_retries = *retries;
+            }
             Insn::User(_) | Insn::Noop => {}
         }
     }
@@ -521,11 +529,55 @@ fn parse(text: &str) -> Vec<Insn> {
             }
             "WORKDIR" => Insn::Workdir(rest.to_string()),
             "USER" => Insn::User(rest.to_string()),
+            "HEALTHCHECK" => parse_healthcheck(rest),
             _ => Insn::Noop, // EXPOSE, LABEL, MAINTAINER, VOLUME, STOPSIGNAL, …
         };
         insns.push(insn);
     }
     insns
+}
+
+/// Parse `HEALTHCHECK [--interval=..] [--timeout=..] [--retries=N] CMD <cmd>`
+/// or `HEALTHCHECK NONE`. Durations accept an s/m/h suffix; the command may be
+/// shell form or a JSON exec array (joined into a shell command).
+fn parse_healthcheck(rest: &str) -> Insn {
+    if rest.split_whitespace().next().map(|s| s.eq_ignore_ascii_case("none")).unwrap_or(false) {
+        return Insn::Health { cmd: String::new(), interval: 0, timeout: 0, retries: 0 };
+    }
+    let dur = |v: &str| -> u32 {
+        let (num, mult) = match v.chars().last() {
+            Some('s') | Some('S') => (&v[..v.len() - 1], 1u32),
+            Some('m') | Some('M') => (&v[..v.len() - 1], 60),
+            Some('h') | Some('H') => (&v[..v.len() - 1], 3600),
+            _ => (v, 1),
+        };
+        num.parse::<u32>().unwrap_or(0) * mult
+    };
+    let mut interval = 0u32;
+    let mut timeout = 0u32;
+    let mut retries = 0u32;
+    for tok in rest.split_whitespace() {
+        if tok.eq_ignore_ascii_case("cmd") {
+            break;
+        }
+        if let Some(v) = tok.strip_prefix("--interval=") {
+            interval = dur(v);
+        } else if let Some(v) = tok.strip_prefix("--timeout=") {
+            timeout = dur(v);
+        } else if let Some(v) = tok.strip_prefix("--retries=") {
+            retries = v.parse().unwrap_or(0);
+        }
+        // Any other --flag (e.g. --start-period=) is accepted and ignored.
+    }
+    // The command is everything after the CMD keyword (shell or JSON exec form).
+    let cmd = match rest.to_ascii_uppercase().find("CMD ") {
+        Some(pos) => {
+            let after = rest[pos + 4..].trim();
+            parse_json_array(after).map(|v| v.join(" ")).unwrap_or_else(|| after.to_string())
+        }
+        None => String::new(),
+    };
+    Insn::Health { cmd, interval, timeout, retries }
 }
 
 /// Parse `COPY [--chown=…] [--chmod=…] src... dest` (flags ignored).

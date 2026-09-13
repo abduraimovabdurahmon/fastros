@@ -350,6 +350,29 @@ def test_pause_unpause_freezes_execution(g, image):
     g.run("fastman rm -f fmt_p")
 
 
+def test_healthcheck(g):
+    """`--health-cmd` drives the container's health status (starting → healthy /
+    unhealthy). Needs a shell in the image, so it uses alpine (network-gated)."""
+    import json
+    import time
+    if g.run("fastman run --rm alpine true", timeout=120)[2] != 0:
+        pytest.skip("alpine unavailable from dev VM")
+
+    def health(name):
+        return json.loads(g.ok(f"fastman inspect {name}"))[0]["State"]["Health"]["Status"]
+
+    g.ok("fastman run -d --name fmt_h1 --health-cmd true --health-interval 1s --health-retries 2 alpine sleep 60")
+    time.sleep(3)
+    assert health("fmt_h1") == "healthy"
+    assert "Up (healthy)" in g.ok("fastman ps")
+    g.run("fastman rm -f fmt_h1")
+
+    g.ok("fastman run -d --name fmt_h2 --health-cmd false --health-interval 1s --health-retries 2 alpine sleep 60")
+    time.sleep(5)
+    assert health("fmt_h2") == "unhealthy"
+    g.run("fastman rm -f fmt_h2")
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.

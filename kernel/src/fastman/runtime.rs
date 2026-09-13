@@ -53,6 +53,12 @@ pub struct RunOpts {
     pub cap_drop: u64,
     /// `--rm`: remove the container automatically after it exits (foreground).
     pub rm: bool,
+    /// Health check (`--health-cmd` etc. or a Dockerfile HEALTHCHECK). Empty
+    /// command = none. Intervals/timeout in seconds; 0 = use defaults.
+    pub health_cmd: String,
+    pub health_interval: u32,
+    pub health_timeout: u32,
+    pub health_retries: u32,
 }
 
 /// Create a container from an image, building its writable rootfs.
@@ -99,6 +105,12 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         env.retain(|x| x.split('=').next() != Some(k));
         env.push(e.clone());
     }
+    // Effective health check: `--health-cmd` wins, else the image's HEALTHCHECK.
+    let hc: (String, u32, u32, u32) = if !opts.health_cmd.is_empty() {
+        (opts.health_cmd.clone(), opts.health_interval, opts.health_timeout, opts.health_retries)
+    } else {
+        (cfg.health_cmd.clone(), cfg.health_interval, cfg.health_timeout, cfg.health_retries)
+    };
     let c = Container {
         id,
         name,
@@ -122,6 +134,14 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         pids_limit: opts.pids_limit,
         cap_add: opts.cap_add,
         cap_drop: opts.cap_drop,
+        // Health check: `--health-cmd` overrides; otherwise inherit the image's
+        // Dockerfile HEALTHCHECK. Timings fall back to Docker-like defaults.
+        health_cmd: hc.0.clone(),
+        health_interval: if hc.1 != 0 { hc.1 } else { 30 },
+        health_timeout: if hc.2 != 0 { hc.2 } else { 30 },
+        health_retries: if hc.3 != 0 { hc.3 } else { 3 },
+        health_status: if hc.0.is_empty() { String::new() } else { String::from("starting") },
+        health_fails: 0,
     };
     c.save(ctx)?;
     if let Some((d, a)) = c.port_remap {
@@ -315,7 +335,17 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
 
     c.pid = pid;
     c.state = State::Running;
+    // A fresh run's health starts as "starting" (until the first probe).
+    if !c.health_cmd.is_empty() {
+        c.health_status = String::from("starting");
+        c.health_fails = 0;
+    }
     c.save(ctx)?;
+
+    // Periodic health check (Docker HEALTHCHECK), if configured.
+    if !c.health_cmd.is_empty() {
+        spawn_health_monitor(c, ctx.cred.uid, ctx.cred.gid);
+    }
 
     // A container in a private network namespace binds its ports inside that
     // namespace, invisible to the host. Publish each `-p` mapping with a host
@@ -636,6 +666,113 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         code
     };
     Ok(code)
+}
+
+/// Run the container's health command once (`/bin/sh -c <cmd>`), discarding
+/// output, and report success (exit 0). Bounded by `timeout_ms`: a probe that
+/// overruns is SIGKILLed and counts as a failure. Best-effort — any setup error
+/// (no shell, load failure) is a failed probe.
+fn health_probe(c: &Container, timeout_ms: u64) -> bool {
+    let Some(init) = proc::find(c.pid).filter(|p| !p.is_zombie()) else { return false };
+    let fs = init.fs.lock().clone();
+    let kctx = Ctx { fs: fs.clone(), cred: crate::fs::perm::Cred::root() };
+    let argv = alloc::vec![String::from("/bin/sh"), String::from("-c"), c.health_cmd.clone()];
+    let Ok(real) = proc::elf::find_program(&kctx, &argv[0]) else { return false };
+    let Ok((data, argv)) = proc::elf::read_exec(&kctx, &real, &argv) else { return false };
+    let Ok((space, frame)) = proc::elf::load(&kctx, &data, &argv, &c.env) else { return false };
+    let mut fds = crate::proc::fdtable::FdTable::new();
+    if let Ok(n) = crate::device::open_char(crate::fs::makedev(1, 3), flags::O_RDONLY) {
+        fds.set(0, n, false);
+    }
+    if let Ok(n) = crate::device::open_char(crate::fs::makedev(1, 3), flags::O_WRONLY) {
+        fds.set(1, n.clone(), false);
+        fds.set(2, n, false);
+    }
+    let spawn = Spawn {
+        name: format!("health:{}", c.name),
+        args: argv,
+        env: env_pairs(&c.env),
+        cred: crate::fs::perm::Cred::root(),
+        fs,
+        fds,
+        parent: crate::proc::kernel(),
+        pgid: None,
+        new_session: true,
+        ctty: None,
+        uts: crate::proc::kernel().uts.clone(),
+        container: Some(c.id.clone()),
+        aspace: None,
+        ignored: 0,
+        sigactions: crate::proc::signal::default_table(),
+        vfork: false,
+        pidns: init.pidns.lock().clone(),
+        caps: c.effective_caps(),
+        no_new_privs: false,
+        seccomp: None,
+        netns: init.netns.lock().clone(),
+    };
+    let Ok(child) = proc::start_user(spawn, space, frame) else { return false };
+    let task = child.tasks().into_iter().next();
+    let deadline = crate::time::now_ns().saturating_add(timeout_ms * 1_000_000);
+    loop {
+        match &task {
+            Some(t) if t.has_exited() => return t.exit_code.load(core::sync::atomic::Ordering::Acquire) == 0,
+            Some(t) => {
+                if crate::time::now_ns() >= deadline {
+                    child.signal(crate::proc::signal::SIGKILL);
+                    let _ = t.join();
+                    return false;
+                }
+                crate::sched::sleep_ms(50);
+            }
+            None => return false,
+        }
+    }
+}
+
+/// Spawn the periodic health checker for a container (Docker HEALTHCHECK). It
+/// runs the probe every `health_interval` seconds and records `health_status`
+/// ("starting" → "healthy"/"unhealthy" after `health_retries` failures). Exits
+/// when the container stops or is restarted (a new run spawns its own monitor).
+fn spawn_health_monitor(c: &Container, uid: u32, gid: u32) {
+    let id = c.id.clone();
+    let watch_pid = c.pid;
+    let interval = c.health_interval.max(1) as u64;
+    let timeout_ms = (c.health_timeout.max(1) as u64) * 1000;
+    let retries = c.health_retries.max(1);
+    crate::sched::spawn("fm-health", move || {
+        loop {
+            for _ in 0..interval {
+                if !crate::sched::sleep_ms(1000) {
+                    let _ = crate::proc::absorb_signals();
+                }
+            }
+            let kctx = Ctx { fs: crate::proc::kernel().fs.lock().clone(), cred: crate::fs::perm::Cred::user(uid, gid, Vec::new()) };
+            let Ok(cur) = super::container::load(&kctx, &id) else { break };
+            if cur.pid != watch_pid || !cur.is_alive() {
+                break;
+            }
+            let ok = health_probe(&cur, timeout_ms);
+            // Reload before writing so we patch only the health fields onto the
+            // current record (never revert state/pid the reaper may have set).
+            let Ok(mut fresh) = super::container::load(&kctx, &id) else { break };
+            if fresh.pid != watch_pid {
+                break;
+            }
+            if ok {
+                fresh.health_status = String::from("healthy");
+                fresh.health_fails = 0;
+            } else {
+                fresh.health_fails += 1;
+                if fresh.health_fails >= retries {
+                    fresh.health_status = String::from("unhealthy");
+                } else if fresh.health_status != "healthy" {
+                    fresh.health_status = String::from("starting");
+                }
+            }
+            let _ = fresh.save(&kctx);
+        }
+    });
 }
 
 /// Read a container's captured log.

@@ -59,6 +59,11 @@ pub struct ImageConfig {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub workdir: String,
+    /// Dockerfile HEALTHCHECK: a shell command (empty = none) and its timings.
+    pub health_cmd: String,
+    pub health_interval: u32,
+    pub health_timeout: u32,
+    pub health_retries: u32,
 }
 
 impl ImageConfig {
@@ -69,6 +74,10 @@ impl ImageConfig {
             entrypoint: Vec::new(),
             cmd: alloc::vec![String::from("/bin/sh")],
             workdir: String::from("/"),
+            health_cmd: String::new(),
+            health_interval: 0,
+            health_timeout: 0,
+            health_retries: 0,
         }
     }
 
@@ -96,6 +105,12 @@ impl ImageConfig {
         for c in &self.cmd {
             s.push_str(&format!("cmd\t{c}\n"));
         }
+        if !self.health_cmd.is_empty() {
+            s.push_str(&format!("health_cmd\t{}\n", self.health_cmd));
+            s.push_str(&format!("health_interval\t{}\n", self.health_interval));
+            s.push_str(&format!("health_timeout\t{}\n", self.health_timeout));
+            s.push_str(&format!("health_retries\t{}\n", self.health_retries));
+        }
         s
     }
 
@@ -108,6 +123,10 @@ impl ImageConfig {
                 "env" => c.env.push(v.to_string()),
                 "entrypoint" => c.entrypoint.push(v.to_string()),
                 "cmd" => c.cmd.push(v.to_string()),
+                "health_cmd" => c.health_cmd = v.to_string(),
+                "health_interval" => c.health_interval = v.parse().unwrap_or(0),
+                "health_timeout" => c.health_timeout = v.parse().unwrap_or(0),
+                "health_retries" => c.health_retries = v.parse().unwrap_or(0),
                 _ => {}
             }
         }

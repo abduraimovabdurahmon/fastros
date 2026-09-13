@@ -264,6 +264,9 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  --cap-drop <cap>   drop a capability (e.g. NET_BIND_SERVICE, or ALL)");
     outln!(ctx, "  -w <dir>           working directory");
     outln!(ctx, "  --network <name>   network: bridge (shared, default) or none (private netns)");
+    outln!(ctx, "  --health-cmd <cmd>   periodic health check (shell command)");
+    outln!(ctx, "  --health-interval N[s|m]  time between checks (default 30s)");
+    outln!(ctx, "  --health-retries N   failures before 'unhealthy' (default 3)");
     outln!(ctx);
     outln!(ctx, "{}", s.dim("Every container is a rootless sandbox: its own mount namespace, chrooted"));
     outln!(ctx, "{}", s.dim("to the image, with no access to host files, processes or network."));
@@ -492,6 +495,23 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, bool, String, Vec<String>), St
                 let v = args.get(i).ok_or("--cap-drop needs a capability")?;
                 o.cap_drop |= parse_caps(v)?;
             }
+            "--health-cmd" => {
+                i += 1;
+                o.health_cmd = args.get(i).ok_or("--health-cmd needs a command")?.clone();
+            }
+            "--health-interval" => {
+                i += 1;
+                o.health_interval = parse_secs(args.get(i).ok_or("--health-interval needs a duration")?)?;
+            }
+            "--health-timeout" => {
+                i += 1;
+                o.health_timeout = parse_secs(args.get(i).ok_or("--health-timeout needs a duration")?)?;
+            }
+            "--health-retries" => {
+                i += 1;
+                o.health_retries = args.get(i).and_then(|s| s.parse().ok()).ok_or("--health-retries needs a number")?;
+            }
+            "--no-healthcheck" => o.health_cmd = String::new(),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             s => image = Some(s.to_string()),
         }
@@ -560,6 +580,18 @@ fn parse_size(s: &str) -> Result<u64, String> {
     };
     let n: u64 = num.trim().parse().map_err(|_| format!("bad size '{s}'"))?;
     Ok(n * mult)
+}
+
+/// Parse a duration in seconds: a bare number or an `Ns`/`Nm`/`Nh` suffix.
+fn parse_secs(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('s') | Some('S') => (&s[..s.len() - 1], 1u32),
+        Some('m') | Some('M') => (&s[..s.len() - 1], 60),
+        Some('h') | Some('H') => (&s[..s.len() - 1], 3600),
+        _ => (s, 1),
+    };
+    num.trim().parse::<u32>().map(|n| n * mult).map_err(|_| format!("bad duration '{s}'"))
 }
 
 fn parse_volume(s: &str) -> Result<Volume, String> {
@@ -643,7 +675,16 @@ fn ps(ctx: &mut Ctx, args: &[String]) -> i32 {
             format!("\"{j}\"")
         };
         let status = match state {
-            State::Running => s.green("Up"),
+            State::Running => {
+                // Reflect the health check in the status, like Docker.
+                let up = match c.health_status.as_str() {
+                    "healthy" => String::from("Up (healthy)"),
+                    "unhealthy" => String::from("Up (unhealthy)"),
+                    "starting" => String::from("Up (health: starting)"),
+                    _ => String::from("Up"),
+                };
+                s.green(&up)
+            }
             State::Exited => s.dim(&format!("Exited ({})", c.exit_code)),
             State::Created => s.dim("Created"),
         };
@@ -1181,6 +1222,10 @@ fn clone_opts(o: &RunOpts) -> RunOpts {
         cap_add: o.cap_add,
         cap_drop: o.cap_drop,
         rm: o.rm,
+        health_cmd: o.health_cmd.clone(),
+        health_interval: o.health_interval,
+        health_timeout: o.health_timeout,
+        health_retries: o.health_retries,
     }
 }
 
@@ -1330,6 +1375,11 @@ fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
         let cap_add = crate::syscall::seccomp::cap_names(c.cap_add);
         let cap_drop = crate::syscall::seccomp::cap_names(c.cap_drop);
         let ip = crate::net::netns::container_ip(&c.id).map(|a| a.to_string()).unwrap_or_default();
+        let health = if c.health_cmd.is_empty() {
+            String::from("null")
+        } else {
+            format!("{{ \"Status\": {}, \"FailingStreak\": {} }}", json_str(if c.health_status.is_empty() { "starting" } else { &c.health_status }), c.health_fails)
+        };
         let obj = format!(
             concat!(
                 "  {{\n",
@@ -1340,7 +1390,8 @@ fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
                 "      \"Status\": {status},\n",
                 "      \"Running\": {running},\n",
                 "      \"Pid\": {pid},\n",
-                "      \"ExitCode\": {exit}\n",
+                "      \"ExitCode\": {exit},\n",
+                "      \"Health\": {health}\n",
                 "    }},\n",
                 "    \"Image\": {image_id},\n",
                 "    \"Config\": {{\n",
@@ -1371,6 +1422,7 @@ fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
             running = running,
             pid = c.pid,
             exit = c.exit_code,
+            health = health,
             image_id = json_str(&c.image_id),
             image_key = json_str(&c.image_key),
             cmd = json_str_array(&c.cmd),
