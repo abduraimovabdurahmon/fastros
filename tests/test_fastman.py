@@ -276,6 +276,80 @@ def test_cp_requires_running_container(g, image):
     g.run("fastman rm -f fmt_cps")
 
 
+def test_kill_default_and_signal(g, image):
+    """`fastman kill` sends SIGKILL by default, `-s` a chosen signal."""
+    import time
+    g.ok(f"fastman run -d --name fmt_k1 {image} /bin/sleeper")
+    time.sleep(1)
+    g.ok("fastman kill fmt_k1")
+    time.sleep(1)
+    assert "Exited (137)" in g.ok("fastman ps -a")  # 128 + SIGKILL(9)
+    g.ok(f"fastman run -d --name fmt_k2 {image} /bin/sleeper")
+    time.sleep(1)
+    g.ok("fastman kill -s TERM fmt_k2")
+    time.sleep(1)
+    import json
+    assert json.loads(g.ok("fastman inspect fmt_k2"))[0]["State"]["Running"] is False
+    g.run("fastman rm -f fmt_k1 fmt_k2")
+
+
+def test_rename(g, image):
+    import time
+    g.ok(f"fastman run -d --name fmt_old {image} /bin/sleeper")
+    time.sleep(1)
+    g.ok("fastman rename fmt_old fmt_new")
+    ps = g.ok("fastman ps")
+    assert "fmt_new" in ps and "fmt_old" not in ps
+    g.run("fastman rm -f fmt_new")
+
+
+def test_top(g, image):
+    import time
+    g.ok(f"fastman run -d --name fmt_top {image} /bin/sleeper")
+    time.sleep(1)
+    out = g.ok("fastman top fmt_top")
+    assert out.splitlines()[0].split()[:2] == ["PID", "PPID"], out
+    assert "sleeper" in out, out
+    g.run("fastman rm -f fmt_top")
+
+
+def test_wait_returns_exit_code(g, image):
+    g.ok(f"fastman run -d --name fmt_w {image} /bin/hello")  # prints then exits 0
+    out, err, st = g.run("fastman wait fmt_w", timeout=15)
+    assert out.strip() == "0", (out, err)
+    g.run("fastman rm -f fmt_w")
+
+
+def test_update_limits(g, image):
+    import json
+    import time
+    g.ok(f"fastman run -d --name fmt_u -m 64m {image} /bin/sleeper")
+    time.sleep(1)
+    g.ok("fastman update -m 128m fmt_u")
+    assert json.loads(g.ok("fastman inspect fmt_u"))[0]["HostConfig"]["Memory"] == 128 * 1024 * 1024
+    g.run("fastman rm -f fmt_u")
+
+
+def test_pause_unpause_freezes_execution(g, image):
+    """Job control: `pause` (SIGSTOP) freezes the container, `unpause` (SIGCONT)
+    resumes it. Verified via the log tick count (sleeper prints once a second)."""
+    import time
+
+    def ticks():
+        return len([l for l in g.ok("fastman logs fmt_p").splitlines() if l.startswith("tick ")])
+
+    g.ok(f"fastman run -d --name fmt_p {image} /bin/sleeper")
+    time.sleep(2)
+    g.ok("fastman pause fmt_p")
+    frozen = ticks()
+    time.sleep(3)
+    assert ticks() == frozen, "container kept running while paused"
+    g.ok("fastman unpause fmt_p")
+    time.sleep(3)
+    assert ticks() > frozen, "container did not resume after unpause"
+    g.run("fastman rm -f fmt_p")
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.

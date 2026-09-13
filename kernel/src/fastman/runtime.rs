@@ -440,6 +440,80 @@ pub fn stop(ctx: &Ctx, name: &str, sig: u32) -> KResult<Container> {
     Ok(c)
 }
 
+/// Send `sig` to every live process belonging to container `name` (not just
+/// its init). Returns the number signalled. Used by `kill`, `pause`, `unpause`.
+pub fn signal_container(ctx: &Ctx, name: &str, sig: u32) -> KResult<usize> {
+    let c = super::container::find(ctx, name)?;
+    if !c.is_alive() {
+        return Err(Errno::ENOTCONN);
+    }
+    let mut n = 0;
+    for p in crate::proc::all() {
+        if p.container.lock().as_deref() == Some(c.id.as_str()) && !p.is_zombie() {
+            p.signal(sig);
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Every live host pid belonging to container `name` (for `top`).
+pub fn container_pids(ctx: &Ctx, name: &str) -> KResult<Vec<u32>> {
+    let c = super::container::find(ctx, name)?;
+    Ok(crate::proc::all()
+        .into_iter()
+        .filter(|p| p.container.lock().as_deref() == Some(c.id.as_str()) && !p.is_zombie())
+        .map(|p| p.pid)
+        .collect())
+}
+
+/// Give a container a new name (Docker's `rename`). The new name must be free.
+pub fn rename(ctx: &Ctx, old: &str, new: &str) -> KResult<()> {
+    if new.is_empty() || new.contains('/') || new.contains(':') {
+        return Err(Errno::EINVAL);
+    }
+    if super::container::find(ctx, new).is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    let mut c = super::container::find(ctx, old)?;
+    c.name = new.to_string();
+    c.save(ctx)
+}
+
+/// Wait for a container's init process to exit and return its shell exit code.
+pub fn wait(ctx: &Ctx, name: &str) -> KResult<i32> {
+    let c = super::container::find(ctx, name)?;
+    match init_process(&c) {
+        Some(p) => {
+            while !p.is_zombie() {
+                if !crate::sched::sleep_ms(50) {
+                    // ^C: stop waiting, report the current recorded code.
+                    let _ = crate::proc::absorb_signals();
+                    break;
+                }
+            }
+            Ok(super::container::load(ctx, &c.id).map(|c| c.exit_code).unwrap_or(0))
+        }
+        None => Ok(super::container::load(ctx, &c.id).map(|c| c.exit_code).unwrap_or(c.exit_code)),
+    }
+}
+
+/// Change a running container's cgroup limits in place (Docker's `update`).
+pub fn update_limits(ctx: &Ctx, name: &str, mem: Option<u64>, pids: Option<u32>) -> KResult<()> {
+    let mut c = super::container::find(ctx, name)?;
+    if let Some(m) = mem {
+        c.mem_limit = m;
+    }
+    if let Some(p) = pids {
+        c.pids_limit = p;
+    }
+    // Apply live if the container is up and already has a cgroup.
+    if c.is_alive() && (c.mem_limit != 0 || c.pids_limit != 0) {
+        crate::cgroup::set_limits(&c.id, c.mem_limit, c.pids_limit);
+    }
+    c.save(ctx)
+}
+
 /// Remove a container (must not be running unless `force`).
 pub fn remove(ctx: &Ctx, name: &str, force: bool) -> KResult<()> {
     let c = super::container::find(ctx, name)?;

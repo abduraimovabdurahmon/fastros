@@ -93,6 +93,8 @@ pub struct Task {
     blocked: AtomicU64,
     pub exit_code: AtomicI32,
     exited: AtomicBool,
+    /// Job control: the task is stopped (SIGSTOP) and blocks until SIGCONT.
+    stopped: AtomicBool,
     /// Woken when the task exits (join).
     pub exit_wq: WaitQueue,
     /// Nanoseconds spent running.
@@ -141,9 +143,37 @@ impl Task {
             return;
         }
         self.signals.fetch_or(1 << (sig - 1), Ordering::AcqRel);
+        // Job control: SIGCONT (and SIGKILL, which must always win) release a
+        // stopped task so it resumes / can be reaped.
+        if sig == crate::proc::signal::SIGCONT || sig == crate::proc::signal::SIGKILL {
+            self.stopped.store(false, Ordering::Release);
+        }
         wake(self);
         // A signalfd being watched by poll/epoll becomes readable now.
         crate::net::wake_pollers();
+    }
+
+    /// Job control: is this task currently stopped (SIGSTOP)?
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Is a stop signal (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) pending?
+    pub fn stop_pending(&self) -> bool {
+        const STOP_MASK: u64 = (1 << (crate::proc::signal::SIGSTOP - 1))
+            | (1 << (crate::proc::signal::SIGTSTP - 1))
+            | (1 << (crate::proc::signal::SIGTTIN - 1))
+            | (1 << (crate::proc::signal::SIGTTOU - 1));
+        self.signals.load(Ordering::Acquire) & STOP_MASK != 0
+    }
+
+    /// Clear any pending stop signals (consumed when the task actually stops).
+    pub fn clear_stop_signals(&self) {
+        const STOP_MASK: u64 = (1 << (crate::proc::signal::SIGSTOP - 1))
+            | (1 << (crate::proc::signal::SIGTSTP - 1))
+            | (1 << (crate::proc::signal::SIGTTIN - 1))
+            | (1 << (crate::proc::signal::SIGTTOU - 1));
+        self.signals.fetch_and(!STOP_MASK, Ordering::AcqRel);
     }
     pub fn signal_pending(&self) -> bool {
         self.signals.load(Ordering::Acquire) != 0
@@ -268,6 +298,7 @@ fn new_task(tid: Tid, name: &str, stack: Option<KernelStack>, stack_top: usize, 
         blocked: AtomicU64::new(0),
         exit_code: AtomicI32::new(0),
         exited: AtomicBool::new(false),
+        stopped: AtomicBool::new(false),
         exit_wq: WaitQueue::new(),
         cpu_ns: AtomicU64::new(0),
         owner: AtomicU32::new(0),
@@ -381,11 +412,41 @@ pub fn block_current(deadline_ns: Option<u64>) {
     schedule();
 }
 
+/// Job control: stop the current task (SIGSTOP) and block until SIGCONT (or
+/// SIGKILL) releases it. Idle/kernel tasks are never stopped.
+pub fn stop_current() {
+    let cur = { RQ.lock().current.clone() };
+    let Some(cur) = cur else { return };
+    if cur.is_idle() {
+        return;
+    }
+    cur.stopped.store(true, Ordering::Release);
+    let sigkill = 1u64 << (crate::proc::signal::SIGKILL - 1);
+    loop {
+        if !cur.stopped.load(Ordering::Acquire) {
+            break;
+        }
+        // SIGKILL must always win, even over a stop.
+        if cur.signals.load(Ordering::Acquire) & sigkill != 0 {
+            cur.stopped.store(false, Ordering::Release);
+            break;
+        }
+        block_current(None);
+    }
+}
+
 /// Sleep for at least `ns` nanoseconds. Returns early (false) if a signal
-/// arrives; the signal stays pending for the caller to act on.
+/// arrives; the signal stays pending for the caller to act on. A stop signal is
+/// handled transparently (the task stops here and resumes the sleep on SIGCONT),
+/// so a stop never surfaces as EINTR — matching Linux job-control semantics.
 pub fn sleep_ns(ns: u64) -> bool {
     let deadline = crate::time::now_ns().saturating_add(ns);
     loop {
+        if with_current(|t| t.stop_pending()) {
+            with_current(|t| t.clear_stop_signals());
+            stop_current();
+            continue;
+        }
         if with_current(|t| t.signal_pending()) {
             return false;
         }

@@ -57,6 +57,27 @@ pub fn create(cid: &str, mem_bytes: u64, pids: u32) {
     cg.pids.store(0, Ordering::Relaxed);
 }
 
+/// Update a live container's limits without resetting its usage counters
+/// (Docker's `update`). Creates the cgroup if the container had none.
+pub fn set_limits(cid: &str, mem_bytes: u64, pids: u32) {
+    let cg = get(cid).unwrap_or_else(|| {
+        let cg = Arc::new(Cgroup {
+            mem_limit_pages: AtomicU64::new(0),
+            swap_limit_pages: AtomicU64::new(0),
+            pids_limit: AtomicU32::new(0),
+            mem_pages: AtomicI64::new(0),
+            swap_pages: AtomicI64::new(0),
+            pids: AtomicU32::new(0),
+        });
+        CGROUPS.lock().insert(cid.to_string(), cg.clone());
+        cg
+    });
+    let mem_pages = mem_bytes.div_ceil(PAGE);
+    cg.mem_limit_pages.store(mem_pages, Ordering::Relaxed);
+    cg.swap_limit_pages.store(mem_pages, Ordering::Relaxed);
+    cg.pids_limit.store(pids, Ordering::Relaxed);
+}
+
 pub fn get(cid: &str) -> Option<Arc<Cgroup>> {
     CGROUPS.lock().get(cid).cloned()
 }

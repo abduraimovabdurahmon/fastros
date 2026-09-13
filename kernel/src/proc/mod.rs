@@ -202,7 +202,10 @@ impl Process {
             return;
         }
         let bit = 1u64 << (sig - 1);
-        let ignored = if sig != signal::SIGKILL && sig != signal::SIGSTOP {
+        // SIGCONT is "ignored by default" as a *delivery* action, but it must
+        // still reach the task: send_signal() is what clears the stopped flag
+        // and wakes a stopped task. Never skip it (nor SIGKILL/SIGSTOP).
+        let ignored = if sig != signal::SIGKILL && sig != signal::SIGSTOP && sig != signal::SIGCONT {
             let act = self.sigactions.lock()[sig as usize];
             let disp_ignored = act.handler == signal::SIG_IGN
                 || (act.handler == signal::SIG_DFL && signal::ignored_by_default(sig));
@@ -836,7 +839,12 @@ pub fn deliver_user_signals(regs: &mut signal::Regs) {
         match act.handler {
             signal::SIG_IGN => continue,
             signal::SIG_DFL => {
-                if signal::ignored_by_default(sig) || signal::stops_by_default(sig) {
+                if signal::stops_by_default(sig) {
+                    // Job control: stop until SIGCONT (or SIGKILL) resumes us.
+                    sched::stop_current();
+                    continue;
+                }
+                if signal::ignored_by_default(sig) {
                     continue;
                 }
                 if signal::terminates_by_default(sig) {

@@ -195,6 +195,14 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "stats" => stats(ctx, &args[1..]),
         "restart" => restart(ctx, &args[1..]),
         "cp" => cp(ctx, &args[1..]),
+        "kill" => kill(ctx, &args[1..]),
+        "pause" => pause_cmd(ctx, &args[1..], crate::proc::signal::SIGSTOP, "pause"),
+        "unpause" => pause_cmd(ctx, &args[1..], crate::proc::signal::SIGCONT, "unpause"),
+        "rename" => rename(ctx, &args[1..]),
+        "top" => top(ctx, &args[1..]),
+        "port" => port(ctx, &args[1..]),
+        "wait" => wait_cmd(ctx, &args[1..]),
+        "update" => update(ctx, &args[1..]),
         "ip" => container_ip(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
@@ -1618,6 +1626,185 @@ fn cp(ctx: &mut Ctx, args: &[String]) -> i32 {
         Ok(()) => 0,
         Err(e) => ctx.fail_errno("cp", e),
     }
+}
+
+/// `fastman kill [-s SIGNAL] <container>...` — send a signal (default SIGKILL).
+fn kill(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut sig = crate::proc::signal::SIGKILL;
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-s" | "--signal" => {
+                i += 1;
+                match args.get(i).and_then(|s| crate::proc::signal::parse(s)) {
+                    Some(s) => sig = s,
+                    None => return ctx.fail("kill: invalid signal"),
+                }
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                // `-9` / `-KILL` form.
+                match crate::proc::signal::parse(&s[1..]) {
+                    Some(x) => sig = x,
+                    None => return ctx.fail(format!("kill: invalid signal '{s}'")),
+                }
+            }
+            _ => names.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if names.is_empty() {
+        return ctx.fail("kill requires a container");
+    }
+    let fc = fs_ctx(ctx);
+    let mut st = 0;
+    for name in &names {
+        match runtime::signal_container(&fc, name, sig) {
+            Ok(_) => outln!(ctx, "{name}"),
+            Err(e) => st = ctx.fail_errno(name, e),
+        }
+    }
+    st
+}
+
+/// Shared by `pause` (SIGSTOP) and `unpause` (SIGCONT).
+fn pause_cmd(ctx: &mut Ctx, args: &[String], sig: u32, verb: &str) -> i32 {
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if names.is_empty() {
+        return ctx.fail(format!("{verb} requires a container"));
+    }
+    let fc = fs_ctx(ctx);
+    let mut st = 0;
+    for name in names {
+        match runtime::signal_container(&fc, name, sig) {
+            Ok(_) => outln!(ctx, "{name}"),
+            Err(e) => st = ctx.fail_errno(name, e),
+        }
+    }
+    st
+}
+
+/// `fastman rename <old> <new>`.
+fn rename(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let a: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if a.len() != 2 {
+        return ctx.fail("rename requires OLD and NEW names");
+    }
+    let fc = fs_ctx(ctx);
+    match runtime::rename(&fc, a[0], a[1]) {
+        Ok(()) => 0,
+        Err(e) => ctx.fail_errno("rename", e),
+    }
+}
+
+/// `fastman top <container>` — the processes running inside a container.
+fn top(ctx: &mut Ctx, args: &[String]) -> i32 {
+    use crate::shell::cmds::procinfo as pi;
+    let Some(name) = args.iter().find(|a| !a.starts_with('-')) else {
+        return ctx.fail("top requires a container");
+    };
+    let fc = fs_ctx(ctx);
+    let pids = match runtime::container_pids(&fc, name) {
+        Ok(p) => p,
+        Err(e) => return ctx.fail_errno(name, e),
+    };
+    if pids.is_empty() {
+        return ctx.fail(format!("{name} is not running"));
+    }
+    let s = style_of(ctx);
+    let procs = pi::list(&fc);
+    let mut t = Table::new(&["PID", "PPID", "STAT", "TIME", "COMMAND"]);
+    for p in &procs {
+        if pids.contains(&p.pid) {
+            t.row(alloc::vec![
+                format!("{}", p.pid),
+                format!("{}", p.ppid),
+                p.stat_flags(),
+                pi::fmt_time_plus(p.cpu_ticks()),
+                p.args(),
+            ]);
+        }
+    }
+    t.render(ctx, &s);
+    0
+}
+
+/// `fastman port <container>` — its published port mappings.
+fn port(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let Some(name) = args.iter().find(|a| !a.starts_with('-')) else {
+        return ctx.fail("port requires a container");
+    };
+    let fc = fs_ctx(ctx);
+    let c = match container::find(&fc, name) {
+        Ok(c) => c,
+        Err(e) => return ctx.fail_errno(name, e),
+    };
+    for p in &c.ports {
+        let proto = if p.udp { "udp" } else { "tcp" };
+        outln!(ctx, "{}/{} -> 0.0.0.0:{}", p.container, proto, p.host);
+    }
+    0
+}
+
+/// `fastman wait <container>...` — block until each exits, printing its code.
+fn wait_cmd(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if names.is_empty() {
+        return ctx.fail("wait requires a container");
+    }
+    let fc = fs_ctx(ctx);
+    let mut st = 0;
+    for name in names {
+        match runtime::wait(&fc, name) {
+            Ok(code) => outln!(ctx, "{code}"),
+            Err(e) => st = ctx.fail_errno(name, e),
+        }
+    }
+    st
+}
+
+/// `fastman update [-m SIZE] [--pids-limit N] <container>...` — change limits.
+fn update(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut mem = None;
+    let mut pids = None;
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--memory" => {
+                i += 1;
+                match args.get(i).and_then(|s| parse_size(s).ok()) {
+                    Some(m) => mem = Some(m),
+                    None => return ctx.fail("update: -m needs a size (e.g. 256m)"),
+                }
+            }
+            "--pids-limit" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse().ok()) {
+                    Some(p) => pids = Some(p),
+                    None => return ctx.fail("update: --pids-limit needs a number"),
+                }
+            }
+            s if s.starts_with('-') => return ctx.fail(format!("update: unknown option '{s}'")),
+            _ => names.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if names.is_empty() {
+        return ctx.fail("update requires a container");
+    }
+    if mem.is_none() && pids.is_none() {
+        return ctx.fail("update: nothing to change (use -m or --pids-limit)");
+    }
+    let fc = fs_ctx(ctx);
+    let mut st = 0;
+    for name in &names {
+        match runtime::update_limits(&fc, name, mem, pids) {
+            Ok(()) => outln!(ctx, "{name}"),
+            Err(e) => st = ctx.fail_errno(name, e),
+        }
+    }
+    st
 }
 
 fn exec(ctx: &mut Ctx, args: &[String]) -> i32 {
