@@ -35,6 +35,9 @@ const LAYOUT: &[(u16, &str)] = &[
     (0o755, "/var/log"),
     (0o755, "/var/cache"),
     (0o1777, "/var/tmp"),
+    // fastman's rootless store parent: sticky + world-writable (the /tmp model),
+    // so every user can create their own private per-uid subtree without root.
+    (0o1777, "/var/lib/fastman"),
 ];
 
 /// Mount `/` and return the host mount namespace.
@@ -108,6 +111,9 @@ pub fn populate(ns: &Arc<MountNamespace>) {
     // The ownership fix-up of /tmp inside the new tmpfs roots.
     let _ = ops::chmod(&ctx, "/tmp", 0o1777, true);
     let _ = ops::chmod(&ctx, "/dev/shm", 0o1777, true);
+    // Force the fastman store parent to sticky+world-writable even if it already
+    // exists from before this became the policy (persistent root fs).
+    let _ = ops::chmod(&ctx, "/var/lib/fastman", 0o1777, true);
     seed_etc(&ctx);
 }
 

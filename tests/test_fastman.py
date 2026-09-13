@@ -446,7 +446,8 @@ def test_rootless_and_user_escalation_denied(g):
         assert ok[2] == 0 and "hi" in ok[0], ok
         # Escalation attempt: --user 0 must be refused.
         esc = g.run("su fmuser -c 'fastman run --user 0 alpine id'", timeout=60)
-        assert esc[2] != 0 and "not permitted" in (esc[0] + esc[1]).lower(), esc
+        out = (esc[0] + esc[1]).lower()
+        assert esc[2] != 0 and ("permission denied" in out or "not permitted" in out), esc
     finally:
         g.run("userdel -r fmuser 2>/dev/null; true")
 

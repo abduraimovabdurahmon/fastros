@@ -827,6 +827,14 @@ fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
     let detach = opts.detach;
     let rm = opts.rm;
     let fc = fs_ctx(ctx);
+    // Reject an unauthorized `--user` up front (before any auto-pull): a non-root
+    // caller may only run as its own identity. runtime::create() enforces this
+    // too; doing it here just fails fast with a clear message and no wasted pull.
+    if let Some((u, g)) = opts.user {
+        if !fc.cred.is_root() && (u != fc.cred.uid || g != fc.cred.gid) {
+            return ctx.fail("--user: permission denied (only root may run as another identity)");
+        }
+    }
     // Like `docker run`: if the image is not present locally, pull it from the
     // registry first, then run. Only a pull failure aborts the run.
     if image::resolve(&fc, &image_name).is_none() {
