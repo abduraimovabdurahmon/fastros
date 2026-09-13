@@ -211,8 +211,13 @@ def test_stats(g, image):
     assert head[:2] == ["CONTAINER", "ID"] and "PIDS" in head, out
     row = [l for l in out.splitlines()[1:] if "fmt_st" in l]
     assert row, out
-    # A running container has at least its init process and a memory limit shown.
-    assert "64" in row[0] and row[0].split()[-1].isdigit() and int(row[0].split()[-1]) >= 1, row
+    fields = row[0].split()
+    assert fields[1] == "fmt_st", row
+    assert fields[2].endswith("%"), row  # CPU %
+    # A memory limit was set, so a real limit (not ∞) is shown, e.g. "/ 67.1MB".
+    assert "MB" in row[0] and "/" in row[0], row
+    # Last column is the PID count: at least the container's init process.
+    assert fields[-1].isdigit() and int(fields[-1]) >= 1, row
     g.run("fastman rm -f fmt_st")
 
 
