@@ -114,6 +114,11 @@ impl ImageConfig {
         s
     }
 
+    /// Parse a config from its encoded bytes (used by `load`).
+    pub fn from_bytes(data: &[u8]) -> ImageConfig {
+        ImageConfig::decode(&alloc::string::String::from_utf8_lossy(data))
+    }
+
     fn decode(text: &str) -> ImageConfig {
         let mut c = ImageConfig { workdir: String::from("/"), ..Default::default() };
         for line in text.lines() {

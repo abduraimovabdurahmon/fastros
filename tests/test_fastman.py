@@ -420,6 +420,18 @@ def test_commit(g):
     g.run("fastman rmi committed:v1")
 
 
+def test_save_load(g, image):
+    """`fastman save` then `load` round-trips an image (via a tag, so the shared
+    fixture image is left intact)."""
+    g.ok("fastman tag fmtest:latest savetest:v1")
+    g.ok("fastman save savetest:v1 -o /tmp/img.tar")
+    g.ok("fastman rmi savetest:v1")
+    assert "savetest:v1" in g.ok("fastman load -i /tmp/img.tar")
+    out, err, st = g.run("fastman run savetest:v1 /bin/hello")
+    assert out.strip() == "hello from a fastman container" and st == 0, (out, err)
+    g.run("fastman rmi savetest:v1")
+
+
 def test_network_management(g):
     """`fastman network` create/ls/rm/inspect (no container needed)."""
     import json

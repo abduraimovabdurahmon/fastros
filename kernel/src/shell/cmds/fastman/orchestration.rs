@@ -375,7 +375,8 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
             }
         }
         "describe" => kube_describe(ctx, &fc, &wdir, &sdir, &rest),
-        other => ctx.fail(format!("unknown kube command '{other}' (apply|get|delete|scale|rollout|logs|exec|describe)")),
+        "port-forward" => kube_port_forward(ctx, &fc, &rest),
+        other => ctx.fail(format!("unknown kube command '{other}' (apply|get|delete|scale|rollout|logs|exec|describe|port-forward)")),
     }
 }
 
@@ -558,3 +559,36 @@ pub(super) fn clone_opts(o: &RunOpts) -> RunOpts {
     }
 }
 
+
+/// `fastman kube port-forward <pod|deployment> <local:remote>` — forward a local
+/// port to a pod's port over the loopback (runs until ^C).
+fn kube_port_forward(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, rest: &[String]) -> i32 {
+    let a: Vec<&String> = rest.iter().filter(|s| !s.starts_with('-')).collect();
+    if a.len() < 2 {
+        return ctx.fail("port-forward requires POD and LOCAL:REMOTE");
+    }
+    let target = bare_name(a[0]);
+    // Resolve to a container: an exact pod name, or a deployment's first pod.
+    let cid = match container::find(fc, &target) {
+        Ok(c) => c.id,
+        Err(_) => match container::find(fc, &crate::fastman::kube::pod_name(&target, 0)) {
+            Ok(c) => c.id,
+            Err(e) => return ctx.fail_errno(&target, e),
+        },
+    };
+    let (local, remote) = match a[1].split_once(':') {
+        Some((l, r)) => (l.parse::<u16>().ok(), r.parse::<u16>().ok()),
+        None => (a[1].parse::<u16>().ok(), a[1].parse::<u16>().ok()),
+    };
+    let (Some(local), Some(remote)) = (local, remote) else {
+        return ctx.fail("port must be LOCAL:REMOTE");
+    };
+    // The pod's declared container port maps to a backend port on the host stack.
+    let actual = crate::net::remap_pod_port(&cid, remote);
+    outln!(ctx, "Forwarding from 127.0.0.1:{local} -> {remote}");
+    ctx.flush();
+    match crate::fastman::proxy::port_forward(local, actual) {
+        Ok(()) => 0,
+        Err(e) => ctx.fail_errno("port-forward", e),
+    }
+}

@@ -186,6 +186,8 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "tag" => tag(ctx, &args[1..]),
         "history" => history(ctx, &args[1..]),
         "rmi" => rmi(ctx, &args[1..]),
+        "save" => save(ctx, &args[1..]),
+        "load" => load(ctx, &args[1..]),
         "commit" => commit(ctx, &args[1..]),
         "run" => run(ctx, &args[1..]),
         "ps" => ps(ctx, &args[1..]),
@@ -240,6 +242,8 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  history <image>            show an image's history");
     outln!(ctx, "  rmi <image>                remove an image (untags if shared)");
     outln!(ctx, "  commit <ctr> <image>       create an image from a container");
+    outln!(ctx, "  save <image> [-o file]     export an image as a tar stream");
+    outln!(ctx, "  load [-i file]             import an image from a save archive");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Containers:"));
     outln!(ctx, "  run [opts] <image> [cmd]   create and start a container");
@@ -461,6 +465,80 @@ fn events(ctx: &mut Ctx, args: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// `fastman save <image> [-o file]` — export an image as a tar stream (stdout by
+/// default). `docker save img > file` and `save -o file` both work.
+fn save(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut out_file = None;
+    let mut name = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                out_file = args.get(i).cloned();
+            }
+            s if !s.starts_with('-') => name = Some(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(name) = name else { return ctx.fail("save requires an image") };
+    if out_file.is_none() && ctx.stdout_tty().is_some() {
+        return ctx.fail("refusing to write an image to the terminal (use -o file or redirect)");
+    }
+    let fc = fs_ctx(ctx);
+    let bytes = match crate::fastman::archive::save(&fc, &name) {
+        Ok(b) => b,
+        Err(e) => return ctx.fail_errno("save", e),
+    };
+    match out_file {
+        Some(f) => match crate::fs::ops::write_file(&fc, &f, &bytes, 0o644) {
+            Ok(()) => 0,
+            Err(e) => ctx.fail_errno(&f, e),
+        },
+        None => {
+            ctx.flush();
+            ctx.write(&bytes);
+            0
+        }
+    }
+}
+
+/// `fastman load [-i file]` — import an image from a `save` archive (stdin by
+/// default).
+fn load(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut in_file = None;
+    let mut i = 0;
+    while i < args.len() {
+        if matches!(args[i].as_str(), "-i" | "--input") {
+            i += 1;
+            in_file = args.get(i).cloned();
+        }
+        i += 1;
+    }
+    let fc = fs_ctx(ctx);
+    let data = match in_file {
+        Some(f) => match crate::fs::ops::read_file(&fc, &f) {
+            Ok(d) => d,
+            Err(e) => return ctx.fail_errno(&f, e),
+        },
+        None => match ctx.read_input("-") {
+            Ok(d) => d,
+            Err(e) => return ctx.fail_errno("stdin", e),
+        },
+    };
+    if data.is_empty() {
+        return ctx.fail("no data (pipe a `fastman save` archive)");
+    }
+    match crate::fastman::archive::load(&fc, &data) {
+        Ok(img) => {
+            outln!(ctx, "Loaded image: {}", img.key);
+            0
+        }
+        Err(e) => ctx.fail_errno("load", e),
+    }
 }
 
 /// `fastman commit <container> <image>` — snapshot a running container's

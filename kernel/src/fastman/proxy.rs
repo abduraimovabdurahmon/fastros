@@ -30,6 +30,32 @@ fn alive(pid: Pid) -> bool {
     crate::proc::find(pid).is_some_and(|p| !p.is_zombie())
 }
 
+/// Foreground port-forward (`kubectl port-forward`): accept connections on the
+/// host stack's `local` port and splice each to `127.0.0.1:target` on the same
+/// stack (where a pod's remapped backend port listens). Runs until the calling
+/// task is interrupted (^C). `Err` if the local port is already taken.
+pub fn port_forward(local: u16, target: u16) -> Result<(), crate::errno::Errno> {
+    let host = crate::net::netns::host();
+    let listener = TcpListener::bind_in(host.clone(), local, 16).map_err(|_| crate::errno::Errno::EADDRINUSE)?;
+    loop {
+        match listener.try_accept() {
+            Some((client, _)) => {
+                let ep = IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), target);
+                if let Ok(backend) = TcpStream::connect_in(host.clone(), ep, 5_000) {
+                    splice(client, backend);
+                }
+            }
+            None => {
+                // Idle: nap, and treat ^C (an interrupted sleep) as "stop".
+                if !crate::sched::sleep_ms(100) {
+                    crate::proc::absorb_signals();
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 fn run_one(cont_ns: Arc<NetNs>, pid: Pid, host_port: u16, cont_port: u16, target: IpAddress) {
     // Listen on the host stack. A pre-armed backlog lets several clients queue.
     let listener = match TcpListener::bind_in(crate::net::netns::host(), host_port, 16) {

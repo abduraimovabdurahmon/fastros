@@ -303,3 +303,23 @@ def test_kube_get_nodes(g):
     assert out.splitlines()[0].split()[:2] == ["NAME", "STATUS"], out
     row = out.splitlines()[1].split()
     assert row[1] == "Ready" and "control-plane" in out, out
+
+
+def test_kube_port_forward(g, kube_setup):
+    """`kube port-forward` forwards a local port to a pod's port over loopback."""
+    import time
+    g.run("fastman kube delete web 2>/dev/null; true")
+    g.ok("fastman kube apply -f /tmp/k8s.yaml", timeout=60)
+    assert _wait(lambda: _running(g, "web-0")), g.ok("fastman kube get pods")
+    try:
+        g.run("(fastman kube port-forward web-0 9091:8080 >/tmp/pf.log 2>&1 &) ; true")
+        # The httpd needs a moment after the pod is Running; retry the local port.
+        got = ""
+        for _ in range(20):
+            got = g.out("curl -s -m 3 http://127.0.0.1:9091/ 2>/dev/null", timeout=8)
+            if "kube pod alive" in got:
+                break
+            time.sleep(1)
+        assert "kube pod alive" in got, (got, g.out("cat /tmp/pf.log 2>/dev/null"))
+    finally:
+        g.run("pkill -f port-forward 2>/dev/null; fastman kube delete web 2>/dev/null; true")
