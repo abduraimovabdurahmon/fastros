@@ -132,6 +132,46 @@ def test_run_interactive_stdin(g, image):
     assert st == 0
 
 
+def test_logs_follow_streams_live(g, image):
+    """`fastman logs -f` streams output as it is produced (Docker's -f)."""
+    g.ok(f"fastman run -d --name fmt_lfs {image} /bin/sleeper")
+    import time
+    time.sleep(1)
+    # Follow for a bounded window; /bin/sleeper prints "tick N" once a second.
+    out = g.out("timeout 4 fastman logs -f fmt_lfs")
+    assert "tick 0" in out and "tick 1" in out, out
+    g.run("fastman rm -f fmt_lfs")
+
+
+def test_logs_follow_exits_with_container(g, image):
+    """`logs -f` on a finished container prints its log and returns (no hang)."""
+    g.ok(f"fastman run -d --name fmt_lfe {image} /bin/hello")
+    import time
+    time.sleep(1)
+    out, err, st = g.run("fastman logs -f fmt_lfe", timeout=15)
+    assert "hello from a fastman container" in out
+    assert st == 0, (out, err)
+    g.run("fastman rm -f fmt_lfe")
+
+
+def test_inspect_json(g, image):
+    """`fastman inspect` emits valid Docker-style JSON describing the container."""
+    import json
+    import time
+    g.ok(f"fastman run -d --name fmt_insp -e K=V -m 64m {image} /bin/sleeper")
+    time.sleep(1)
+    data = json.loads(g.ok("fastman inspect fmt_insp"))
+    assert isinstance(data, list) and len(data) == 1
+    c = data[0]
+    assert c["Name"] == "/fmt_insp"
+    assert c["State"]["Running"] is True
+    assert c["State"]["Pid"] > 0
+    assert c["Config"]["Cmd"] == ["/bin/sleeper"]
+    assert "K=V" in c["Config"]["Env"]
+    assert c["HostConfig"]["Memory"] == 64 * 1024 * 1024
+    g.run("fastman rm -f fmt_insp")
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.

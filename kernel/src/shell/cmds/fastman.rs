@@ -191,6 +191,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "stop" => stop(ctx, &args[1..]),
         "rm" => rm(ctx, &args[1..]),
         "logs" => logs(ctx, &args[1..]),
+        "inspect" => inspect(ctx, &args[1..]),
         "ip" => container_ip(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
@@ -224,8 +225,9 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "{}", s.bold("Containers:"));
     outln!(ctx, "  run [opts] <image> [cmd]   create and start a container");
     outln!(ctx, "  ps [-a]                    list containers");
-    outln!(ctx, "  logs <container>           show a container's output");
-    outln!(ctx, "  exec <container> <cmd>     run a command in a container");
+    outln!(ctx, "  logs [-f] <container>      show a container's output (-f: follow live)");
+    outln!(ctx, "  inspect <container>...     print a container's config + state as JSON");
+    outln!(ctx, "  exec [-it] <container> <cmd>  run a command in a container");
     outln!(ctx, "  stop <container>           stop a container");
     outln!(ctx, "  rm [-f] <container>        remove a container");
     outln!(ctx);
@@ -237,6 +239,8 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx);
     outln!(ctx, "{}", s.bold("run options:"));
     outln!(ctx, "  -d                 detached (background)");
+    outln!(ctx, "  -it                interactive: wire your terminal to the container (e.g. sh)");
+    outln!(ctx, "  --rm               remove the container automatically when it exits");
     outln!(ctx, "  --name <name>      assign a name");
     outln!(ctx, "  -e KEY=VALUE       set an environment variable");
     outln!(ctx, "  -p HOST:CONT       publish a port");
@@ -1196,17 +1200,185 @@ fn rm(ctx: &mut Ctx, args: &[String]) -> i32 {
 }
 
 fn logs(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let follow = args.iter().any(|a| matches!(a.as_str(), "-f" | "--follow"));
     let Some(name) = args.iter().find(|a| !a.starts_with('-')) else {
         return ctx.fail("logs requires a container");
     };
     let fc = fs_ctx(ctx);
-    match runtime::logs(&fc, name) {
-        Ok(data) => {
-            ctx.write(&data);
-            0
+    let c = match container::find(&fc, name) {
+        Ok(c) => c,
+        Err(e) => return ctx.fail_errno(name, e),
+    };
+    if !follow {
+        match runtime::logs(&fc, name) {
+            Ok(data) => {
+                ctx.write(&data);
+                0
+            }
+            Err(e) => ctx.fail_errno(name, e),
         }
-        Err(e) => ctx.fail_errno(name, e),
+    } else {
+        logs_follow(ctx, &fc, &c)
     }
+}
+
+/// `fastman logs -f`: stream the container's log, printing new output as it is
+/// written, until the container exits (Docker's behaviour) or the caller hits
+/// ^C. We track a byte offset and `pread` the tail each pass, so a growing log
+/// is never re-read from the start.
+fn logs_follow(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, c: &container::Container) -> i32 {
+    let path = c.log_path(fc);
+    let mut off: u64 = 0;
+    let mut buf = [0u8; 4096];
+    loop {
+        // Drain whatever has been appended since the last pass.
+        if let Ok(f) = crate::fs::ops::open(fc, &path, crate::fs::file::flags::O_RDONLY, 0) {
+            loop {
+                match f.pread(off, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        ctx.write(&buf[..n]);
+                        off += n as u64;
+                    }
+                    Err(_) => break,
+                }
+            }
+            ctx.flush();
+        }
+        // The container has exited and its log is fully drained — stop, like Docker.
+        if !container::find(fc, &c.id).map(|c| c.is_alive()).unwrap_or(false) {
+            break;
+        }
+        // Wait for more output; ^C (an interrupted sleep) ends the follow.
+        if !crate::sched::sleep_ms(200) {
+            let _ = crate::proc::absorb_signals();
+            break;
+        }
+    }
+    0
+}
+
+/// A JSON string literal with the mandatory escapes.
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// A JSON array of strings on one line: `["a", "b"]`.
+fn json_str_array(items: &[String]) -> String {
+    let parts: Vec<String> = items.iter().map(|s| json_str(s)).collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// `fastman inspect <container>...`: emit a Docker-style JSON array describing
+/// each container's config, state and network. Faithful to the fields fastman
+/// actually models (no invented Docker keys).
+fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if names.is_empty() {
+        return ctx.fail("inspect requires a container");
+    }
+    let fc = fs_ctx(ctx);
+    let mut objs: Vec<String> = Vec::new();
+    let mut st = 0;
+    for name in &names {
+        let c = match container::find(&fc, name) {
+            Ok(c) => c,
+            Err(e) => {
+                st = ctx.fail_errno(name, e);
+                continue;
+            }
+        };
+        let running = c.is_alive();
+        let ports: Vec<String> = c
+            .ports
+            .iter()
+            .map(|p| format!("{}:{}{}", p.host, p.container, if p.udp { "/udp" } else { "/tcp" }))
+            .collect();
+        let binds: Vec<String> = c
+            .volumes
+            .iter()
+            .map(|v| format!("{}:{}{}", v.host, v.container, if v.read_only { ":ro" } else { "" }))
+            .collect();
+        let cap_add = crate::syscall::seccomp::cap_names(c.cap_add);
+        let cap_drop = crate::syscall::seccomp::cap_names(c.cap_drop);
+        let ip = crate::net::netns::container_ip(&c.id).map(|a| a.to_string()).unwrap_or_default();
+        let obj = format!(
+            concat!(
+                "  {{\n",
+                "    \"Id\": {id},\n",
+                "    \"Name\": {name},\n",
+                "    \"Created\": {created},\n",
+                "    \"State\": {{\n",
+                "      \"Status\": {status},\n",
+                "      \"Running\": {running},\n",
+                "      \"Pid\": {pid},\n",
+                "      \"ExitCode\": {exit}\n",
+                "    }},\n",
+                "    \"Image\": {image_id},\n",
+                "    \"Config\": {{\n",
+                "      \"Image\": {image_key},\n",
+                "      \"Cmd\": {cmd},\n",
+                "      \"Env\": {env},\n",
+                "      \"WorkingDir\": {workdir},\n",
+                "      \"User\": {user}\n",
+                "    }},\n",
+                "    \"HostConfig\": {{\n",
+                "      \"NetworkMode\": {network},\n",
+                "      \"Memory\": {mem},\n",
+                "      \"PidsLimit\": {pids},\n",
+                "      \"PortBindings\": {ports},\n",
+                "      \"Binds\": {binds},\n",
+                "      \"CapAdd\": {cap_add},\n",
+                "      \"CapDrop\": {cap_drop}\n",
+                "    }},\n",
+                "    \"NetworkSettings\": {{\n",
+                "      \"IPAddress\": {ip}\n",
+                "    }}\n",
+                "  }}"
+            ),
+            id = json_str(&c.id),
+            name = json_str(&format!("/{}", c.name)),
+            created = c.created,
+            status = json_str(c.live_state().as_str()),
+            running = running,
+            pid = c.pid,
+            exit = c.exit_code,
+            image_id = json_str(&c.image_id),
+            image_key = json_str(&c.image_key),
+            cmd = json_str_array(&c.cmd),
+            env = json_str_array(&c.env),
+            workdir = json_str(if c.workdir.is_empty() { "/" } else { &c.workdir }),
+            user = json_str(&format!("{}:{}", c.uid, c.gid)),
+            network = json_str(&c.network),
+            mem = c.mem_limit,
+            pids = c.pids_limit,
+            ports = json_str_array(&ports),
+            binds = json_str_array(&binds),
+            cap_add = json_str_array(&cap_add),
+            cap_drop = json_str_array(&cap_drop),
+            ip = json_str(&ip),
+        );
+        objs.push(obj);
+    }
+    if objs.is_empty() {
+        return st;
+    }
+    outln!(ctx, "[\n{}\n]", objs.join(",\n"));
+    st
 }
 
 fn exec(ctx: &mut Ctx, args: &[String]) -> i32 {

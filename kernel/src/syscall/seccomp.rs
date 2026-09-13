@@ -66,6 +66,38 @@ pub fn cap_by_name(name: &str) -> Option<u32> {
     })
 }
 
+/// The canonical `CAP_*` name for a bit index, or `None` if unnamed.
+pub fn cap_name(bit: u32) -> Option<&'static str> {
+    Some(match bit {
+        0 => "CAP_CHOWN",
+        1 => "CAP_DAC_OVERRIDE",
+        5 => "CAP_KILL",
+        6 => "CAP_SETGID",
+        7 => "CAP_SETUID",
+        12 => "CAP_NET_ADMIN",
+        CAP_NET_BIND_SERVICE => "CAP_NET_BIND_SERVICE",
+        CAP_NET_RAW => "CAP_NET_RAW",
+        18 => "CAP_SYS_CHROOT",
+        19 => "CAP_SYS_PTRACE",
+        CAP_SYS_ADMIN => "CAP_SYS_ADMIN",
+        CAP_SYS_BOOT => "CAP_SYS_BOOT",
+        27 => "CAP_MKNOD",
+        _ => return None,
+    })
+}
+
+/// The names of every capability set in `mask` (unnamed bits as `CAP_<n>`).
+pub fn cap_names(mask: u64) -> Vec<alloc::string::String> {
+    use alloc::string::ToString;
+    let mut out = Vec::new();
+    for bit in 0..=CAP_LAST {
+        if mask & (1u64 << bit) != 0 {
+            out.push(cap_name(bit).map(|s| s.to_string()).unwrap_or_else(|| alloc::format!("CAP_{bit}")));
+        }
+    }
+    out
+}
+
 // ── seccomp cBPF ─────────────────────────────────────────────────────────────
 
 /// One classic-BPF instruction (`struct sock_filter`).
