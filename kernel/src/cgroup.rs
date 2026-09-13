@@ -49,6 +49,12 @@ pub fn create(cid: &str, mem_bytes: u64, pids: u32) {
     // Default swap allowance equals the memory limit (memory-swap = 2× memory).
     cg.swap_limit_pages.store(mem_pages, Ordering::Relaxed);
     cg.pids_limit.store(pids, Ordering::Relaxed);
+    // `create` always begins a fresh run (first start or a restart). Reset the
+    // live usage counters so a restart does not inherit the previous run's stale
+    // charges — which would otherwise leave the new process unable to allocate.
+    cg.mem_pages.store(0, Ordering::Relaxed);
+    cg.swap_pages.store(0, Ordering::Relaxed);
+    cg.pids.store(0, Ordering::Relaxed);
 }
 
 pub fn get(cid: &str) -> Option<Arc<Cgroup>> {

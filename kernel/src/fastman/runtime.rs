@@ -63,10 +63,29 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
     let key = super::image::list(ctx).into_iter().find(|i| i.id == image_id).map(|i| i.key).unwrap_or_else(|| image_name.to_string());
 
     let id = super::container::new_id();
-    let name = opts.name.clone().unwrap_or_else(super::container::random_name);
-    if super::container::find(ctx, &name).is_ok() {
-        return Err(Errno::EEXIST);
-    }
+    // An explicit `--name` that already exists is an error (Docker: "name already
+    // in use"). An auto-generated name is retried until it is free, so a run
+    // never fails just because random_name() happened to collide with a leftover
+    // container — the bug that made `fastman run <img>` intermittently EEXIST.
+    let name = match opts.name.clone() {
+        Some(n) => {
+            if super::container::find(ctx, &n).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+            n
+        }
+        None => {
+            let mut chosen = None;
+            for _ in 0..100 {
+                let n = super::container::random_name();
+                if super::container::find(ctx, &n).is_err() {
+                    chosen = Some(n);
+                    break;
+                }
+            }
+            chosen.ok_or(Errno::EEXIST)?
+        }
+    };
     let dir = format!("{}/{id}", super::store::containers_dir(ctx));
     ops::mkdir(ctx, &dir, 0o700)?;
     // No up-front copy: the writable rootfs is an overlay built at start time
@@ -309,18 +328,23 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
     }
 
     // Reap the container when its init exits: record the exit code and state.
+    // Guarded by the pid of *this* run, so a restart (which gives the container
+    // a new init pid) is never clobbered by the previous run's reaper.
     let id = c.id.clone();
     let uid = ctx.cred.uid;
     let gid = ctx.cred.gid;
+    let watch_pid = pid;
     let task = child.tasks().into_iter().next();
     crate::sched::spawn("fm-wait", move || {
         let code = task.map(|t| t.join()).unwrap_or(0);
         let kctx = Ctx { fs: crate::proc::kernel().fs.lock().clone(), cred: crate::fs::perm::Cred::user(uid, gid, Vec::new()) };
         if let Ok(mut c) = super::container::load(&kctx, &id) {
-            c.state = State::Exited;
-            c.exit_code = code;
-            c.pid = 0;
-            let _ = c.save(&kctx);
+            if c.pid == watch_pid {
+                c.state = State::Exited;
+                c.exit_code = code;
+                c.pid = 0;
+                let _ = c.save(&kctx);
+            }
         }
     });
     Ok((pid, logger))

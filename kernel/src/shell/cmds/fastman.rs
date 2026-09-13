@@ -192,6 +192,8 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "rm" => rm(ctx, &args[1..]),
         "logs" => logs(ctx, &args[1..]),
         "inspect" => inspect(ctx, &args[1..]),
+        "stats" => stats(ctx, &args[1..]),
+        "restart" => restart(ctx, &args[1..]),
         "ip" => container_ip(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
@@ -227,8 +229,10 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  ps [-a]                    list containers");
     outln!(ctx, "  logs [-f] <container>      show a container's output (-f: follow live)");
     outln!(ctx, "  inspect <container>...     print a container's config + state as JSON");
+    outln!(ctx, "  stats [container...]       live resource usage (CPU, memory, PIDs)");
     outln!(ctx, "  exec [-it] <container> <cmd>  run a command in a container");
     outln!(ctx, "  stop <container>           stop a container");
+    outln!(ctx, "  restart <container>...     stop then start a container");
     outln!(ctx, "  rm [-f] <container>        remove a container");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Compose (multi-container stacks):"));
@@ -1378,6 +1382,127 @@ fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
         return st;
     }
     outln!(ctx, "[\n{}\n]", objs.join(",\n"));
+    st
+}
+
+/// The host pids belonging to a container: its init (`root`) plus every
+/// descendant, walking the parent map built from a process snapshot.
+fn proc_subtree(root: u32, children: &alloc::collections::BTreeMap<u32, Vec<u32>>) -> Vec<u32> {
+    let mut out = alloc::vec![root];
+    let mut stack = alloc::vec![root];
+    while let Some(p) = stack.pop() {
+        if let Some(kids) = children.get(&p) {
+            for &k in kids {
+                out.push(k);
+                stack.push(k);
+            }
+        }
+    }
+    out
+}
+
+/// `fastman stats [container...]`: a one-shot resource snapshot (like
+/// `docker stats --no-stream`) — CPU%, memory usage/limit, and PID count per
+/// running container. CPU is sampled over a short window; memory comes from the
+/// container's cgroup when it has limits, else from its processes' RSS.
+fn stats(ctx: &mut Ctx, args: &[String]) -> i32 {
+    use crate::shell::cmds::procinfo as pi;
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let fc = fs_ctx(ctx);
+    let s = style_of(ctx);
+
+    // Which containers to report: the named ones, else all running.
+    let mut conts: Vec<container::Container> = Vec::new();
+    if names.is_empty() {
+        for c in container::list(&fc) {
+            if c.is_alive() {
+                conts.push(c);
+            }
+        }
+    } else {
+        for name in &names {
+            match container::find(&fc, name) {
+                Ok(c) => conts.push(c),
+                Err(e) => return ctx.fail_errno(name, e),
+            }
+        }
+    }
+
+    // Two CPU-time samples across a short window.
+    let s1 = pi::list(&fc);
+    let t1 = crate::time::now_ns();
+    let before: alloc::collections::BTreeMap<u32, u64> = s1.iter().map(|p| (p.pid, p.cpu_ticks())).collect();
+    crate::sched::sleep_ms(500);
+    let s2 = pi::list(&fc);
+    let t2 = crate::time::now_ns();
+    let elapsed_ticks = ((t2.saturating_sub(t1)) * crate::time::HZ as u64 / 1_000_000_000).max(1);
+
+    // Parent → children and per-pid cpu/rss from the second sample.
+    let mut children: alloc::collections::BTreeMap<u32, Vec<u32>> = alloc::collections::BTreeMap::new();
+    let mut cpu_now: alloc::collections::BTreeMap<u32, u64> = alloc::collections::BTreeMap::new();
+    let mut rss_pages: alloc::collections::BTreeMap<u32, u64> = alloc::collections::BTreeMap::new();
+    for p in &s2 {
+        children.entry(p.ppid).or_default().push(p.pid);
+        cpu_now.insert(p.pid, p.cpu_ticks());
+        rss_pages.insert(p.pid, p.rss_pages);
+    }
+    let total_ram = crate::mm::stats().total_bytes.max(1);
+
+    let mut t = Table::new(&["CONTAINER ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %", "PIDS"]);
+    for c in &conts {
+        if !c.is_alive() {
+            t.row(alloc::vec![short(&c.id).to_string(), c.name.clone(), "--".into(), "-- / --".into(), "--".into(), "0".into()]);
+            continue;
+        }
+        let tree = proc_subtree(c.pid, &children);
+        let cpu_delta: u64 = tree.iter().map(|p| cpu_now.get(p).copied().unwrap_or(0).saturating_sub(before.get(p).copied().unwrap_or(0))).sum();
+        let cpu_pm = cpu_delta * 1000 / elapsed_ticks; // per-mille of one core
+
+        // Memory: prefer the cgroup counter, fall back to summed RSS.
+        let (mem, limit, pids) = match crate::cgroup::usage(&c.id) {
+            Some((m, l, p, _)) => (m, l, p as u64),
+            None => {
+                let rss: u64 = tree.iter().map(|p| rss_pages.get(p).copied().unwrap_or(0)).sum::<u64>() * 4096;
+                (rss, c.mem_limit, tree.len() as u64)
+            }
+        };
+        let denom = if limit > 0 { limit } else { total_ram };
+        let mem_pm = mem * 1000 / denom;
+        let limit_str = if limit > 0 { human_size(limit) } else { "∞".into() };
+
+        t.row(alloc::vec![
+            short(&c.id).to_string(),
+            c.name.clone(),
+            format!("{}.{}%", cpu_pm / 10, cpu_pm % 10),
+            format!("{} / {}", human_size(mem), limit_str),
+            format!("{}.{}%", mem_pm / 10, mem_pm % 10),
+            format!("{pids}"),
+        ]);
+    }
+    t.render(ctx, &s);
+    0
+}
+
+/// `fastman restart <container>...`: stop (SIGTERM, escalating to SIGKILL) then
+/// start each container again — the same lifecycle Docker's `restart` runs.
+fn restart(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if names.is_empty() {
+        return ctx.fail("restart requires a container");
+    }
+    let fc = fs_ctx(ctx);
+    let mut st = 0;
+    for name in names {
+        // Stop it if it is running (a no-op for an already-exited container).
+        let _ = runtime::stop(&fc, name, crate::proc::signal::SIGTERM);
+        match container::find(&fc, name) {
+            Ok(mut c) => match runtime::start(&fc, &mut c, None, None) {
+                Ok(_) => outln!(ctx, "{}", name),
+                Err(e) => st = ctx.fail_errno(name, e),
+            },
+            Err(e) => st = ctx.fail_errno(name, e),
+        }
+    }
     st
 }
 

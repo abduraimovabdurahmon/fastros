@@ -172,6 +172,50 @@ def test_inspect_json(g, image):
     g.run("fastman rm -f fmt_insp")
 
 
+def test_restart(g, image):
+    """`fastman restart` stops then starts a container (new pid, still running)."""
+    import json
+    import time
+    g.ok(f"fastman run -d --name fmt_rs {image} /bin/sleeper")
+    time.sleep(1)
+    pid1 = json.loads(g.ok("fastman inspect fmt_rs"))[0]["State"]["Pid"]
+    g.ok("fastman restart fmt_rs")
+    time.sleep(1)
+    c = json.loads(g.ok("fastman inspect fmt_rs"))[0]
+    assert c["State"]["Running"] is True, c
+    assert c["State"]["Pid"] != pid1, c
+    g.run("fastman rm -f fmt_rs")
+
+
+def test_restart_with_memory_limit(g, image):
+    """Regression: restarting a container that has a memory cgroup must not
+    inherit the dead run's stale charges (which left the new process unable to
+    allocate and made it exit immediately)."""
+    import json
+    import time
+    g.ok(f"fastman run -d --name fmt_rsm -m 32m {image} /bin/sleeper")
+    time.sleep(1)
+    g.ok("fastman restart fmt_rsm")
+    time.sleep(1)
+    assert json.loads(g.ok("fastman inspect fmt_rsm"))[0]["State"]["Running"] is True
+    g.run("fastman rm -f fmt_rsm")
+
+
+def test_stats(g, image):
+    """`fastman stats` reports CPU/memory/PIDs for a running container."""
+    import time
+    g.ok(f"fastman run -d --name fmt_st -m 64m {image} /bin/sleeper")
+    time.sleep(1)
+    out = g.ok("fastman stats fmt_st")
+    head = out.splitlines()[0].split()
+    assert head[:2] == ["CONTAINER", "ID"] and "PIDS" in head, out
+    row = [l for l in out.splitlines()[1:] if "fmt_st" in l]
+    assert row, out
+    # A running container has at least its init process and a memory limit shown.
+    assert "64" in row[0] and row[0].split()[-1].isdigit() and int(row[0].split()[-1]) >= 1, row
+    g.run("fastman rm -f fmt_st")
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.
