@@ -1,0 +1,18 @@
+# fastman compose demo: two services on a private user bridge network `appnet`.
+# `web` publishes port 80 to the host as 8093 (via the netns port-publish proxy);
+# both services run in isolated network namespaces on the same bridge.
+services:
+  web:
+    image: demoimg:latest
+    command: ["/bin/httpd", "80"]
+    network: appnet
+    environment:
+      - SVC=web
+    ports:
+      - "8093:80"
+  worker:
+    image: demoimg:latest
+    command: ["/bin/httpd", "80"]
+    network: appnet
+    environment:
+      - SVC=worker

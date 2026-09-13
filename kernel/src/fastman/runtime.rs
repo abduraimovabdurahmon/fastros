@@ -283,6 +283,16 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
     c.state = State::Running;
     c.save(ctx)?;
 
+    // A container in a private network namespace binds its ports inside that
+    // namespace, invisible to the host. Publish each `-p` mapping with a host
+    // forwarding proxy so the port is reachable from outside (Docker's model).
+    if !c.ports.is_empty() {
+        if let Some(ns) = container_netns(c) {
+            let target = ns.ip.map(crate::net::IpAddress::Ipv4).unwrap_or_else(|| crate::net::IpAddress::v4(127, 0, 0, 1));
+            super::proxy::publish(ns, pid, c.ports.clone(), target);
+        }
+    }
+
     // Reap the container when its init exits: record the exit code and state.
     let id = c.id.clone();
     let uid = ctx.cred.uid;

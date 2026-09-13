@@ -286,6 +286,16 @@ pub fn parse(project: &str, src: &str) -> KResult<Compose> {
         if let Some(w) = spec.get("working_dir").and_then(|v| v.as_str()) {
             opts.workdir = Some(w.to_string());
         }
+        // `network:` (a name) or the first entry of `networks:` puts the service
+        // in that user bridge network — its own namespace, reachable from peers
+        // by name/IP and, with `ports:`, published to the host via the proxy.
+        if let Some(n) = spec.get("network").and_then(|v| v.as_str()) {
+            opts.network = n.to_string();
+        } else if let Some(nets) = spec.get("networks") {
+            if let Some(first) = nets.as_string_list().into_iter().next() {
+                opts.network = first;
+            }
+        }
         out.push(Service { name: name.clone(), image, opts });
     }
     Ok(Compose { project: project.to_string(), services: out })

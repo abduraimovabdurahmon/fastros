@@ -58,7 +58,12 @@ fn new_tcp_socket() -> tcp::Socket<'static> {
 
 impl TcpStream {
     pub fn connect(remote: IpEndpoint, timeout_ms: u64) -> KResult<TcpStream> {
-        let ns = netns::current();
+        Self::connect_in(netns::current(), remote, timeout_ms)
+    }
+
+    /// Connect from a specific network namespace (used by the port-publish proxy
+    /// to reach a container's server inside its own namespace).
+    pub fn connect_in(ns: Arc<NetNs>, remote: IpEndpoint, timeout_ms: u64) -> KResult<TcpStream> {
         let h = {
             let mut st = ns.stack().lock();
             // Loopback destinations are reachable even without a configured
@@ -249,7 +254,12 @@ pub struct TcpListener {
 
 impl TcpListener {
     pub fn bind(port: u16, backlog: usize) -> KResult<TcpListener> {
-        let ns = netns::current();
+        Self::bind_in(netns::current(), port, backlog)
+    }
+
+    /// Listen in a specific network namespace (the port-publish proxy listens on
+    /// the host namespace to forward into a container's namespace).
+    pub fn bind_in(ns: Arc<NetNs>, port: u16, backlog: usize) -> KResult<TcpListener> {
         let mut hs = Vec::new();
         {
             let mut st = ns.stack().lock();

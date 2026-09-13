@@ -89,3 +89,43 @@ def test_compose_up_ps_down(g, compose_setup):
     # After down, nothing left for the project.
     ps2 = g.ok("fastman compose -f /tmp/fastman-compose.yaml ps")
     assert "fastman_alpha" not in ps2 and "fastman_beta" not in ps2, ps2
+
+
+# A network-scoped stack: services on a user bridge, one publishing to the host.
+COMPOSE_NET = """\
+services:
+  api:
+    image: httpd:latest
+    command: ["/bin/httpd", "80"]
+    network: composenet
+    ports:
+      - "8094:80"
+  side:
+    image: httpd:latest
+    command: ["/bin/httpd", "80"]
+    network: composenet
+"""
+
+
+def test_compose_network_and_publish(g, compose_setup):
+    """Services on a user `network:` run in private namespaces on one bridge; a
+    `ports:` mapping is published to the host through the netns proxy."""
+    import base64 as _b64, time
+    g.run("fastman compose -f /tmp/fastman-net.yaml down 2>/dev/null; true")
+    g.ok("base64 -d > /tmp/fastman-net.yaml", stdin=_b64.b64encode(COMPOSE_NET.encode()).decode())
+    try:
+        up = g.ok("fastman compose -f /tmp/fastman-net.yaml up", timeout=60)
+        assert "api" in up and "side" in up, up
+        # Both are on the bridge (each has a 10.88.x address).
+        assert g.ok("fastman ip fastman_api").strip().startswith("10.88."), g.ok("fastman ip fastman_api")
+        assert g.ok("fastman ip fastman_side").strip().startswith("10.88."), g.ok("fastman ip fastman_side")
+        # The published port reaches api through the host proxy.
+        ok = False
+        for _ in range(15):
+            if "port 80" in g.out("curl -s -m 6 http://127.0.0.1:8094/", timeout=12):
+                ok = True
+                break
+            time.sleep(0.6)
+        assert ok, g.out("curl -s -m 6 http://127.0.0.1:8094/", timeout=12)
+    finally:
+        g.run("fastman compose -f /tmp/fastman-net.yaml down 2>/dev/null; true")

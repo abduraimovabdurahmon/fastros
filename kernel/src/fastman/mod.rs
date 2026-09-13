@@ -26,6 +26,7 @@
 pub mod build;
 pub mod compose;
 pub mod container;
+pub mod proxy;
 pub mod extract;
 pub mod image;
 pub mod json;
