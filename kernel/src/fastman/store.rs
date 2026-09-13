@@ -23,10 +23,21 @@ pub fn index_path(ctx: &Ctx) -> String {
     format!("{}/images/index", base(ctx))
 }
 
+/// Named volumes (Docker `volume create`): each is a directory here, bind-mounted
+/// into containers via `-v <name>:/path`.
+pub fn volumes_dir(ctx: &Ctx) -> String {
+    format!("{}/volumes", base(ctx))
+}
+
+/// Named networks (Docker `network create`): one marker file per network.
+pub fn networks_dir(ctx: &Ctx) -> String {
+    format!("{}/networks", base(ctx))
+}
+
 /// Create the store directories, owned by the calling user (mode 0700 — a
 /// user's containers are private).
 pub fn ensure(ctx: &Ctx) -> KResult<()> {
-    for d in ["/var/lib/fastman", &base(ctx), &images_dir(ctx), &containers_dir(ctx)] {
+    for d in ["/var/lib/fastman", &base(ctx), &images_dir(ctx), &containers_dir(ctx), &volumes_dir(ctx), &networks_dir(ctx)] {
         match ops::mkdir(ctx, d, 0o700) {
             Ok(()) | Err(crate::errno::Errno::EEXIST) => {}
             Err(e) => return Err(e),

@@ -105,6 +105,18 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         env.retain(|x| x.split('=').next() != Some(k));
         env.push(e.clone());
     }
+    // Named volumes: a `-v <name>:/path` whose source has no slash refers to a
+    // managed volume (Docker's model), not a host path. Expand it to the store
+    // path and create it on demand.
+    let mut volumes = opts.volumes;
+    for v in &mut volumes {
+        if !v.host.contains('/') {
+            let dir = format!("{}/{}", super::store::volumes_dir(ctx), v.host);
+            let _ = ops::mkdir_all(ctx, &dir, 0o755);
+            v.host = dir;
+        }
+    }
+
     // Effective health check: `--health-cmd` wins, else the image's HEALTHCHECK.
     let hc: (String, u32, u32, u32) = if !opts.health_cmd.is_empty() {
         (opts.health_cmd.clone(), opts.health_interval, opts.health_timeout, opts.health_retries)
@@ -124,7 +136,7 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         exit_code: 0,
         created: crate::time::unix_now(),
         ports: opts.ports,
-        volumes: opts.volumes,
+        volumes,
         network: if opts.network.is_empty() { String::from("bridge") } else { opts.network },
         detach: opts.detach,
         uid: opts.user.map(|u| u.0).unwrap_or(0),

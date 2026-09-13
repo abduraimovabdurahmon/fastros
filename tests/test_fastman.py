@@ -394,6 +394,40 @@ def test_system_df(g, image):
     assert any(l.startswith("Containers") for l in out.splitlines())
 
 
+def test_network_management(g):
+    """`fastman network` create/ls/rm/inspect (no container needed)."""
+    import json
+    g.run("fastman network rm testnet")  # clean slate
+    g.ok("fastman network create testnet")
+    ls = g.ok("fastman network ls")
+    for builtin in ("bridge", "host", "none"):
+        assert builtin in ls, ls
+    assert "testnet" in ls
+    data = json.loads(g.ok("fastman network inspect testnet"))
+    assert data[0]["Name"] == "testnet" and "10.88" in data[0]["Subnet"]
+    # Built-ins are protected.
+    assert g.run("fastman network rm bridge")[2] != 0
+    g.ok("fastman network rm testnet")
+    assert "testnet" not in g.ok("fastman network ls")
+
+
+def test_volume_management_and_persistence(g):
+    """`fastman volume` create/ls/inspect/rm, and a named volume persists data
+    across containers. Needs a shell in the image → alpine (network-gated)."""
+    import json
+    if g.run("fastman run --rm alpine true", timeout=120)[2] != 0:
+        pytest.skip("alpine unavailable from dev VM")
+    g.run("fastman volume rm tvol")
+    g.ok("fastman volume create tvol")
+    assert "tvol" in g.ok("fastman volume ls")
+    mp = json.loads(g.ok("fastman volume inspect tvol"))[0]["Mountpoint"]
+    assert mp.endswith("/volumes/tvol"), mp
+    # Data written in one container is visible in the next.
+    g.ok("fastman run --rm -v tvol:/data alpine sh -c 'echo persisted > /data/x'")
+    assert "persisted" in g.ok("fastman run --rm -v tvol:/data alpine cat /data/x")
+    g.ok("fastman volume rm tvol")
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.

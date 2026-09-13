@@ -5,11 +5,13 @@ mod control;
 mod orchestration;
 mod pull;
 mod query;
+mod resources;
 
 use control::*;
 use orchestration::*;
 use pull::*;
 use query::*;
+use resources::*;
 
 use crate::fastman::container::{Port, State, Volume};
 use crate::fastman::runtime::{self, RunOpts};
@@ -205,6 +207,8 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
         "system" => system(ctx, &args[1..]),
+        "network" => network(ctx, &args[1..]),
+        "volume" => volume(ctx, &args[1..]),
         "compose" => compose(ctx, &args[1..]),
         "kube" | "kubectl" | "k" => kube(ctx, &args[1..]),
         "apply" => kube(ctx, &{ let mut v = alloc::vec!["apply".to_string()]; v.extend_from_slice(&args[1..]); v }),
@@ -251,6 +255,8 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  update [-m..] <container>  change resource limits");
     outln!(ctx, "  rm [-f] <container>        remove a container");
     outln!(ctx, "  system df|info|prune       disk usage / info / clean exited");
+    outln!(ctx, "  network ls|create|rm|inspect   manage networks");
+    outln!(ctx, "  volume ls|create|rm|inspect    manage volumes");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Compose (multi-container stacks):"));
     outln!(ctx, "  compose [-f file] up       start all services in a compose file");
