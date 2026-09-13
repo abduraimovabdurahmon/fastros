@@ -71,11 +71,6 @@ pub fn topology() -> Option<&'static Topology> {
     TOPO.get()
 }
 
-/// Number of CPUs actually running (the BSP plus any APs brought online).
-pub fn online_count() -> usize {
-    1 + crate::arch::ap::ONLINE.load(core::sync::atomic::Ordering::SeqCst)
-}
-
 /// Bring the application processors online (SMP step 3). Each AP runs the
 /// trampoline into long mode and parks; the BSP keeps doing all the work for
 /// now. Best-effort: an AP that does not check in within the timeout is skipped.

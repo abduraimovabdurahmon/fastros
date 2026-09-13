@@ -153,11 +153,6 @@ impl Task {
         crate::net::wake_pollers();
     }
 
-    /// Job control: is this task currently stopped (SIGSTOP)?
-    pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-    }
-
     /// Is a stop signal (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) pending?
     pub fn stop_pending(&self) -> bool {
         const STOP_MASK: u64 = (1 << (crate::proc::signal::SIGSTOP - 1))
