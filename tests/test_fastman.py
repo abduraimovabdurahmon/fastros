@@ -98,6 +98,40 @@ def test_run_foreground(g, image):
     assert out.strip() == "hello from a fastman container" and st == 0
 
 
+def test_run_auto_pulls_missing_image(g):
+    """Like `docker run`, `fastman run <image>` pulls a missing image from the
+    registry before running it — no separate `pull` step needed.
+
+    Network-dependent (real Docker Hub): skipped if the registry is unreachable
+    from the dev VM, so it never produces a false failure.
+    """
+    g.run("fastman rmi alpine:latest")  # start from "not present" if possible
+    out, err, st = g.run("fastman run alpine echo AUTO_PULL_OK", timeout=120)
+    if st != 0 and ("no network" in (out + err) or "pull" in (out + err).lower()):
+        pytest.skip("registry unreachable from dev VM")
+    assert "Unable to find image 'alpine:latest' locally" in out
+    assert "Pulling from library/alpine" in out
+    assert "AUTO_PULL_OK" in out
+    assert st == 0, (out, err)
+
+
+def test_run_rm_removes_container(g, image):
+    """`fastman run --rm` discards the container after it exits (like Docker)."""
+    out = g.ok(f"fastman run --rm --name fmt_rm {image} /bin/hello")
+    assert out.strip() == "hello from a fastman container"
+    # The container must not linger in `ps -a`.
+    assert "fmt_rm" not in g.ok("fastman ps -a")
+
+
+def test_run_interactive_stdin(g, image):
+    """`fastman run -i <img> <cmd>` wires the caller's stdin to the container
+    process (Docker's `-i`), so a command that reads stdin sees real input
+    rather than an immediate EOF."""
+    out, err, st = g.run(f"fastman run -i {image} /bin/catr", stdin="ping-from-host")
+    assert "GOT:ping-from-host" in out, (out, err)
+    assert st == 0
+
+
 def test_sandbox_isolation(g, image):
     # The container reads its OWN /etc/hostname and cannot see the host's
     # /etc/shadow — proof the chroot/mount-namespace sandbox holds.

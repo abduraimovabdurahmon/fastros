@@ -411,8 +411,9 @@ fn rmi(ctx: &mut Ctx, args: &[String]) -> i32 {
     st
 }
 
-fn parse_run(args: &[String]) -> Result<(RunOpts, String, Vec<String>), String> {
+fn parse_run(args: &[String]) -> Result<(RunOpts, bool, String, Vec<String>), String> {
     let mut o = RunOpts { network: String::from("bridge"), ..Default::default() };
+    let mut interactive = false;
     let mut i = 0;
     let mut image = None;
     let mut cmd = Vec::new();
@@ -425,6 +426,8 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, String, Vec<String>), String> 
         }
         match a.as_str() {
             "-d" | "--detach" => o.detach = true,
+            "--rm" => o.rm = true,
+            "-i" | "-t" | "-it" | "-ti" | "--interactive" | "--tty" => interactive = true,
             "--name" => {
                 i += 1;
                 o.name = Some(args.get(i).ok_or("--name needs a value")?.clone());
@@ -478,7 +481,11 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, String, Vec<String>), String> 
     }
     let image = image.ok_or("run requires an image")?;
     o.cmd = cmd.clone();
-    Ok((o, image, cmd))
+    // `-d` and `-it` are mutually exclusive (detached has no terminal).
+    if interactive {
+        o.detach = false;
+    }
+    Ok((o, interactive, image, cmd))
 }
 
 fn parse_port(s: &str) -> Result<Port, String> {
@@ -548,24 +555,52 @@ fn parse_volume(s: &str) -> Result<Volume, String> {
 }
 
 fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
-    let (opts, image_name, _cmd) = match parse_run(args) {
+    let (opts, interactive, image_name, _cmd) = match parse_run(args) {
         Ok(v) => v,
         Err(e) => return ctx.fail(e),
     };
     let detach = opts.detach;
+    let rm = opts.rm;
     let fc = fs_ctx(ctx);
-    // Distinguish "no such image" from "command not found inside the image".
+    // Like `docker run`: if the image is not present locally, pull it from the
+    // registry first, then run. Only a pull failure aborts the run.
     if image::resolve(&fc, &image_name).is_none() {
-        return ctx.fail(format!("Unable to find image '{image_name}' locally (try `fastman pull {image_name}`)"));
+        if let Err(code) = ensure_image(ctx, &image_name) {
+            return code;
+        }
     }
-    let tee = if detach { None } else { runtime::caller_stdout(&ctx.proc) };
+    // Interactive (`-it`): wire the caller's terminal to the container's init
+    // process so `sh`/`bash` are usable. Requires a real stdio triple.
+    let itty = if interactive {
+        let fds = ctx.proc.fds.lock();
+        match (fds.get(0), fds.get(1), fds.get(2)) {
+            (Ok(stdin), Ok(stdout), Ok(stderr)) => {
+                drop(fds);
+                Some(runtime::ExecTty {
+                    stdin,
+                    stdout,
+                    stderr,
+                    tty: ctx.proc.ctty.lock().clone(),
+                    pgid: ctx.proc.pgid.load(core::sync::atomic::Ordering::Relaxed),
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let tee = if detach || interactive { None } else { runtime::caller_stdout(&ctx.proc) };
     ctx.flush();
-    match runtime::run(&fc, &image_name, opts, tee) {
+    match runtime::run(&fc, &image_name, opts, tee, itty) {
         Ok((c, code)) => {
             if detach {
                 outln!(ctx, "{}", c.id);
                 0
             } else {
+                // `--rm`: discard the finished container (best-effort).
+                if rm {
+                    let _ = runtime::remove(&fc, &c.id, true);
+                }
                 code
             }
         }
@@ -678,7 +713,7 @@ fn compose(ctx: &mut Ctx, args: &[String]) -> i32 {
                 let mut opts = clone_opts(&svc.opts);
                 opts.detach = true;
                 ctx.flush();
-                match runtime::run(&fc, &svc.image, opts, None) {
+                match runtime::run(&fc, &svc.image, opts, None, None) {
                     Ok((c, _)) => outln!(ctx, "{} {} {}", s.green("Started"), svc.name, short(&c.id)),
                     Err(e) => {
                         ctx.fail_errno(&svc.name, e);
@@ -791,7 +826,7 @@ fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                         opts.port_remap = Some((d, crate::fastman::kube::alloc_pod_port()));
                     }
                     ctx.flush();
-                    match runtime::run(&fc, &w.image, opts, None) {
+                    match runtime::run(&fc, &w.image, opts, None, None) {
                         Ok(_) => outln!(ctx, "{} {}/{} created", s.green(&w.kind.to_lowercase()), w.name, pod),
                         Err(e) => {
                             ctx.fail_errno(&pod, e);
@@ -1007,7 +1042,7 @@ fn kube_scale(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[Strin
                 opts.port_remap = Some((declared, crate::fastman::kube::alloc_pod_port()));
             }
             ctx.flush();
-            match runtime::run(fc, &image, opts, None) {
+            match runtime::run(fc, &image, opts, None, None) {
                 Ok(_) => outln!(ctx, "pod {pod} created"),
                 Err(e) => {
                     ctx.fail_errno(&pod, e);
@@ -1053,7 +1088,7 @@ fn kube_rollout(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[Str
         let pod = crate::fastman::kube::pod_name(&name, n);
         if let Ok(mut c) = container::find(fc, &pod) {
             let _ = runtime::stop(fc, &pod, crate::proc::signal::SIGTERM);
-            match runtime::start(fc, &mut c, None) {
+            match runtime::start(fc, &mut c, None, None) {
                 Ok(_) => outln!(ctx, "pod {pod} restarted"),
                 Err(e) => {
                     ctx.fail_errno(&pod, e);
@@ -1127,6 +1162,7 @@ fn clone_opts(o: &RunOpts) -> RunOpts {
         pids_limit: o.pids_limit,
         cap_add: o.cap_add,
         cap_drop: o.cap_drop,
+        rm: o.rm,
     }
 }
 
@@ -1223,16 +1259,16 @@ impl crate::fastman::registry::Progress for CliProgress<'_> {
     }
 }
 
-fn pull(ctx: &mut Ctx, args: &[String]) -> i32 {
-    let Some(reference) = args.iter().find(|a| !a.starts_with('-')) else {
-        return ctx.fail("pull requires an image reference");
-    };
+/// Pull `reference` from the registry and store it locally. Prints the same
+/// progress Docker does. `Ok(())` on success, `Err(rc)` (already reported) on
+/// failure. Shared by `fastman pull` and the auto-pull path of `fastman run`.
+fn pull_reference(ctx: &mut Ctx, reference: &str) -> Result<(), i32> {
     let r = match image::ImageRef::parse(reference) {
         Some(r) => r,
-        None => return ctx.fail(format!("invalid reference '{reference}'")),
+        None => return Err(ctx.fail(format!("invalid reference '{reference}'"))),
     };
     if !crate::net::is_up() {
-        return ctx.fail("no network");
+        return Err(ctx.fail("no network"));
     }
     ctx.flush();
     let result = {
@@ -1241,15 +1277,33 @@ fn pull(ctx: &mut Ctx, args: &[String]) -> i32 {
     };
     let pulled = match result {
         Ok(p) => p,
-        Err(e) => return ctx.fail(format!("pull {}: {}", r.key(), e.message())),
+        Err(e) => return Err(ctx.fail(format!("pull {}: {}", r.key(), e.message()))),
     };
     let fc = fs_ctx(ctx);
     match image::store_layers(&fc, &r.key(), &pulled.layers, pulled.config) {
         Ok(img) => {
             outln!(ctx, "Status: Downloaded newer image for {}", r.key());
             outln!(ctx, "{}", img.key);
-            0
+            Ok(())
         }
-        Err(e) => ctx.fail_errno("store image", e),
+        Err(e) => Err(ctx.fail_errno("store image", e)),
+    }
+}
+
+/// Ensure an image is present locally, pulling it Docker-style if not. Used by
+/// `fastman run` so `run <image>` works without a separate `pull`.
+fn ensure_image(ctx: &mut Ctx, image_name: &str) -> Result<(), i32> {
+    let key = image::ImageRef::parse(image_name).map(|r| r.key()).unwrap_or_else(|| image_name.to_string());
+    outln!(ctx, "Unable to find image '{key}' locally");
+    pull_reference(ctx, image_name)
+}
+
+fn pull(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let Some(reference) = args.iter().find(|a| !a.starts_with('-')) else {
+        return ctx.fail("pull requires an image reference");
+    };
+    match pull_reference(ctx, reference) {
+        Ok(()) => 0,
+        Err(code) => code,
     }
 }

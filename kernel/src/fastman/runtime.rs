@@ -51,6 +51,8 @@ pub struct RunOpts {
     /// Capabilities to add / drop (`--cap-add` / `--cap-drop`) as `CAP_*` masks.
     pub cap_add: u64,
     pub cap_drop: u64,
+    /// `--rm`: remove the container automatically after it exits (foreground).
+    pub rm: bool,
 }
 
 /// Create a container from an image, building its writable rootfs.
@@ -216,7 +218,7 @@ fn spawn_logger(id: String, uid: u32, gid: u32, reader: Arc<dyn File>, tee: Opti
 
 /// Start a created container. Returns its init pid. For a foreground run,
 /// `tee` receives a copy of the output; the caller then waits on the pid.
-pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResult<(u32, alloc::sync::Arc<crate::sched::Task>)> {
+pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Option<&ExecTty>) -> KResult<(u32, Option<alloc::sync::Arc<crate::sched::Task>>)> {
     // Re-register the pod port remap (survives reboot: the controller restarts
     // pods from their persisted config, and bind() must translate again).
     if let Some((d, a)) = c.port_remap {
@@ -239,15 +241,25 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
     let (data, argv) = proc::elf::read_exec(&cctx, &real, &argv)?;
     let (space, frame) = proc::elf::load(&cctx, &data, &argv, &c.env)?;
 
-    // stdio: /dev/null in, a pipe out to the logger.
-    let (r, w) = pipe::pipe();
-    let r: Arc<dyn File> = r;
-    let w: Arc<dyn File> = w;
-    let null = crate::device::open_char(crate::fs::makedev(1, 3), flags::O_RDONLY)?;
+    // stdio. Interactive (`run -it`): the container's init owns the caller's
+    // terminal directly (keyboard in, screen out, no log capture) so `sh`/`bash`
+    // are usable. Otherwise stdin is /dev/null and output is teed to the logger.
     let mut fds = crate::proc::fdtable::FdTable::new();
-    fds.set(0, null, false);
-    fds.set(1, w.clone(), false);
-    fds.set(2, w, false);
+    let logger_read: Option<Arc<dyn File>> = if let Some(t) = itty {
+        fds.set(0, t.stdin.clone(), false);
+        fds.set(1, t.stdout.clone(), false);
+        fds.set(2, t.stderr.clone(), false);
+        None
+    } else {
+        let (r, w) = pipe::pipe();
+        let w: Arc<dyn File> = w;
+        let null = crate::device::open_char(crate::fs::makedev(1, 3), flags::O_RDONLY)?;
+        fds.set(0, null, false);
+        fds.set(1, w.clone(), false);
+        fds.set(2, w, false);
+        Some(r as Arc<dyn File>)
+    };
+    let interactive = itty.is_some();
 
     let spawn = Spawn {
         name: c.name.clone(),
@@ -258,8 +270,10 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
         fds,
         parent: crate::proc::kernel(),
         pgid: None,
-        new_session: true,
-        ctty: None,
+        // Interactive: its own foreground group under the caller's session, so
+        // ^C reaches the container command via the terminal line discipline.
+        new_session: !interactive,
+        ctty: itty.and_then(|t| t.tty.clone()),
         uts: crate::proc::kernel().uts.clone(),
         container: Some(c.id.clone()),
         aspace: None,
@@ -277,7 +291,8 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
     };
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
-    let logger = spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee);
+    // Interactive: no logger (output goes straight to the terminal).
+    let logger = logger_read.map(|r| spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee));
 
     c.pid = pid;
     c.state = State::Running;
@@ -313,12 +328,29 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>) -> KResul
 
 /// `fastman run`: create + start. Foreground waits and returns the exit code;
 /// detached returns 0 immediately (the caller prints the id).
-pub fn run(ctx: &Ctx, image_name: &str, opts: RunOpts, tee: Option<Arc<dyn File>>) -> KResult<(Container, i32)> {
+pub fn run(ctx: &Ctx, image_name: &str, opts: RunOpts, tee: Option<Arc<dyn File>>, itty: Option<ExecTty>) -> KResult<(Container, i32)> {
     let detach = opts.detach;
     let mut c = create(ctx, image_name, opts)?;
-    let (pid, logger) = start(ctx, &mut c, if detach { None } else { tee })?;
+    let (pid, logger) = start(ctx, &mut c, if detach { None } else { tee }, itty.as_ref())?;
     if detach {
         return Ok((c, 0));
+    }
+    // Interactive (`-it`): hand the terminal to the container's init and wait,
+    // then take the terminal back — ^C flows through the line discipline.
+    if let Some(t) = &itty {
+        let code = if let Some(p) = proc::find(pid) {
+            if let Some(tty) = &t.tty {
+                tty.set_fg_pgrp(pid);
+            }
+            let code = p.tasks().into_iter().next().map(|task| task.join()).unwrap_or(0);
+            if let Some(tty) = &t.tty {
+                tty.set_fg_pgrp(t.pgid);
+            }
+            code
+        } else {
+            super::container::load(ctx, &c.id).map(|c| c.exit_code).unwrap_or(0)
+        };
+        return Ok((c, code));
     }
     // Foreground: wait for the init process.
     let child = proc::find(pid);
@@ -339,7 +371,9 @@ pub fn run(ctx: &Ctx, image_name: &str, opts: RunOpts, tee: Option<Arc<dyn File>
     };
     // Drain the logger so all container output reaches the caller before we
     // return (and the exec channel closes).
-    logger.join();
+    if let Some(logger) = logger {
+        logger.join();
+    }
     Ok((c, code))
 }
 

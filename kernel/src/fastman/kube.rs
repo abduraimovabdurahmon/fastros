@@ -201,6 +201,7 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         pids_limit: o.pids_limit,
         cap_add: o.cap_add,
         cap_drop: o.cap_drop,
+        rm: false,
     }
 }
 
@@ -223,6 +224,7 @@ pub fn opts_from_container(c: &super::container::Container, name: String) -> Run
         pids_limit: c.pids_limit,
         cap_add: c.cap_add,
         cap_drop: c.cap_drop,
+        rm: false,
     }
 }
 
@@ -270,7 +272,7 @@ fn reconcile_once() {
             let pod = pod_name(&e.name, n);
             if let Ok(mut c) = super::container::find(&kctx, &pod) {
                 if c.live_state() != super::container::State::Running {
-                    match super::runtime::start(&kctx, &mut c, None) {
+                    match super::runtime::start(&kctx, &mut c, None, None) {
                         Ok(_) => {
                             bump_restart(&pod);
                             crate::knotice!("kube", "restarted pod {} (self-healing)", pod);
