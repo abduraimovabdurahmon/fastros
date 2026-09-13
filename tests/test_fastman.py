@@ -432,6 +432,25 @@ def test_save_load(g, image):
     g.run("fastman rmi savetest:v1")
 
 
+def test_rootless_and_user_escalation_denied(g):
+    """Security: a non-root user can use fastman (rootless), but `--user` may
+    only drop privilege — running a container as uid 0 is denied (no local
+    privilege escalation). Network-gated (the user needs an image to run)."""
+    g.run("userdel -r fmuser 2>/dev/null; true")
+    g.ok("useradd -m fmuser")
+    try:
+        if g.run("su fmuser -c 'fastman pull alpine'", timeout=150)[2] != 0:
+            pytest.skip("alpine unavailable for the test user")
+        # Rootless: the non-root user runs its own container fine.
+        ok = g.run("su fmuser -c 'fastman run --rm alpine echo hi'", timeout=60)
+        assert ok[2] == 0 and "hi" in ok[0], ok
+        # Escalation attempt: --user 0 must be refused.
+        esc = g.run("su fmuser -c 'fastman run --user 0 alpine id'", timeout=60)
+        assert esc[2] != 0 and "not permitted" in (esc[0] + esc[1]).lower(), esc
+    finally:
+        g.run("userdel -r fmuser 2>/dev/null; true")
+
+
 def test_network_management(g):
     """`fastman network` create/ls/rm/inspect (no container needed)."""
     import json

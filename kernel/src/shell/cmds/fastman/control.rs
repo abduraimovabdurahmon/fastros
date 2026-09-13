@@ -60,12 +60,15 @@ pub(super) fn split_container(fc: &crate::fs::ops::Ctx, arg: &str) -> Option<(co
 /// An `ops::Ctx` pointed at a *running* container's filesystem (its live
 /// overlay). The writable layer is a tmpfs that exists only while the container
 /// runs, so `cp` requires the container to be up.
-pub(super) fn container_ctx(_ctx: &Ctx, c: &container::Container) -> Result<crate::fs::ops::Ctx, i32> {
+pub(super) fn container_ctx(ctx: &Ctx, c: &container::Container) -> Result<crate::fs::ops::Ctx, i32> {
     if !c.is_alive() {
         return Err(-1);
     }
+    // Access the container's filesystem as the caller — never as root — so `cp`
+    // cannot read or write files (e.g. via a bind mount) the caller could not.
+    let cred = ctx.fs().cred;
     match crate::proc::find(c.pid) {
-        Some(init) => Ok(crate::fs::ops::Ctx { fs: init.fs.lock().clone(), cred: crate::fs::perm::Cred::root() }),
+        Some(init) => Ok(crate::fs::ops::Ctx { fs: init.fs.lock().clone(), cred }),
         None => Err(-1),
     }
 }

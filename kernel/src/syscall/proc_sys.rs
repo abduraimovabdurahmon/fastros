@@ -482,6 +482,14 @@ pub fn tkill(tid: i32, sig: u32) -> KResult<usize> {
     }
     let p = proc::find(tid as u32).ok_or(Errno::ESRCH)?;
     if sig != 0 {
+        // Same permission rule as kill(2): only root or a matching uid may
+        // signal a process. Without this, any user could tkill (e.g. SIGKILL)
+        // another user's process — tkill must not be a hole around kill().
+        let cred = proc::current().cred();
+        let tc = p.cred();
+        if !cred.is_root() && cred.euid != tc.uid && cred.uid != tc.uid {
+            return Err(Errno::EPERM);
+        }
         p.signal(sig);
     }
     Ok(0)

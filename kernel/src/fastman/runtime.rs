@@ -64,6 +64,18 @@ pub struct RunOpts {
 /// Create a container from an image, building its writable rootfs.
 pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> {
     super::store::ensure(ctx)?;
+
+    // `--user` may only DROP privilege, never raise it: a non-root caller cannot
+    // run a container as any identity other than its own (in particular not
+    // uid 0). Without this, `--user 0:1` would give a real root process — a full
+    // privilege escalation, since FastROS has no uid remapping. Root may pick
+    // any identity (like dockerd). Checked before anything else so it fails fast.
+    if let Some((u, g)) = opts.user {
+        if !ctx.cred.is_root() && (u != ctx.cred.uid || g != ctx.cred.gid) {
+            return Err(Errno::EPERM);
+        }
+    }
+
     let image_id = image::resolve(ctx, image_name).ok_or(Errno::ENOENT)?;
     let cfg = image::load_config(ctx, &image_id);
     let key = super::image::list(ctx).into_iter().find(|i| i.id == image_id).map(|i| i.key).unwrap_or_else(|| image_name.to_string());
@@ -692,10 +704,10 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
 /// output, and report success (exit 0). Bounded by `timeout_ms`: a probe that
 /// overruns is SIGKILLed and counts as a failure. Best-effort — any setup error
 /// (no shell, load failure) is a failed probe.
-fn health_probe(c: &Container, timeout_ms: u64) -> bool {
+fn health_probe(c: &Container, timeout_ms: u64, cred: &crate::fs::perm::Cred) -> bool {
     let Some(init) = proc::find(c.pid).filter(|p| !p.is_zombie()) else { return false };
     let fs = init.fs.lock().clone();
-    let kctx = Ctx { fs: fs.clone(), cred: crate::fs::perm::Cred::root() };
+    let kctx = Ctx { fs: fs.clone(), cred: cred.clone() };
     let argv = alloc::vec![String::from("/bin/sh"), String::from("-c"), c.health_cmd.clone()];
     let Ok(real) = proc::elf::find_program(&kctx, &argv[0]) else { return false };
     let Ok((data, argv)) = proc::elf::read_exec(&kctx, &real, &argv) else { return false };
@@ -712,7 +724,7 @@ fn health_probe(c: &Container, timeout_ms: u64) -> bool {
         name: format!("health:{}", c.name),
         args: argv,
         env: env_pairs(&c.env),
-        cred: crate::fs::perm::Cred::root(),
+        cred: cred.clone(),
         fs,
         fds,
         parent: crate::proc::kernel(),
@@ -772,7 +784,14 @@ fn spawn_health_monitor(c: &Container, uid: u32, gid: u32) {
             if cur.pid != watch_pid || !cur.is_alive() {
                 break;
             }
-            let ok = health_probe(&cur, timeout_ms);
+            // Run the probe as the container's identity — its `--user` if set,
+            // otherwise the launching user — never as root.
+            let probe_cred = if cur.uid != 0 || cur.gid != 0 {
+                crate::fs::perm::Cred::user(cur.uid, cur.gid, Vec::new())
+            } else {
+                crate::fs::perm::Cred::user(uid, gid, Vec::new())
+            };
+            let ok = health_probe(&cur, timeout_ms, &probe_cred);
             // Reload before writing so we patch only the health fields onto the
             // current record (never revert state/pid the reaper may have set).
             let Ok(mut fresh) = super::container::load(&kctx, &id) else { break };
@@ -806,8 +825,10 @@ pub fn commit(ctx: &Ctx, name: &str, reference: &str) -> KResult<super::image::I
         return Err(Errno::ENOTCONN);
     }
     let init = proc::find(c.pid).ok_or(Errno::ESRCH)?;
-    // The container's merged filesystem, seen through its own mount namespace.
-    let src = Ctx { fs: init.fs.lock().clone(), cred: crate::fs::perm::Cred::root() };
+    // The container's merged filesystem, seen through its own mount namespace,
+    // accessed as the caller — never as root, so `commit` cannot read files the
+    // caller could not (e.g. root-owned files on a bind mount).
+    let src = Ctx { fs: init.fs.lock().clone(), cred: ctx.cred.clone() };
 
     let new_id = super::image::new_id();
     let dir = format!("{}/{new_id}", super::store::images_dir(ctx));
