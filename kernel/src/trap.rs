@@ -32,6 +32,11 @@ pub fn dispatch(tf: &mut TrapFrame) {
         exception(tf);
     } else if v < (VEC_IRQ_BASE as u64 + IRQ_LINES as u64) {
         irq((v - VEC_IRQ_BASE as u64) as u8);
+    } else if v == crate::arch::apic::TIMER_VECTOR as u64 {
+        // Local-APIC timer: the per-CPU scheduler tick.
+        crate::time::tick();
+        crate::sched::timer_tick();
+        crate::arch::apic::eoi();
     } else {
         SPURIOUS.fetch_add(1, Ordering::Relaxed);
     }

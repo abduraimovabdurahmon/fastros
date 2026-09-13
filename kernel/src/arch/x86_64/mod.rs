@@ -1,6 +1,7 @@
 //! x86_64 support: boot stub, descriptor tables, traps, interrupt
 //! controller, timers, paging and context switching.
 
+pub mod apic;
 pub mod boot;
 pub mod context;
 pub mod cpu;
