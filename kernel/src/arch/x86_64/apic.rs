@@ -52,6 +52,51 @@ pub fn enabled() -> bool {
     base() != 0
 }
 
+/// This CPU's local-APIC id.
+pub fn local_id() -> u32 {
+    if base() == 0 {
+        return 0;
+    }
+    unsafe { read(0x20) >> 24 }
+}
+
+const ICR_LOW: usize = 0x300;
+const ICR_HIGH: usize = 0x310;
+
+/// Wait for a previously written ICR command to be accepted (delivery status).
+unsafe fn icr_wait() {
+    for _ in 0..1_000_000 {
+        if unsafe { read(ICR_LOW) } & (1 << 12) == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Send an INIT IPI to the CPU with local-APIC id `apic_id`.
+pub fn send_init(apic_id: u32) {
+    if base() == 0 {
+        return;
+    }
+    unsafe {
+        write(ICR_HIGH, apic_id << 24);
+        write(ICR_LOW, 0x0000_4500); // INIT, assert, edge
+        icr_wait();
+    }
+}
+
+/// Send a STARTUP IPI (SIPI) telling the CPU to begin at `vector << 12`.
+pub fn send_sipi(apic_id: u32, vector: u8) {
+    if base() == 0 {
+        return;
+    }
+    unsafe {
+        write(ICR_HIGH, apic_id << 24);
+        write(ICR_LOW, 0x0000_4600 | vector as u32); // STARTUP
+        icr_wait();
+    }
+}
+
 /// Bring up the boot CPU's local APIC and start its periodic timer at `hz`.
 /// Returns false (caller keeps the PIT tick) if there is no LAPIC or the timer
 /// could not be calibrated.

@@ -4,7 +4,6 @@ use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
 pub fn main() {
     crate::crypto::rng::init();
-    crate::smp::init();
     crate::drivers::pci::init();
     crate::drivers::block::ata::init();
     // A dedicated swap disk (sdb), if present, backs page reclaim under pressure.

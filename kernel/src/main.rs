@@ -98,11 +98,18 @@ pub extern "C" fn kernel_main(start_info_phys: u32) -> ! {
     sched::init();
     trap::register_irq(0, timer_irq);
     arch::init_interrupts(time::HZ);
+    // Discover the CPU topology (ACPI MADT) before enabling the LAPIC, so the
+    // real LAPIC address and the AP list are available to both steps below.
+    smp::init();
     // Prefer the local-APIC timer for the scheduler tick (per-CPU, the basis for
     // SMP preemption). If it comes up, retire the PIT tick so we don't double.
     if arch::apic::init_bsp(time::HZ) {
         arch::pic::mask(0);
         kinfo!("apic", "LAPIC timer @ {} Hz drives the scheduler tick (PIC kept for legacy IRQs)", time::HZ);
+        // Bring the application processors into long mode and park them. This
+        // uses the PIT busy-wait (no IRQs needed) and must run before we unmask
+        // interrupts, while low memory is still identity-mappable.
+        smp::bringup();
     } else {
         kinfo!("apic", "no local APIC timer; using the PIT tick");
     }

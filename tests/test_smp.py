@@ -24,3 +24,30 @@ def test_system_stable_with_multiple_cpus(g):
     assert g.ok("uname -s").strip() == "FastROS", g.ok("uname -s")
     # A quick round trip proving the scheduler/IO path is healthy.
     assert g.ok("echo smp-ok").strip() == "smp-ok"
+
+
+def test_ap_brought_online(g):
+    """SMP step 3: each application processor reaches long-mode Rust and parks.
+
+    The AP runs the trampoline (real -> protected -> long mode) on the live
+    kernel page tables, marks itself online, then halts. It does no scheduling
+    and takes no interrupts yet, so the boot CPU keeps running everything.
+    """
+    out = g.ok("dmesg")
+    # Only assert bringup if the LAPIC timer actually came up (bringup is gated
+    # on it). On the dev VM it does.
+    if "LAPIC timer @" not in out:
+        return
+    m = re.search(r"smp: (\d+) CPU\(s\) online \(1 BSP \+ (\d+) AP\)", out)
+    assert m, f"no SMP bringup summary in dmesg:\n{out[-2000:]}"
+    total, aps = int(m.group(1)), int(m.group(2))
+    assert total == 1 + aps, out
+    # The dev VM has 2 vCPUs, so exactly one AP should have come online.
+    assert aps >= 1, f"expected >=1 AP online, got {aps}:\n{out[-2000:]}"
+    assert re.search(r"smp: CPU \(APIC \d+\) online", out), out
+
+
+def test_no_panic_after_ap_bringup(g):
+    """Bringing up the AP must never destabilise the running system."""
+    assert "panic" not in g.ok("dmesg").lower()
+    assert g.ok("echo alive").strip() == "alive"

@@ -71,6 +71,64 @@ pub fn topology() -> Option<&'static Topology> {
     TOPO.get()
 }
 
+/// Number of CPUs actually running (the BSP plus any APs brought online).
+pub fn online_count() -> usize {
+    1 + crate::arch::ap::ONLINE.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Bring the application processors online (SMP step 3). Each AP runs the
+/// trampoline into long mode and parks; the BSP keeps doing all the work for
+/// now. Best-effort: an AP that does not check in within the timeout is skipped.
+pub fn bringup() {
+    use crate::arch::paging::{self, flags};
+    use crate::arch::{apic, ap, cpu};
+    let Some(topo) = TOPO.get() else { return };
+    if !apic::enabled() {
+        return;
+    }
+    let bsp = apic::local_id();
+    let cr3 = cpu::read_cr3();
+
+    // Identity-map the trampoline pages into the (live) kernel PML4 so the AP
+    // keeps fetching instructions right after it turns paging on.
+    let pml4 = crate::mm::kspace::pml4();
+    for p in [ap::TRAMP_PA, ap::TRAMP_PA + 0x1000] {
+        let _ = unsafe { paging::map_4k(pml4, p, p as u64, flags::PRESENT | flags::WRITABLE, &mut || crate::mm::frame::alloc_zeroed(0)) };
+    }
+
+    let mut online = 0usize;
+    for c in topo.cpus.iter().filter(|c| c.enabled && c.apic_id != bsp) {
+        // A per-AP kernel stack (in the direct map, so it is already mapped).
+        let Some(stack_phys) = crate::mm::frame::alloc(2) else { continue };
+        let stack_top = (crate::mm::phys_to_virt(stack_phys) + (4 * 4096)) as u64 & !15;
+        ap::install(cr3, stack_top);
+
+        let before = ap::ONLINE.load(core::sync::atomic::Ordering::SeqCst);
+        apic::send_init(c.apic_id);
+        crate::arch::pit::busy_wait_ms(10);
+        apic::send_sipi(c.apic_id, ap::SIPI_VECTOR);
+        crate::arch::pit::busy_wait_ms(1);
+        apic::send_sipi(c.apic_id, ap::SIPI_VECTOR);
+
+        // Wait (up to ~200 ms) for the AP to reach ap_entry.
+        let mut up = false;
+        for _ in 0..200 {
+            if ap::ONLINE.load(core::sync::atomic::Ordering::SeqCst) > before {
+                up = true;
+                break;
+            }
+            crate::arch::pit::busy_wait_ms(1);
+        }
+        if up {
+            online += 1;
+            crate::knotice!("smp", "CPU (APIC {}) online", c.apic_id);
+        } else {
+            crate::kwarn!("smp", "CPU (APIC {}) did not start (trampoline stage {})", c.apic_id, ap::status());
+        }
+    }
+    crate::knotice!("smp", "{} CPU(s) online (1 BSP + {} AP)", 1 + online, online);
+}
+
 // ── ACPI table parsing ───────────────────────────────────────────────────────
 
 fn le16(b: &[u8], o: usize) -> u16 {

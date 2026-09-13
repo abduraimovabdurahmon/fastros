@@ -2,6 +2,7 @@
 //! controller, timers, paging and context switching.
 
 pub mod apic;
+pub mod ap;
 pub mod boot;
 pub mod context;
 pub mod cpu;
