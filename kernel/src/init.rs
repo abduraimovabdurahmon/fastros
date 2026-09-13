@@ -18,6 +18,7 @@ pub fn main() {
 
     crate::firewall::init();
     crate::net::init();
+    crate::net::bridge::start();
     crate::sched::spawn("dhcp-fallback", || {
         crate::net::static_fallback(
             4000,

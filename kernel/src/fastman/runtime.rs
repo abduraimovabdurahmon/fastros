@@ -162,14 +162,17 @@ fn build_fs(ctx: &Ctx, c: &Container) -> KResult<FsContext> {
     Ok(FsContext { ns, root, cwd, umask: 0o022 })
 }
 
-/// The network namespace a container runs in: a private isolated loopback stack
-/// for `--network none`/`private`, or `None` (the shared host stack) for the
-/// default `bridge` network — preserving existing published-port behaviour.
+/// The network namespace a container runs in:
+/// - `none`/`private`   → a private, isolated loopback stack (no peers).
+/// - a user network name → a private stack on that software bridge; containers
+///   on the same network reach each other by IP.
+/// - `bridge`/`host`/empty (default) → `None`, the shared host stack, preserving
+///   published-port and host-network behaviour.
 fn container_netns(c: &Container) -> Option<alloc::sync::Arc<crate::net::netns::NetNs>> {
-    if c.network == "none" || c.network == "private" {
-        Some(crate::net::netns::create(&c.id))
-    } else {
-        None
+    match c.network.as_str() {
+        "none" | "private" => Some(crate::net::netns::create(&c.id)),
+        "" | "bridge" | "host" => None,
+        other => Some(crate::net::netns::create_bridged(&c.id, other)),
     }
 }
 

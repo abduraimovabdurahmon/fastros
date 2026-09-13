@@ -34,6 +34,13 @@ pub struct PhysDevice {
     pub lo_stats: NetStats,
     pub filtered_in: u64,
     pub filtered_out: u64,
+    /// When this device is a port on a user-defined bridge network, the bridge's
+    /// name and the shared queue the bridge delivers peer frames into. Frames to
+    /// a peer on the same bridge are handed to [`crate::net::bridge`] instead of
+    /// a NIC (a bridge port has none); ARP for a peer is answered from the
+    /// bridge's table so containers reach each other by IP.
+    bridge: Option<alloc::string::String>,
+    bridge_rx: alloc::sync::Arc<crate::sync::SpinLock<VecDeque<Vec<u8>>>>,
 }
 
 impl PhysDevice {
@@ -49,7 +56,17 @@ impl PhysDevice {
             lo_stats: NetStats::default(),
             filtered_in: 0,
             filtered_out: 0,
+            bridge: None,
+            bridge_rx: alloc::sync::Arc::new(crate::sync::SpinLock::new(VecDeque::new())),
         }
+    }
+
+    /// Turn this (NIC-less) device into a port on bridge `name` with `mac`,
+    /// delivering peer frames through the shared `rx` queue.
+    pub fn set_bridge(&mut self, name: alloc::string::String, mac: [u8; 6], rx: alloc::sync::Arc<crate::sync::SpinLock<VecDeque<Vec<u8>>>>) {
+        self.mac = mac;
+        self.bridge = Some(name);
+        self.bridge_rx = rx;
     }
     pub fn mac(&self) -> [u8; 6] {
         self.mac
@@ -137,20 +154,29 @@ impl PhysDevice {
             let a = &frame[ETH_HDR..];
             let op = u16::from_be_bytes([a[6], a[7]]);
             let target = ip4(&a[24..28]);
-            if op == 1 && self.is_local(target) {
-                // Answer ARP for our own addresses ourselves.
-                let mut reply = frame.clone();
-                reply[0..6].copy_from_slice(&self.mac);
-                reply[6..12].copy_from_slice(&self.mac);
-                let r = &mut reply[ETH_HDR..];
-                r[6..8].copy_from_slice(&2u16.to_be_bytes());
-                r[8..14].copy_from_slice(&self.mac);
-                r[14..18].copy_from_slice(&target.octets());
-                let (sha, spa) = (a[8..14].to_vec(), a[14..18].to_vec());
-                r[18..24].copy_from_slice(&sha);
-                r[24..28].copy_from_slice(&spa);
-                self.loopback.push_back(reply);
-                return;
+            if op == 1 {
+                // Answer ARP for our own addresses with our MAC, and — on a
+                // bridge — for a peer on the same bridge with the peer's MAC
+                // (proxy ARP), so the resolved neighbour routes to that peer.
+                let reply_mac = if self.is_local(target) {
+                    Some(self.mac)
+                } else {
+                    self.bridge.as_ref().and_then(|b| crate::net::bridge::arp_mac(b, target))
+                };
+                if let Some(mac) = reply_mac {
+                    let mut reply = frame.clone();
+                    reply[0..6].copy_from_slice(&self.mac);
+                    reply[6..12].copy_from_slice(&mac);
+                    let r = &mut reply[ETH_HDR..];
+                    r[6..8].copy_from_slice(&2u16.to_be_bytes());
+                    r[8..14].copy_from_slice(&mac);
+                    r[14..18].copy_from_slice(&target.octets());
+                    let (sha, spa) = (a[8..14].to_vec(), a[14..18].to_vec());
+                    r[18..24].copy_from_slice(&sha);
+                    r[24..28].copy_from_slice(&spa);
+                    self.loopback.push_back(reply);
+                    return;
+                }
             }
         }
         if ethertype == ETHERTYPE_IPV4 && frame.len() >= ETH_HDR + 20 {
@@ -179,6 +205,13 @@ impl PhysDevice {
                 self.loopback.push_back(frame);
                 return;
             }
+        }
+        // A bridge port has no NIC: a frame for a peer on the same bridge is
+        // delivered to that peer by destination MAC.
+        if let Some(bname) = self.bridge.clone() {
+            let dmac: [u8; 6] = frame[0..6].try_into().unwrap_or([0; 6]);
+            crate::net::bridge::deliver(&bname, dmac, frame);
+            return;
         }
         if !crate::net::filter::allow_out(&frame) {
             self.filtered_out += 1;
@@ -214,6 +247,13 @@ impl phy::Device for PhysDevice {
 
     fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Some(f) = self.loopback.pop_front() {
+            return Some((Rx(f), Tx(self)));
+        }
+        // Frames a bridge peer sent us.
+        let delivered = self.bridge_rx.lock().pop_front();
+        if let Some(f) = delivered {
+            self.lo_stats.rx_packets += 1;
+            self.lo_stats.rx_bytes += f.len() as u64;
             return Some((Rx(f), Tx(self)));
         }
         loop {

@@ -66,7 +66,11 @@ impl TcpStream {
             // where AF_INET6 loopback traffic rides.
             let loopback = matches!(remote.addr, IpAddress::Ipv4(a) if a.octets()[0] == 127)
                 || matches!(remote.addr, IpAddress::Ipv6(a) if a == smoltcp::wire::Ipv6Address::LOCALHOST || a.octets()[0] == 0xfd);
-            if st.cfg.addr.is_none() && !loopback {
+            // Reachable if we have any real address: a DHCP/static host address,
+            // or a bridge-network interface address (a private namespace has no
+            // cfg.addr but does carry its bridge IP in the device's local set).
+            let has_addr = st.cfg.addr.is_some() || st.dev.local_ips.iter().any(|a| a.octets()[0] != 127);
+            if !has_addr && !loopback {
                 return Err(Errno::ENETUNREACH);
             }
             let mut sock = new_tcp_socket();

@@ -7,6 +7,7 @@
 //! a socket sleep on [`SOCK_WQ`], which is woken after every poll that may
 //! have changed a socket's state.
 
+pub mod bridge;
 pub mod device;
 pub mod ftp;
 pub mod netns;
@@ -287,6 +288,32 @@ pub fn new_loopback_stack() -> Stack {
     config.random_seed = crate::crypto::rng::u64();
     let mut iface = Interface::new(config, &mut dev, now());
     iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128));
+        let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), 64));
+    });
+    let sockets = SocketSet::new(vec![]);
+    let mut st = Stack { iface, dev, sockets, dhcp: None, cfg: IfConfig::default(), orphans: Vec::new() };
+    st.sync_local_ips();
+    st
+}
+
+/// Build a bridged stack for a private namespace on user network `name`: an
+/// isolated loopback stack that is also a port on the software bridge, with the
+/// assigned `ip` (on-link with its peers) and `mac`. Peers on the same bridge
+/// reach each other by IP; the host and other bridges are unreachable.
+pub fn new_bridge_stack(name: &str, ip: Ipv4Address, mac: [u8; 6], rx: alloc::sync::Arc<crate::sync::SpinLock<alloc::collections::VecDeque<Vec<u8>>>>) -> Stack {
+    let mut dev = PhysDevice::new(None);
+    dev.set_bridge(alloc::string::String::from(name), mac, rx);
+    let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    config.random_seed = crate::crypto::rng::u64();
+    let mut iface = Interface::new(config, &mut dev, now());
+    iface.update_ip_addrs(|a| {
+        // The bridge address is pushed FIRST: smoltcp's IPv4 source selection
+        // returns the first interface address, so outbound frames must carry the
+        // routable bridge IP (not 127.0.0.1) as their source or the peer would
+        // reply to loopback.
+        let _ = a.push(IpCidr::new(IpAddress::Ipv4(ip), bridge::BRIDGE_PREFIX));
         let _ = a.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
         let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128));
         let _ = a.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), 64));

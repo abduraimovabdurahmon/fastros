@@ -191,6 +191,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "stop" => stop(ctx, &args[1..]),
         "rm" => rm(ctx, &args[1..]),
         "logs" => logs(ctx, &args[1..]),
+        "ip" => container_ip(ctx, &args[1..]),
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
         "compose" => compose(ctx, &args[1..]),
@@ -360,6 +361,26 @@ fn build(ctx: &mut Ctx, args: &[String]) -> i32 {
         Err(crate::errno::Errno::EINVAL) => ctx.fail("build failed: the Dockerfile must start with a FROM instruction"),
         Err(crate::errno::Errno::EIO) => ctx.fail("build failed: a RUN step exited non-zero"),
         Err(e) => ctx.fail_errno("build", e),
+    }
+}
+
+/// `fastman ip <container>` — print the container's bridge-network IP address
+/// (only meaningful for a container on a user-defined `--network`).
+fn container_ip(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let Some(name) = args.first() else {
+        return ctx.fail("ip requires a container");
+    };
+    let fc = fs_ctx(ctx);
+    let c = match container::find(&fc, name) {
+        Ok(c) => c,
+        Err(e) => return ctx.fail_errno(name, e),
+    };
+    match crate::net::netns::container_ip(&c.id) {
+        Some(ip) => {
+            outln!(ctx, "{}", ip);
+            0
+        }
+        None => ctx.fail(format!("{name} is not on a bridge network")),
     }
 }
 
