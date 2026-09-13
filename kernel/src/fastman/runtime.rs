@@ -162,6 +162,7 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
     if c.mem_limit != 0 || c.pids_limit != 0 {
         crate::cgroup::create(&c.id, c.mem_limit, c.pids_limit);
     }
+    super::events::record("create", &c.name);
     Ok(c)
 }
 
@@ -354,6 +355,8 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
     }
     c.save(ctx)?;
 
+    super::events::record("start", &c.name);
+
     // Periodic health check (Docker HEALTHCHECK), if configured.
     if !c.health_cmd.is_empty() {
         spawn_health_monitor(c, ctx.cred.uid, ctx.cred.gid);
@@ -386,6 +389,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
                 c.exit_code = code;
                 c.pid = 0;
                 let _ = c.save(&kctx);
+                super::events::record("die", &c.name);
             }
         }
     });
@@ -479,6 +483,7 @@ pub fn stop(ctx: &Ctx, name: &str, sig: u32) -> KResult<Container> {
         }
     }
     let _ = ctx;
+    super::events::record("stop", &c.name);
     Ok(c)
 }
 
@@ -496,6 +501,7 @@ pub fn signal_container(ctx: &Ctx, name: &str, sig: u32) -> KResult<usize> {
             n += 1;
         }
     }
+    super::events::record("kill", &c.name);
     Ok(n)
 }
 
@@ -576,7 +582,9 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool) -> KResult<()> {
     crate::net::clear_pod_port(&c.id);
     crate::net::netns::remove(&c.id);
     crate::cgroup::remove(&c.id);
-    ops::remove_tree(ctx, &c.dir(ctx))
+    ops::remove_tree(ctx, &c.dir(ctx))?;
+    super::events::record("destroy", &c.name);
+    Ok(())
 }
 
 /// `fastman exec`: run another program inside a running container.
@@ -785,6 +793,43 @@ fn spawn_health_monitor(c: &Container, uid: u32, gid: u32) {
             let _ = fresh.save(&kctx);
         }
     });
+}
+
+/// `fastman commit <container> <image>`: snapshot a running container's current
+/// filesystem (its live overlay) into a new image. The container must be running
+/// (its writable layer is a tmpfs that exists only while it runs). The new image
+/// inherits the source image's config, updated with the container's cmd/env/
+/// workdir — exactly what `docker commit` produces.
+pub fn commit(ctx: &Ctx, name: &str, reference: &str) -> KResult<super::image::Image> {
+    let c = super::container::find(ctx, name)?;
+    if !c.is_alive() {
+        return Err(Errno::ENOTCONN);
+    }
+    let init = proc::find(c.pid).ok_or(Errno::ESRCH)?;
+    // The container's merged filesystem, seen through its own mount namespace.
+    let src = Ctx { fs: init.fs.lock().clone(), cred: crate::fs::perm::Cred::root() };
+
+    let new_id = super::image::new_id();
+    let dir = format!("{}/{new_id}", super::store::images_dir(ctx));
+    ops::mkdir(ctx, &dir, 0o700)?;
+    let rootfs = super::image::rootfs_path(ctx, &new_id);
+    ops::mkdir(ctx, &rootfs, 0o755)?;
+    let mut bytes = 0u64;
+    super::build::copy_tree(&src, "/", ctx, &rootfs, 0, &mut bytes)?;
+
+    // Config from the source image, updated with the container's runtime config.
+    let base = super::image::load_config(ctx, &c.image_id);
+    let cfg = super::image::ImageConfig {
+        env: c.env.clone(),
+        entrypoint: base.entrypoint.clone(),
+        cmd: c.cmd.clone(),
+        workdir: if c.workdir.is_empty() { base.workdir.clone() } else { c.workdir.clone() },
+        health_cmd: c.health_cmd.clone(),
+        health_interval: c.health_interval,
+        health_timeout: c.health_timeout,
+        health_retries: c.health_retries,
+    };
+    super::image::commit(ctx, reference, &new_id, bytes, &cfg)
 }
 
 /// Read a container's captured log.

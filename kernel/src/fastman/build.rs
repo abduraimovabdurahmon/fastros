@@ -331,7 +331,7 @@ fn run_copy(host: &Ctx, bctx: &Ctx, cdir: &str, srcs: &[String], dest: &str, wor
 /// Recursively copy a tree from `src`/`spath` to `dst`/`dpath`. At depth 0 the
 /// pseudo/mount directories (proc, dev, sys, tmp) are created but not recursed
 /// into, so a build never bakes in the container-private mounts.
-fn copy_tree(src: &Ctx, spath: &str, dst: &Ctx, dpath: &str, depth: usize, bytes: &mut u64) -> KResult<()> {
+pub(super) fn copy_tree(src: &Ctx, spath: &str, dst: &Ctx, dpath: &str, depth: usize, bytes: &mut u64) -> KResult<()> {
     let _ = ops::mkdir(dst, dpath, 0o755);
     for e in ops::list_dir(src, spath)? {
         let sp = format!("{}/{}", spath.trim_end_matches('/'), e.name);

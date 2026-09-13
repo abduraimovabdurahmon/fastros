@@ -394,6 +394,32 @@ def test_system_df(g, image):
     assert any(l.startswith("Containers") for l in out.splitlines())
 
 
+def test_events(g, image):
+    """`fastman events` streams container lifecycle events."""
+    import time
+    g.ok(f"fastman run -d --name fmt_ev {image} /bin/sleeper")
+    time.sleep(1)
+    # Stream briefly (guest `timeout` stops it); --since 0 includes the buffer.
+    out = g.out("timeout 3 fastman events --since 0")
+    assert "create fmt_ev" in out and "start fmt_ev" in out, out
+    g.run("fastman rm -f fmt_ev")
+
+
+def test_commit(g):
+    """`fastman commit` snapshots a running container into a usable image.
+    Needs a shell to write into the container → alpine (network-gated)."""
+    import time
+    if g.run("fastman run --rm alpine true", timeout=120)[2] != 0:
+        pytest.skip("alpine unavailable from dev VM")
+    g.ok("fastman run -d --name fmt_cm alpine sleep 60")
+    time.sleep(1)
+    g.ok("fastman exec fmt_cm sh -c 'echo snapshot > /root/m'")
+    g.ok("fastman commit fmt_cm committed:v1")
+    assert "snapshot" in g.ok("fastman run --rm committed:v1 cat /root/m")
+    g.run("fastman rm -f fmt_cm")
+    g.run("fastman rmi committed:v1")
+
+
 def test_network_management(g):
     """`fastman network` create/ls/rm/inspect (no container needed)."""
     import json

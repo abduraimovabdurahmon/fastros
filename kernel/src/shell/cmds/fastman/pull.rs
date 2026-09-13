@@ -42,6 +42,7 @@ pub(super) fn pull_reference(ctx: &mut Ctx, reference: &str) -> Result<(), i32> 
         Ok(img) => {
             outln!(ctx, "Status: Downloaded newer image for {}", r.key());
             outln!(ctx, "{}", img.key);
+            crate::fastman::events::record("pull", &img.key);
             Ok(())
         }
         Err(e) => Err(ctx.fail_errno("store image", e)),

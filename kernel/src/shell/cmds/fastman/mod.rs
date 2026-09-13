@@ -186,6 +186,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "tag" => tag(ctx, &args[1..]),
         "history" => history(ctx, &args[1..]),
         "rmi" => rmi(ctx, &args[1..]),
+        "commit" => commit(ctx, &args[1..]),
         "run" => run(ctx, &args[1..]),
         "ps" => ps(ctx, &args[1..]),
         "stop" => stop(ctx, &args[1..]),
@@ -207,6 +208,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "exec" => exec(ctx, &args[1..]),
         "pull" => pull(ctx, &args[1..]),
         "system" => system(ctx, &args[1..]),
+        "events" => events(ctx, &args[1..]),
         "network" => network(ctx, &args[1..]),
         "volume" => volume(ctx, &args[1..]),
         "compose" => compose(ctx, &args[1..]),
@@ -237,6 +239,7 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  tag <src> <dst>            add a new name for an image");
     outln!(ctx, "  history <image>            show an image's history");
     outln!(ctx, "  rmi <image>                remove an image (untags if shared)");
+    outln!(ctx, "  commit <ctr> <image>       create an image from a container");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Containers:"));
     outln!(ctx, "  run [opts] <image> [cmd]   create and start a container");
@@ -257,6 +260,7 @@ fn usage(ctx: &mut Ctx) -> i32 {
     outln!(ctx, "  system df|info|prune       disk usage / info / clean exited");
     outln!(ctx, "  network ls|create|rm|inspect   manage networks");
     outln!(ctx, "  volume ls|create|rm|inspect    manage volumes");
+    outln!(ctx, "  events [--since N]          stream container lifecycle events");
     outln!(ctx);
     outln!(ctx, "{}", s.bold("Compose (multi-container stacks):"));
     outln!(ctx, "  compose [-f file] up       start all services in a compose file");
@@ -428,6 +432,53 @@ fn images(ctx: &mut Ctx) -> i32 {
     }
     t.render(ctx, &s);
     0
+}
+
+/// `fastman events [--since <seq>]` — stream container lifecycle events (create,
+/// start, die, kill, stop, destroy, pull). Shows the buffered recent events,
+/// then follows live until interrupted (^C).
+fn events(ctx: &mut Ctx, args: &[String]) -> i32 {
+    // --since <seq>: only events after this sequence (default 0 = all buffered).
+    let mut last = 0u64;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--since" {
+            i += 1;
+            last = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+        i += 1;
+    }
+    loop {
+        for e in crate::fastman::events::since(last) {
+            outln!(ctx, "seq={} {} container {} {}", e.seq, e.time, e.action, e.actor);
+            last = e.seq;
+        }
+        ctx.flush();
+        // Follow: wake on the next event or ^C (an interrupted sleep).
+        if !crate::sched::sleep_ms(300) {
+            let _ = crate::proc::absorb_signals();
+            break;
+        }
+    }
+    0
+}
+
+/// `fastman commit <container> <image>` — snapshot a running container's
+/// filesystem into a new image.
+fn commit(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let a: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if a.len() != 2 {
+        return ctx.fail("commit requires CONTAINER and a new IMAGE name");
+    }
+    let fc = fs_ctx(ctx);
+    match runtime::commit(&fc, a[0], a[1]) {
+        Ok(img) => {
+            outln!(ctx, "{}", img.id);
+            0
+        }
+        Err(crate::errno::Errno::ENOTCONN) => ctx.fail(format!("container {} is not running", a[0])),
+        Err(e) => ctx.fail_errno("commit", e),
+    }
 }
 
 /// `fastman tag <src> <dst>` — add a new name for an existing image.
