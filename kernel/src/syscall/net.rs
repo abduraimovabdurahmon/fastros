@@ -349,6 +349,79 @@ pub fn recvfrom(fd: i32, buf: usize, len: usize, _flags: i32, addr: usize, addrl
     Ok(n)
 }
 
+/// Read a user `struct iovec[]` (each { base: *mut u8; len: usize }, 16 bytes).
+fn read_iovecs(iov: usize, cnt: usize) -> KResult<alloc::vec::Vec<(usize, usize)>> {
+    let mut out = alloc::vec::Vec::new();
+    for i in 0..cnt.min(1024) {
+        let base: u64 = uaccess::read_obj(iov + i * 16)?;
+        let len: u64 = uaccess::read_obj(iov + i * 16 + 8)?;
+        out.push((base as usize, len as usize));
+    }
+    Ok(out)
+}
+
+// `struct msghdr` (x86_64): name@0, namelen@8, iov@16, iovlen@24, control@32,
+// controllen@40, flags@48. Ancillary data (msg_control, SCM_RIGHTS) is not yet
+// carried — the common scatter/gather and datagram-address uses are covered.
+pub fn sendmsg(fd: i32, msg: usize, _flags: i32) -> KResult<usize> {
+    let name: u64 = uaccess::read_obj(msg)?;
+    let namelen: u32 = uaccess::read_obj(msg + 8)?;
+    let iov: u64 = uaccess::read_obj(msg + 16)?;
+    let iovlen: u64 = uaccess::read_obj(msg + 24)?;
+    let vecs = read_iovecs(iov as usize, iovlen as usize)?;
+    let total: usize = vecs.iter().map(|(_, l)| *l).sum::<usize>().min(1 << 20);
+    let mut data = alloc::vec::Vec::with_capacity(total);
+    for (base, len) in &vecs {
+        if data.len() >= total {
+            break;
+        }
+        let take = (*len).min(total - data.len());
+        let mut chunk = alloc::vec![0u8; take];
+        uaccess::copy_from(*base, &mut chunk)?;
+        data.extend_from_slice(&chunk);
+    }
+    if is_unix(fd) {
+        return fdt_get(fd)?.write(&data);
+    }
+    let to = if name != 0 && namelen >= 16 { Some(read_sockaddr(name as usize, namelen as usize)?) } else { None };
+    with_sock(fd, |s| s.sendto(&data, to))
+}
+
+pub fn recvmsg(fd: i32, msg: usize, _flags: i32) -> KResult<usize> {
+    let name: u64 = uaccess::read_obj(msg)?;
+    let iov: u64 = uaccess::read_obj(msg + 16)?;
+    let iovlen: u64 = uaccess::read_obj(msg + 24)?;
+    let vecs = read_iovecs(iov as usize, iovlen as usize)?;
+    let cap: usize = vecs.iter().map(|(_, l)| *l).sum::<usize>().min(1 << 20);
+    let mut data = alloc::vec![0u8; cap];
+    let (n, from) = if is_unix(fd) {
+        let n = fdt_get(fd)?.read(&mut data)?;
+        (n, None)
+    } else {
+        with_sock(fd, |s| s.recvfrom(&mut data))?
+    };
+    // Scatter the received bytes across the iovecs.
+    let mut off = 0usize;
+    for (base, len) in &vecs {
+        if off >= n {
+            break;
+        }
+        let take = (*len).min(n - off);
+        uaccess::copy_to(*base, &data[off..off + take])?;
+        off += take;
+    }
+    // Source address into msg_name (msg_namelen at msg+8 doubles as the socklen_t*).
+    if name != 0 {
+        if let Some(ep) = from {
+            write_sockaddr(ep, name as usize, msg + 8)?;
+        }
+    }
+    // No ancillary data returned.
+    let _ = uaccess::write_obj::<u64>(msg + 40, &0u64);
+    let _ = uaccess::write_obj::<i32>(msg + 48, &0i32);
+    Ok(n)
+}
+
 // ── epoll ───────────────────────────────────────────────────────────────────
 
 const EPOLL_CTL_ADD: i32 = 1;

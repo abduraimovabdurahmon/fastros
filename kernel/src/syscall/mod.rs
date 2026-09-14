@@ -180,6 +180,8 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         43 => ret(net::accept(a[0] as i32, a[1] as usize, a[2] as usize)),
         44 => ret(net::sendto(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32, a[4] as usize, a[5] as usize)),
         45 => ret(net::recvfrom(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32, a[4] as usize, a[5] as usize)),
+        46 => ret(net::sendmsg(a[0] as i32, a[1] as usize, a[2] as i32)),
+        47 => ret(net::recvmsg(a[0] as i32, a[1] as usize, a[2] as i32)),
         48 => ret(net::shutdown(a[0] as i32, a[1] as i32)),
         49 => ret(net::bind(a[0] as i32, a[1] as usize, a[2] as usize)),
         50 => ret(net::listen(a[0] as i32, a[1] as i32)),
@@ -211,6 +213,9 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         11 => ret(mem::munmap(a[0] as usize, a[1] as usize)),
         12 => ret(mem::brk(a[0] as usize)),
         158 => ret(mem::arch_prctl(a[0] as u32, a[1])),
+        // msync(addr, len, flags): our file mmaps write through page-by-page and
+        // anonymous mappings have nothing to flush, so a success no-op is correct.
+        26 => 0,
         // madvise(addr, len, advice): purely advisory. We honour none of the
         // hints (no page reclaim, no huge-page changes) but must return success
         // — the Go runtime (gosu, in the postgres image) calls it during GC and
