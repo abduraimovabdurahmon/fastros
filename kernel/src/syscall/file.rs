@@ -540,6 +540,58 @@ pub fn mkdir(path: usize, mode: u16) -> KResult<usize> {
     Ok(0)
 }
 
+/// `chroot(path)`: set the process root to `path` (root only). cwd is left as-is,
+/// as on Linux.
+pub fn chroot(path: usize) -> KResult<usize> {
+    let p = proc::current();
+    if !p.cred().is_root() {
+        return Err(Errno::EPERM);
+    }
+    let ctx = ops::Ctx::of(&p);
+    let n = ctx.resolve(&user_path(path)?, true)?;
+    if n.inode.metadata()?.kind != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    p.fs.lock().root = n;
+    Ok(0)
+}
+
+/// Map a `mknod` mode's type bits to a FileType.
+fn mknod_kind(mode: u32) -> KResult<FileType> {
+    const S_IFMT: u32 = 0o170000;
+    match mode & S_IFMT {
+        0 | 0o100000 => Ok(FileType::Regular),
+        0o020000 => Ok(FileType::CharDevice),
+        0o060000 => Ok(FileType::BlockDevice),
+        0o010000 => Ok(FileType::Fifo),
+        _ => Err(Errno::EINVAL), // sockets: use bind(); others unsupported
+    }
+}
+
+/// `mknod(path, mode, dev)`: create a regular file, FIFO, or device node.
+/// ops::mknod enforces root for char/block devices.
+pub fn mknod(path: usize, mode: u32, dev: u64) -> KResult<usize> {
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    let umask = p.fs.lock().umask;
+    let kind = mknod_kind(mode)?;
+    ops::mknod(&ctx, &user_path(path)?, kind, (mode as u16 & 0o7777) & !umask, dev)?;
+    Ok(0)
+}
+
+/// `mknodat(dirfd, path, mode, dev)`: `mknod` relative to `dirfd` (AT_FDCWD or
+/// an absolute path use the process cwd/root).
+pub fn mknodat(dirfd: i32, path: usize, mode: u32, dev: u64) -> KResult<usize> {
+    let path = user_path(path)?;
+    let p = proc::current();
+    let ctx = ops::Ctx::of(&p);
+    let umask = p.fs.lock().umask;
+    let kind = mknod_kind(mode)?;
+    let full = at_path(dirfd, &path)?;
+    ops::mknod(&ctx, &full, kind, (mode as u16 & 0o7777) & !umask, dev)?;
+    Ok(0)
+}
+
 pub fn rmdir(path: usize) -> KResult<usize> {
     let p = proc::current();
     let ctx = ops::Ctx::of(&p);

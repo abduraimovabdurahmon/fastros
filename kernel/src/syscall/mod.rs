@@ -305,6 +305,14 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         // rules): a program that drops privileges must really drop them, or it
         // loops (docker-entrypoint re-execs gosu until non-root) and postgres
         // refuses to run as root. A silent no-op is also a privilege-drop hole.
+        // utime(132)/utimes(235)/futimesat(261)/utimensat(280): accept setting
+        // file timestamps. We don't persist a-/mtime yet, so this is a success
+        // no-op — tools like `cp -a`, tar and make need it to not fail (ENOSYS),
+        // which is far worse than not updating a timestamp.
+        132 | 235 | 261 | 280 => 0,
+        133 => ret(file::mknod(a[0] as usize, a[1] as u32, a[2] as u64)),
+        259 => ret(file::mknodat(a[0] as i32, a[1] as usize, a[2] as u32, a[3] as u64)),
+        161 => ret(file::chroot(a[0] as usize)),
         105 => ret(proc_sys::setuid(a[0] as u32)),
         106 => ret(proc_sys::setgid(a[0] as u32)),
         113 => ret(proc_sys::setreuid(a[0] as u32, a[1] as u32)),
