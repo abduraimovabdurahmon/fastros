@@ -88,6 +88,7 @@ pub fn start_getty() {
             no_new_privs: false,
             seccomp: None,
             netns: None,
+            init_fs_base: 0,
         };
         let u = user.clone();
         if let Ok(p) = crate::proc::spawn(spawn, move || crate::shell::login_shell_main(u)) {

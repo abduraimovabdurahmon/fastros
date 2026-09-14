@@ -69,6 +69,9 @@ pub enum HttpError {
     Io(Errno),
     BadResponse,
     TooManyRedirects,
+    /// The response body did not fit in memory. Returned instead of aborting
+    /// the kernel: a container pulling an over-large image gets a clean error.
+    Oom,
 }
 
 impl HttpError {
@@ -81,8 +84,17 @@ impl HttpError {
             HttpError::Io(e) => alloc::format!("Transfer closed: {e}"),
             HttpError::BadResponse => "Received malformed HTTP response".to_string(),
             HttpError::TooManyRedirects => "Number of redirects hit maximum".to_string(),
+            HttpError::Oom => "Response body too large to fit in memory".to_string(),
         }
     }
+}
+
+/// Append `data` to `v`, reserving space fallibly so an over-large body returns
+/// an error instead of aborting the kernel through the infallible allocator.
+fn push_bytes(v: &mut Vec<u8>, data: &[u8]) -> Result<(), HttpError> {
+    v.try_reserve(data.len()).map_err(|_| HttpError::Oom)?;
+    v.extend_from_slice(data);
+    Ok(())
 }
 
 pub struct Request<'a> {
@@ -162,12 +174,20 @@ fn read_line(conn: &mut Conn, buf: &mut Vec<u8>, timeout_ms: u64) -> Result<Vec<
 }
 
 fn read_exact(conn: &mut Conn, buf: &mut Vec<u8>, want: usize, timeout_ms: u64) -> Result<Vec<u8>, HttpError> {
-    let mut out = Vec::with_capacity(want);
+    // Reserve fallibly: `want` is attacker/registry-controlled (Content-Length),
+    // so a huge value must fail this request, not abort the kernel.
+    let mut out = Vec::new();
+    out.try_reserve(want).map_err(|_| HttpError::Oom)?;
     let take = want.min(buf.len());
     out.extend_from_slice(&buf[..take]);
     buf.drain(..take);
     let mut tmp = [0u8; 8192];
     while out.len() < want {
+        // Downloads run in a kernel task (fastman pull); abort if signalled so a
+        // large blob transfer is killable, not just yieldable.
+        if crate::proc::interrupted() {
+            return Err(HttpError::Io(Errno::EINTR));
+        }
         let n = conn.read(&mut tmp, timeout_ms)?;
         if n == 0 {
             break;
@@ -273,7 +293,7 @@ pub fn fetch(req: &Request) -> Result<Response, HttpError> {
                     break;
                 }
                 let chunk = read_exact(&mut conn, &mut buf, size, req.timeout_ms)?;
-                body.extend_from_slice(&chunk);
+                push_bytes(&mut body, &chunk)?;
                 let _ = read_line(&mut conn, &mut buf, req.timeout_ms); // CRLF after chunk
                 if crate::proc::interrupted() {
                     break;
@@ -290,7 +310,7 @@ pub fn fetch(req: &Request) -> Result<Response, HttpError> {
                 if n == 0 {
                     break;
                 }
-                body.extend_from_slice(&tmp[..n]);
+                push_bytes(&mut body, &tmp[..n])?;
                 if crate::proc::interrupted() {
                     break;
                 }

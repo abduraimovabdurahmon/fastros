@@ -52,8 +52,14 @@ fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, _owner: u32, _group: u32) -> KR
     let mut tr = TarReader::new(src);
     while let Some(entry) = tr.next_entry().map_err(ae)? {
         // Extracting a large image is a long kernel-side operation; yield
-        // between entries so a big pull never starves the rest of the system.
+        // between entries so a big pull never starves the rest of the system,
+        // and abort if the task was signalled (SIGKILL/SIGTERM). `fastman` runs
+        // as a kernel task, so nothing kills this loop unless it checks itself —
+        // without this, `kill`/`fastman rm -f`/a timeout could not stop a pull.
         crate::sched::cond_resched();
+        if crate::proc::interrupted() {
+            return Err(Errno::EINTR);
+        }
         let safe = match sanitize(&entry.path) {
             Ok(s) => s,
             Err(_) => {
@@ -106,6 +112,9 @@ fn untar<R: Read>(ctx: &Ctx, dest: &str, src: R, _owner: u32, _group: u32) -> KR
                     f.write_all(&buf[..n])?;
                     st.bytes += n as u64;
                     crate::sched::cond_resched();
+                    if crate::proc::interrupted() {
+                        return Err(Errno::EINTR);
+                    }
                 }
                 let _ = ops::chmod(ctx, &full, mode, true);
                 st.files += 1;

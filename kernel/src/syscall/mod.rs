@@ -211,6 +211,11 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         11 => ret(mem::munmap(a[0] as usize, a[1] as usize)),
         12 => ret(mem::brk(a[0] as usize)),
         158 => ret(mem::arch_prctl(a[0] as u32, a[1])),
+        // madvise(addr, len, advice): purely advisory. We honour none of the
+        // hints (no page reclaim, no huge-page changes) but must return success
+        // — the Go runtime (gosu, in the postgres image) calls it during GC and
+        // spins retrying if it sees ENOSYS, never reaching execve.
+        28 => 0,
 
         // ── process / signals / info ──
         24 => {

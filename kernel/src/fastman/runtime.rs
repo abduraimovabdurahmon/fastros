@@ -352,6 +352,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
         // A private network namespace ("none"/"private") gives the container its
         // own isolated loopback stack; the default "bridge" shares the host stack.
         netns: container_netns(c),
+        init_fs_base: 0,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let pid = child.pid;
@@ -677,6 +678,7 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         seccomp: None,
         // Join the running container's network namespace.
         netns: init.netns.lock().clone(),
+        init_fs_base: 0,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = if let Some(t) = &itty {
@@ -742,6 +744,7 @@ fn health_probe(c: &Container, timeout_ms: u64, cred: &crate::fs::perm::Cred) ->
         no_new_privs: false,
         seccomp: None,
         netns: init.netns.lock().clone(),
+        init_fs_base: 0,
     };
     let Ok(child) = proc::start_user(spawn, space, frame) else { return false };
     let task = child.tasks().into_iter().next();

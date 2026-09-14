@@ -427,6 +427,11 @@ pub struct Spawn {
     pub seccomp: Option<Arc<crate::syscall::seccomp::Filters>>,
     /// Network namespace to join (inherited across fork/exec; `None` = host).
     pub netns: Option<Arc<crate::net::netns::NetNs>>,
+    /// Initial thread pointer (`%fs` base) for the child's first task. Set for
+    /// `fork` (inherits the parent's TLS); 0 for a fresh exec or kernel thread.
+    /// Applied before the task is made runnable, closing the same scheduling
+    /// race that `owner`/`cr3` do.
+    pub init_fs_base: u64,
 }
 
 impl Spawn {
@@ -454,6 +459,7 @@ impl Spawn {
             no_new_privs: parent.no_new_privs.load(Ordering::Relaxed),
             seccomp: parent.seccomp.lock().clone(),
             netns: parent.netns.lock().clone(),
+            init_fs_base: 0,
         }
     }
 }
@@ -485,6 +491,12 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         }
     };
     let pid = task.tid;
+    // Capture the child's initial address space and thread pointer *before* the
+    // aspace is moved into the Process, so they can be applied to the task
+    // before make_ready(): a user task scheduled with cr3==0 would run
+    // enter_user() in the kernel's PML4 and instantly fault on its user rip.
+    let init_cr3 = s.aspace.as_ref().map(|a| a.pml4()).unwrap_or(0);
+    let init_fs_base = s.init_fs_base;
     let pgid = if s.new_session { pid } else { s.pgid.unwrap_or(pid) };
     let sid = if s.new_session { pid } else { s.parent.sid.load(Ordering::Relaxed) };
     let mut comm = s.name.clone();
@@ -529,8 +541,14 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
     }
     PROCS.lock().insert(pid, p.clone());
     s.parent.children.lock().push(p.clone());
+    // Set cr3, fs_base and owner before the task can be scheduled. cr3 must be
+    // in place first: with preemption, make_ready() below can let the task run
+    // immediately, and a user task with cr3==0 would enter ring 3 under the
+    // kernel's page tables and fault on the first instruction fetch.
+    task.cr3.store(init_cr3, Ordering::Release);
+    task.fs_base.store(init_fs_base, Ordering::Release);
     task.owner.store(pid, Ordering::Release);
-    // Now safe to schedule: owner and the process record are in place.
+    // Now safe to schedule: owner, cr3/fs_base and the process record are in place.
     sched::make_ready(&task);
     Ok(p)
 }
@@ -546,14 +564,13 @@ pub fn start_user(s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame) -> KRes
 /// `execve`/exec passes 0 (the new program sets it up via `arch_prctl`).
 pub fn start_user_with(mut s: Spawn, aspace: Arc<AddressSpace>, frame: UserFrame, fs_base: u64) -> KResult<Arc<Process>> {
     s.aspace = Some(aspace.clone());
+    s.init_fs_base = fs_base;
     // Charge this space's memory to the container's cgroup, if any.
     aspace.set_container(s.container.clone());
-    let p = spawn(s, move || unsafe { enter_user(&frame) })?;
-    if let Some(t) = p.tasks().into_iter().next() {
-        t.cr3.store(aspace.pml4(), core::sync::atomic::Ordering::Release);
-        t.fs_base.store(fs_base, core::sync::atomic::Ordering::Release);
-    }
-    Ok(p)
+    // spawn() applies cr3 (from s.aspace) and fs_base (s.init_fs_base) to the
+    // task before making it runnable, so there is no window where the task can
+    // enter user mode with the wrong page tables.
+    spawn(s, move || unsafe { enter_user(&frame) })
 }
 
 /// Create a new thread in the current process: a task sharing the process's

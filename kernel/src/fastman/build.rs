@@ -459,6 +459,7 @@ fn run_step(bctx: &Ctx, argv: &[String], env: &[String], workdir: &str, out: Opt
         no_new_privs: false,
         seccomp: None,
         netns: None,
+        init_fs_base: 0,
     };
     let child = proc::start_user(spawn, space, frame)?;
     let code = child.tasks().into_iter().next().map(|t| t.join()).unwrap_or(0);
