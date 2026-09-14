@@ -452,6 +452,15 @@ def test_rootless_and_user_escalation_denied(g):
         g.run("userdel -r fmuser 2>/dev/null; true")
 
 
+def test_container_proc_mountinfo(g):
+    """/proc/self/mountinfo exists in a container (some real images, e.g.
+    postgres, parse it). Network-gated (needs a shell image)."""
+    if g.run("fastman run --rm alpine true", timeout=120)[2] != 0:
+        pytest.skip("alpine unavailable")
+    out = g.ok("fastman run --rm alpine cat /proc/self/mountinfo")
+    assert "overlay" in out, out  # the container's root overlay mount is listed
+
+
 def test_network_management(g):
     """`fastman network` create/ls/rm/inspect (no container needed)."""
     import json

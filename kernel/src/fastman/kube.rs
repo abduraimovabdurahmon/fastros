@@ -27,6 +27,9 @@ pub struct Workload {
     pub replicas: usize,
     pub image: String,
     pub opts: RunOpts,
+    /// `envFrom` references: (kind, name) with kind "configmap"/"secret" — all
+    /// their keys are injected into the pod's environment at apply time.
+    pub env_from: Vec<(String, String)>,
 }
 
 pub struct Service {
@@ -36,10 +39,18 @@ pub struct Service {
     pub selector: String,
 }
 
+/// A ConfigMap or Secret: a named bag of key/value data.
+pub struct ConfigObject {
+    pub kind: String, // "configmap" or "secret"
+    pub name: String,
+    pub data: Vec<(String, String)>,
+}
+
 #[derive(Default)]
 pub struct Manifest {
     pub workloads: Vec<Workload>,
     pub services: Vec<Service>,
+    pub configs: Vec<ConfigObject>,
 }
 
 fn yaml_get<'a>(y: &'a Yaml, path: &[&str]) -> Option<&'a Yaml> {
@@ -67,10 +78,22 @@ fn as_list(y: &Yaml) -> &[Yaml] {
     }
 }
 
-/// Build a container's RunOpts from a `containers[0]` spec.
-fn container_opts(name: &str, c: &Yaml) -> (String, RunOpts) {
+/// Build a container's RunOpts from a `containers[0]` spec. Also returns any
+/// `envFrom` references (configMapRef/secretRef) for injection at apply time.
+fn container_opts(name: &str, c: &Yaml) -> (String, RunOpts, Vec<(String, String)>) {
     let image = scalar(c, &["image"]).unwrap_or("").to_string();
     let mut opts = RunOpts { network: String::from("bridge"), detach: true, name: Some(name.to_string()), ..Default::default() };
+    let mut env_from: Vec<(String, String)> = Vec::new();
+    if let Some(ef) = yaml_get(c, &["envFrom"]) {
+        for e in as_list(ef) {
+            if let Some(n) = scalar(e, &["configMapRef", "name"]) {
+                env_from.push((String::from("configmap"), n.to_string()));
+            }
+            if let Some(n) = scalar(e, &["secretRef", "name"]) {
+                env_from.push((String::from("secret"), n.to_string()));
+            }
+        }
+    }
     if let Some(cmd) = yaml_get(c, &["command"]) {
         opts.cmd = as_list(cmd).iter().filter_map(scalar_of).collect();
     }
@@ -97,7 +120,7 @@ fn container_opts(name: &str, c: &Yaml) -> (String, RunOpts) {
         // Best-effort: mountPath only (hostPath volumes are a follow-up).
         let _ = vols;
     }
-    (image, opts)
+    (image, opts, env_from)
 }
 
 fn scalar_of(y: &Yaml) -> Option<String> {
@@ -121,15 +144,28 @@ pub fn parse(src: &str) -> Manifest {
             "Deployment" => {
                 let replicas = scalar(&y, &["spec", "replicas"]).and_then(|s| s.parse().ok()).unwrap_or(1);
                 if let Some(c0) = yaml_get(&y, &["spec", "template", "spec", "containers"]).map(as_list).and_then(|l| l.first()) {
-                    let (image, opts) = container_opts(&name, c0);
-                    m.workloads.push(Workload { kind, name, replicas, image, opts });
+                    let (image, opts, env_from) = container_opts(&name, c0);
+                    m.workloads.push(Workload { kind, name, replicas, image, opts, env_from });
                 }
             }
             "Pod" => {
                 if let Some(c0) = yaml_get(&y, &["spec", "containers"]).map(as_list).and_then(|l| l.first()) {
-                    let (image, opts) = container_opts(&name, c0);
-                    m.workloads.push(Workload { kind, name, replicas: 1, image, opts });
+                    let (image, opts, env_from) = container_opts(&name, c0);
+                    m.workloads.push(Workload { kind, name, replicas: 1, image, opts, env_from });
                 }
+            }
+            "ConfigMap" | "Secret" => {
+                let mut data: Vec<(String, String)> = Vec::new();
+                for src_key in ["data", "stringData"] {
+                    if let Some(Yaml::Map(mm)) = yaml_get(&y, &[src_key]) {
+                        for (k, v) in mm {
+                            if let Yaml::Scalar(s) = v {
+                                data.push((k.clone(), s.clone()));
+                            }
+                        }
+                    }
+                }
+                m.configs.push(ConfigObject { kind: kind.to_ascii_lowercase(), name, data });
             }
             "Service" => {
                 let selector = scalar(&y, &["spec", "selector", "app"]).unwrap_or(&name).to_string();
@@ -168,6 +204,39 @@ fn split_documents(src: &str) -> Vec<String> {
 /// The pod (container) name for replica `i` of a workload.
 pub fn pod_name(workload: &str, i: usize) -> String {
     alloc::format!("{workload}-{i}")
+}
+
+// ── ConfigMaps & Secrets ─────────────────────────────────────────────────────
+
+/// Directory holding a kind of config object under a store base.
+pub fn configs_dir(base: &str, kind: &str) -> String {
+    let sub = if kind == "secret" { "secrets" } else { "configmaps" };
+    alloc::format!("{base}/kube/{sub}")
+}
+
+/// Persist a ConfigMap/Secret as `key\tvalue` lines (values may not contain
+/// tabs or newlines — a simplification adequate for env data).
+pub fn save_config(ctx: &crate::fs::ops::Ctx, base: &str, obj: &ConfigObject) -> crate::errno::KResult<()> {
+    let dir = configs_dir(base, &obj.kind);
+    crate::fs::ops::mkdir_all(ctx, &dir, 0o700)?;
+    let mut s = String::new();
+    for (k, v) in &obj.data {
+        s.push_str(&alloc::format!("{k}\t{v}\n"));
+    }
+    let mode = if obj.kind == "secret" { 0o600 } else { 0o644 };
+    crate::fs::ops::write_file(ctx, &alloc::format!("{dir}/{}", obj.name), s.as_bytes(), mode)
+}
+
+/// Load a config object's key/value pairs, or `None` if it does not exist.
+pub fn load_config_obj(ctx: &crate::fs::ops::Ctx, base: &str, kind: &str, name: &str) -> Option<Vec<(String, String)>> {
+    let path = alloc::format!("{}/{name}", configs_dir(base, kind));
+    let data = crate::fs::ops::read_file(ctx, &path).ok()?;
+    Some(
+        String::from_utf8_lossy(&data)
+            .lines()
+            .filter_map(|l| l.split_once('\t').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect(),
+    )
 }
 
 use core::sync::atomic::{AtomicU16, Ordering as AOrd};

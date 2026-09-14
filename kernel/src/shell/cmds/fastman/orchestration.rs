@@ -177,23 +177,48 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                 Err(e) => return ctx.fail_errno(&path, e),
             };
             let m = crate::fastman::kube::parse(&src);
-            if m.workloads.is_empty() && m.services.is_empty() {
-                return ctx.fail(format!("{path}: no Deployment/Pod/Service found"));
+            if m.workloads.is_empty() && m.services.is_empty() && m.configs.is_empty() {
+                return ctx.fail(format!("{path}: no Deployment/Pod/Service/ConfigMap/Secret found"));
             }
+            let base = crate::fastman::store::base(&fc);
             let _ = crate::fs::ops::mkdir_all(&fc, &wdir, 0o700);
             let _ = crate::fs::ops::mkdir_all(&fc, &sdir, 0o700);
+            // ConfigMaps/Secrets first, so workloads in the same file can use them.
+            for cfgo in &m.configs {
+                match crate::fastman::kube::save_config(&fc, &base, cfgo) {
+                    Ok(()) => outln!(ctx, "{} {} created", s.green(&cfgo.kind), cfgo.name),
+                    Err(e) => {
+                        ctx.fail_errno(&cfgo.name, e);
+                    }
+                }
+            }
             for w in &m.workloads {
                 if image::resolve(&fc, &w.image).is_none() {
                     ctx.fail(format!("{}: image '{}' not found", w.name, w.image));
                     continue;
                 }
                 let declared = w.opts.ports.first().map(|p| p.container);
+                // Resolve envFrom (configMapRef/secretRef) into concrete env vars.
+                let mut injected: Vec<String> = Vec::new();
+                for (kind, name) in &w.env_from {
+                    match crate::fastman::kube::load_config_obj(&fc, &base, kind, name) {
+                        Some(kvs) => injected.extend(kvs.into_iter().map(|(k, v)| format!("{k}={v}"))),
+                        None => outln!(ctx, "{}: {kind} '{name}' not found", w.name),
+                    }
+                }
                 let rec = format!("{}\n{}\n{}\n", w.kind, w.replicas, w.image);
                 let _ = crate::fs::ops::write_file(&fc, &format!("{wdir}/{}", w.name), rec.as_bytes(), 0o600);
                 for n in 0..w.replicas {
                     let pod = crate::fastman::kube::pod_name(&w.name, n);
                     let _ = runtime::remove(&fc, &pod, true);
                     let mut opts = crate::fastman::kube::clone_opts(&w.opts, pod.clone());
+                    // envFrom is injected first so explicit `env:` (already in
+                    // opts.env) takes precedence.
+                    if !injected.is_empty() {
+                        let mut merged = injected.clone();
+                        merged.extend(core::mem::take(&mut opts.env));
+                        opts.env = merged;
+                    }
                     // Give each replica a unique backend port for its declared
                     // container port, so N fixed-port pods can coexist.
                     if let Some(d) = declared {
@@ -239,6 +264,18 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                     format!("{}", crate::smp::present_count()),
                     format!("fastros-{}", env!("CARGO_PKG_VERSION")),
                 ]);
+                t.render(ctx, &s);
+                return 0;
+            }
+            if matches!(what, "configmaps" | "configmap" | "cm" | "secrets" | "secret") {
+                let kind = if what.starts_with("secret") { "secret" } else { "configmap" };
+                let base = crate::fastman::store::base(&fc);
+                let dir = crate::fastman::kube::configs_dir(&base, kind);
+                let mut t = Table::new(&["NAME", "KEYS"]);
+                for e in crate::fs::ops::list_dir(&fc, &dir).unwrap_or_default() {
+                    let keys = crate::fastman::kube::load_config_obj(&fc, &base, kind, &e.name).map(|kv| kv.len()).unwrap_or(0);
+                    t.row(alloc::vec![e.name.clone(), format!("{keys}")]);
+                }
                 t.render(ctx, &s);
                 return 0;
             }
@@ -318,8 +355,17 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                 outln!(ctx, "service \"{name}\" deleted");
                 return 0;
             }
+            let base = crate::fastman::store::base(&fc);
+            for kind in ["configmap", "secret"] {
+                let p = format!("{}/{name}", crate::fastman::kube::configs_dir(&base, kind));
+                if crate::fs::ops::unlink(&fc, &p).is_ok() {
+                    outln!(ctx, "{kind} \"{name}\" deleted");
+                    return 0;
+                }
+            }
             ctx.fail(format!("{name}: not found"))
         }
+        "create" => kube_create(ctx, &fc, &rest),
         "scale" => kube_scale(ctx, &fc, &wdir, &rest),
         "rollout" => kube_rollout(ctx, &fc, &wdir, &rest),
         "logs" => {
@@ -376,7 +422,7 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
         }
         "describe" => kube_describe(ctx, &fc, &wdir, &sdir, &rest),
         "port-forward" => kube_port_forward(ctx, &fc, &rest),
-        other => ctx.fail(format!("unknown kube command '{other}' (apply|get|delete|scale|rollout|logs|exec|describe|port-forward)")),
+        other => ctx.fail(format!("unknown kube command '{other}' (apply|create|get|delete|scale|rollout|logs|exec|describe|port-forward)")),
     }
 }
 
@@ -590,5 +636,43 @@ fn kube_port_forward(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, rest: &[String]) -
     match crate::fastman::proxy::port_forward(local, actual) {
         Ok(()) => 0,
         Err(e) => ctx.fail_errno("port-forward", e),
+    }
+}
+
+/// `fastman kube create configmap|secret [generic] NAME --from-literal=K=V ...`
+fn kube_create(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, rest: &[String]) -> i32 {
+    let mut it = rest.iter().peekable();
+    let kind = match it.next().map(|s| s.as_str()) {
+        Some("configmap") | Some("cm") => "configmap",
+        Some("secret") => {
+            // `secret generic NAME ...` — skip the optional type word.
+            if it.peek().map(|s| s.as_str()) == Some("generic") {
+                it.next();
+            }
+            "secret"
+        }
+        _ => return ctx.fail("usage: kube create configmap|secret NAME --from-literal=K=V ..."),
+    };
+    let rest2: Vec<&String> = it.collect();
+    let Some(name) = rest2.iter().find(|a| !a.starts_with('-')).map(|s| s.to_string()) else {
+        return ctx.fail("create requires a NAME");
+    };
+    let mut data: Vec<(String, String)> = Vec::new();
+    for a in &rest2 {
+        if let Some(kv) = a.strip_prefix("--from-literal=") {
+            if let Some((k, v)) = kv.split_once('=') {
+                data.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    let base = crate::fastman::store::base(fc);
+    let obj = crate::fastman::kube::ConfigObject { kind: kind.to_string(), name: name.clone(), data };
+    let s = style_of(ctx);
+    match crate::fastman::kube::save_config(fc, &base, &obj) {
+        Ok(()) => {
+            outln!(ctx, "{} {name} created", s.green(kind));
+            0
+        }
+        Err(e) => ctx.fail_errno(&name, e),
     }
 }

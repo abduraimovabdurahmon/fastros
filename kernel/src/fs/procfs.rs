@@ -57,7 +57,7 @@ const ROOT_FILES: &[&str] = &[
 const DIRS: &[&str] = &["net", "sys", "sys/kernel", "sys/vm", "sys/net", "sys/net/ipv4"];
 const NET_FILES: &[&str] = &["dev", "route", "tcp", "udp", "arp", "sockstat", "snmp"];
 const SYS_KERNEL: &[&str] = &["hostname", "domainname", "ostype", "osrelease", "version", "pid_max", "random"];
-const PID_FILES: &[&str] = &["stat", "status", "cmdline", "comm", "environ", "statm", "io", "mounts", "limits"];
+const PID_FILES: &[&str] = &["stat", "status", "cmdline", "comm", "environ", "statm", "io", "mounts", "mountinfo", "limits"];
 const PID_LINKS: &[&str] = &["cwd", "root", "exe"];
 
 fn ino_of(n: &Node) -> u64 {
@@ -712,6 +712,21 @@ pub fn mounts_text(p: &Process) -> String {
     s
 }
 
+/// `/proc/<pid>/mountinfo` — the richer mount table (fields: mount-id parent-id
+/// major:minor root mount-point options - fstype source super-options). Some
+/// real images (postgres) parse this; a plausible line per mount is enough.
+pub fn mountinfo_text(p: &Process) -> String {
+    let mut s = String::new();
+    let ns = p.fs.lock().ns.clone();
+    let mut id = 36u32;
+    for (path, m) in ns.list() {
+        let opts = m.flags.lock().describe();
+        let _ = writeln!(s, "{id} 1 0:{id} / {path} {opts} - {} {} {opts}", m.fs.fs_type(), m.source);
+        id += 1;
+    }
+    s
+}
+
 fn gen_sys(f: &str) -> KResult<String> {
     let me = proc::current();
     Ok(match f {
@@ -882,6 +897,11 @@ fn gen_pid(pid: u32, f: &str) -> KResult<String> {
         "mounts" => {
             if let Some(p) = &p {
                 s = mounts_text(p);
+            }
+        }
+        "mountinfo" => {
+            if let Some(p) = &p {
+                s = mountinfo_text(p);
             }
         }
         "limits" => {

@@ -323,3 +323,44 @@ def test_kube_port_forward(g, kube_setup):
         assert "kube pod alive" in got, (got, g.out("cat /tmp/pf.log 2>/dev/null"))
     finally:
         g.run("pkill -f port-forward 2>/dev/null; fastman kube delete web 2>/dev/null; true")
+
+
+def test_kube_configmap_secret_cli(g):
+    """`kube create/get/delete` for ConfigMaps and Secrets (no image needed)."""
+    g.run("fastman kube delete cmx 2>/dev/null; fastman kube delete secx 2>/dev/null; true")
+    g.ok("fastman kube create configmap cmx --from-literal=A=1 --from-literal=B=2")
+    g.ok("fastman kube create secret generic secx --from-literal=T=zzz")
+    cms = g.ok("fastman kube get configmaps")
+    assert any(l.startswith("cmx") and l.split()[1] == "2" for l in cms.splitlines()[1:]), cms
+    secs = g.ok("fastman kube get secrets")
+    assert any(l.startswith("secx") for l in secs.splitlines()[1:]), secs
+    g.ok("fastman kube delete cmx")
+    g.ok("fastman kube delete secx")
+    assert "cmx" not in g.ok("fastman kube get configmaps")
+
+
+def test_kube_env_from(g):
+    """A pod's envFrom injects a ConfigMap's and Secret's keys as env vars.
+    Needs a shell image (alpine) — network-gated."""
+    if g.run("fastman run --rm alpine true", timeout=120)[2] != 0:
+        pytest.skip("alpine unavailable")
+    g.run("fastman kube delete envp 2>/dev/null; fastman kube delete ec 2>/dev/null; fastman kube delete es 2>/dev/null; true")
+    g.ok("fastman kube create configmap ec --from-literal=APP_COLOR=blue")
+    g.ok("fastman kube create secret generic es --from-literal=TOKEN=s3cr3t")
+    manifest = (
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: envp\n"
+        "spec:\n  containers:\n    - name: envp\n      image: alpine\n"
+        '      command: ["sh","-c","env; sleep 3"]\n'
+        "      envFrom:\n        - configMapRef:\n            name: ec\n"
+        "        - secretRef:\n            name: es\n"
+    )
+    import base64 as _b64
+    g.ok("base64 -d > /tmp/env.yaml", stdin=_b64.b64encode(manifest.encode()).decode())
+    try:
+        g.ok("fastman kube apply -f /tmp/env.yaml", timeout=60)
+        import time
+        time.sleep(2)
+        logs = g.ok("fastman kube logs envp-0")
+        assert "APP_COLOR=blue" in logs and "TOKEN=s3cr3t" in logs, logs
+    finally:
+        g.run("fastman kube delete envp 2>/dev/null; fastman kube delete ec 2>/dev/null; fastman kube delete es 2>/dev/null; true")
