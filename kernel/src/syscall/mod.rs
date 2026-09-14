@@ -236,8 +236,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         63 => ret(proc_sys::uname(a[0] as usize)),
         96 => ret(proc_sys::gettimeofday(a[0] as usize, a[1] as usize)),
         99 => ret(proc_sys::sysinfo(a[0] as usize)),
-        102 | 107 => proc::current().cred().uid as u64,
-        104 | 108 => proc::current().cred().gid as u64,
+        102 => proc::current().cred().uid as u64,  // getuid: real uid
+        107 => proc::current().cred().euid as u64, // geteuid: effective uid (id -u)
+        104 => proc::current().cred().gid as u64,  // getgid: real gid
+        108 => proc::current().cred().egid as u64, // getegid: effective gid
         110 => proc::current_ppid_vpid() as u64,
         98 => ret(proc_sys::getrusage(a[0] as i32, a[1] as usize)),
         111 => proc::current().pgid.load(core::sync::atomic::Ordering::Relaxed) as u64,
@@ -275,9 +277,10 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         13 => ret(proc_sys::rt_sigaction(a[0] as u32, a[1] as usize, a[2] as usize, a[3] as usize)),
         14 => ret(proc_sys::rt_sigprocmask(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as usize)),
         15 => proc_sys::rt_sigreturn(frame),
-        // sigaltstack, set_robust_list, rseq, sched_setaffinity,
+        131 => ret(proc_sys::sigaltstack(a[0] as usize, a[1] as usize)),
+        // set_robust_list, rseq, sched_setaffinity,
         // fadvise64: accepted as no-ops so libc starts.
-        131 | 273 | 334 | 203 | 221 => 0,
+        273 | 334 | 203 | 221 => 0,
         // prctl: no_new_privs, seccomp mode, capability bounding set.
         157 => ret(proc_sys::prctl(a[0] as i32, a[1], a[2], a[3], a[4])),
         // seccomp(op, flags, args) — install a cBPF filter or enter strict mode.
@@ -293,13 +296,19 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         160 => 0, // setrlimit: accepted, not enforced
         302 => ret(proc_sys::prlimit64(a[0] as i32, a[1] as u32, a[2] as usize, a[3] as usize)),
 
-        // Credential setters: a rootless container already runs under the
-        // caller's identity and is sandboxed regardless, so a server dropping
-        // privileges (nginx worker setgid/setuid/setgroups) succeeds as a no-op
-        // instead of failing and exiting. setuid=105 setgid=106
-        // setreuid=113 setregid=114 setgroups=116 setresuid=117 setresgid=119
-        // setfsuid=122 setfsgid=123 setsid handled elsewhere.
-        105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 => 0,
+        // Credential setters — these actually change the process cred (Linux
+        // rules): a program that drops privileges must really drop them, or it
+        // loops (docker-entrypoint re-execs gosu until non-root) and postgres
+        // refuses to run as root. A silent no-op is also a privilege-drop hole.
+        105 => ret(proc_sys::setuid(a[0] as u32)),
+        106 => ret(proc_sys::setgid(a[0] as u32)),
+        113 => ret(proc_sys::setreuid(a[0] as u32, a[1] as u32)),
+        114 => ret(proc_sys::setregid(a[0] as u32, a[1] as u32)),
+        116 => ret(proc_sys::setgroups(a[0] as usize, a[1] as usize)),
+        117 => ret(proc_sys::setresuid(a[0] as u32, a[1] as u32, a[2] as u32)),
+        119 => ret(proc_sys::setresgid(a[0] as u32, a[1] as u32, a[2] as u32)),
+        // setfsuid/setfsgid: rarely used; accept as no-ops (return prior fsuid=uid).
+        122 | 123 => proc::current().cred().uid as u64,
         // setpgid: job-control shells (bash) put each pipeline in its own group.
         109 => ret(proc_sys::setpgid(a[0] as i64, a[1] as i64)),
         // getgroups: no supplementary groups.

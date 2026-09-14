@@ -87,6 +87,7 @@ pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
 pub const SA_SIGINFO: u64 = 0x0000_0004;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
 pub const SA_RESTORER: u64 = 0x0400_0000;
 pub const SA_NODEFER: u64 = 0x4000_0000;
 pub const SA_RESETHAND: u64 = 0x8000_0000;
@@ -266,8 +267,26 @@ fn read_sigmask(uc: usize) -> KResult<u64> {
 /// enters the handler. On handler return the (libc-provided) `restorer` invokes
 /// `rt_sigreturn`, which [`restore_frame`] undoes.
 pub fn setup_frame(regs: &Regs, sig: u32, act: &SigAction, old_mask: u64) -> KResult<Regs> {
-    // Lay the frame out below the interrupted stack pointer, past the red zone.
-    let mut sp = (regs.rsp as usize).checked_sub(128).ok_or(Errno::EFAULT)?;
+    // Choose the stack the handler runs on. With SA_ONSTACK and an installed
+    // alternate signal stack, run on it — unless the interrupted context is
+    // already inside it (no nesting). The Go runtime sets SA_ONSTACK for its
+    // async-preemption handler and aborts if the signal is not delivered there.
+    let base = {
+        let (sp, size) = crate::sched::with_current(|t| {
+            (
+                t.sas_sp.load(core::sync::atomic::Ordering::Relaxed),
+                t.sas_size.load(core::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        let on_altstack = size != 0 && (regs.rsp >= sp && regs.rsp < sp + size);
+        if act.flags & SA_ONSTACK != 0 && size != 0 && !on_altstack {
+            (sp + size) as usize // top of the alt stack (grows down)
+        } else {
+            regs.rsp as usize
+        }
+    };
+    // Lay the frame out below the chosen stack pointer, past the red zone.
+    let mut sp = base.checked_sub(128).ok_or(Errno::EFAULT)?;
     sp &= !15;
     sp -= SIGINFO_SIZE;
     let info = sp;

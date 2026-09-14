@@ -182,6 +182,11 @@ impl Process {
     pub fn tasks(&self) -> Vec<Arc<Task>> {
         self.tasks.lock().clone()
     }
+    /// Drop every task but the one with `keep` from the process's task list —
+    /// used by execve after reaping sibling threads (de_thread).
+    pub fn retain_only_task(&self, keep: crate::sched::Tid) {
+        self.tasks.lock().retain(|t| t.tid == keep);
+    }
     pub fn children(&self) -> Vec<Arc<Process>> {
         self.children.lock().clone()
     }

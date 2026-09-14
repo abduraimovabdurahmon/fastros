@@ -206,6 +206,54 @@ pub fn rt_sigprocmask(how: i32, set: usize, oldset: usize, _sigsetsize: usize) -
     Ok(0)
 }
 
+/// `sigaltstack(new, old)`: get/set this thread's alternate signal stack. Go
+/// installs one per M and its async-preemption handler runs there (SA_ONSTACK);
+/// without a real implementation the runtime aborts when a signal arrives off
+/// the expected stack. `stack_t` (x86_64): ss_sp @0, ss_flags @8, ss_size @16.
+pub fn sigaltstack(new: usize, old: usize) -> KResult<usize> {
+    const SS_DISABLE: i32 = 2;
+    const SS_ONSTACK: i32 = 1;
+    const MINSIGSTKSZ: u64 = 2048;
+    let (cur_sp, cur_size) = sched::with_current(|t| {
+        (
+            t.sas_sp.load(core::sync::atomic::Ordering::Relaxed),
+            t.sas_size.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    });
+    if old != 0 {
+        // Report SS_ONSTACK if the interrupted context is currently on it — we
+        // don't nest handlers, so "on stack" is reported only when installed and
+        // the caller's sp is inside it; a plain query just returns the config.
+        let flags = if cur_size == 0 { SS_DISABLE } else { 0 };
+        uaccess::write_obj(old, &cur_sp)?;
+        uaccess::write_obj(old + 8, &flags)?;
+        uaccess::write_obj(old + 16, &cur_size)?;
+    }
+    if new != 0 {
+        let sp: u64 = uaccess::read_obj(new)?;
+        let flags: i32 = uaccess::read_obj(new + 8)?;
+        let size: u64 = uaccess::read_obj(new + 16)?;
+        if flags & SS_DISABLE != 0 {
+            sched::with_current(|t| {
+                t.sas_sp.store(0, core::sync::atomic::Ordering::Relaxed);
+                t.sas_size.store(0, core::sync::atomic::Ordering::Relaxed);
+            });
+        } else {
+            if flags & !SS_ONSTACK != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if size < MINSIGSTKSZ {
+                return Err(Errno::ENOMEM);
+            }
+            sched::with_current(|t| {
+                t.sas_sp.store(sp, core::sync::atomic::Ordering::Relaxed);
+                t.sas_size.store(size, core::sync::atomic::Ordering::Relaxed);
+            });
+        }
+    }
+    Ok(0)
+}
+
 /// `rt_sigreturn`: restore the context a signal handler was set up over, and the
 /// blocked mask that was in force before the handler ran, then resume that
 /// context directly via iretq.
@@ -395,6 +443,20 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
 
     let (new_space, new_frame) = proc::elf::load(&ctx, &data, &argv, &envp)?;
     // Point of no return: swap the address space and run the new image.
+    //
+    // POSIX: execve replaces the entire thread group. Terminate every OTHER
+    // thread of this process now — BEFORE the address space is swapped below —
+    // or a sibling left runnable would execute in the freed/replaced space and
+    // fault (this is exactly what wedged multithreaded Go binaries: gosu calls
+    // syscall.Exec while its runtime still has worker threads). Collect first,
+    // then reap without holding the task list lock.
+    let mytid = crate::sched::current_tid();
+    let siblings: Vec<alloc::sync::Arc<crate::sched::Task>> =
+        me.tasks().into_iter().filter(|t| t.tid != mytid).collect();
+    for t in &siblings {
+        crate::sched::kill_task(t);
+    }
+    me.retain_only_task(mytid);
     me.fds.lock().close_on_exec();
     // execve resets caught signals to their default; SIG_IGN dispositions and
     // the blocked mask (per-task) persist across exec, as on Linux.
@@ -422,6 +484,11 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
     me.set_cmdline(argv);
     proc::set_current_cr3(new_space.pml4());
     proc::set_current_fs_base(0);
+    // The old alternate signal stack pointed into the now-replaced address space.
+    sched::with_current(|t| {
+        t.sas_sp.store(0, Ordering::Relaxed);
+        t.sas_size.store(0, Ordering::Relaxed);
+    });
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, 0) };
     new_space.activate();
     *frame = new_frame;
@@ -638,22 +705,165 @@ pub fn clock_nanosleep(clk: u32, flags: i32, req: usize, rem: usize) -> KResult<
 
 /// `getresuid`/`getresgid`: report real=effective=saved = the current id.
 pub fn getresuid(ruid: usize, euid: usize, suid: usize) -> KResult<usize> {
-    let u = proc::current().cred().uid;
-    for p in [ruid, euid, suid] {
+    let c = proc::current().cred();
+    for (p, v) in [(ruid, c.uid), (euid, c.euid), (suid, c.suid)] {
         if p != 0 {
-            uaccess::write_obj(p, &u)?;
+            uaccess::write_obj(p, &v)?;
         }
     }
     Ok(0)
 }
 
 pub fn getresgid(rgid: usize, egid: usize, sgid: usize) -> KResult<usize> {
-    let g = proc::current().cred().gid;
-    for p in [rgid, egid, sgid] {
+    let c = proc::current().cred();
+    for (p, v) in [(rgid, c.gid), (egid, c.egid), (sgid, c.sgid)] {
         if p != 0 {
-            uaccess::write_obj(p, &g)?;
+            uaccess::write_obj(p, &v)?;
         }
     }
+    Ok(0)
+}
+
+// ── credential changes (setuid family) ──────────────────────────────────────
+//
+// These MUST take effect, not no-op: programs drop privileges through them and
+// then check the result. docker-entrypoint re-execs `gosu` until it is no longer
+// root (an endless loop if setuid silently does nothing), and postgres refuses
+// to run as root. A silent no-op is also a security hole — a process that thinks
+// it dropped privileges keeps root. Permission rules follow Linux: root may set
+// any id; a non-root process may only switch among its real/effective/saved ids.
+
+const KEEP: u32 = u32::MAX; // -1: leave this id unchanged (setres*/setre*)
+
+pub fn setuid(uid: u32) -> KResult<usize> {
+    let me = proc::current();
+    let mut c = me.cred.lock();
+    if c.euid == 0 {
+        c.uid = uid;
+        c.euid = uid;
+        c.suid = uid;
+    } else if uid == c.uid || uid == c.euid || uid == c.suid {
+        c.euid = uid;
+    } else {
+        return Err(Errno::EPERM);
+    }
+    Ok(0)
+}
+
+pub fn setgid(gid: u32) -> KResult<usize> {
+    let me = proc::current();
+    let mut c = me.cred.lock();
+    if c.euid == 0 {
+        c.gid = gid;
+        c.egid = gid;
+        c.sgid = gid;
+    } else if gid == c.gid || gid == c.egid || gid == c.sgid {
+        c.egid = gid;
+    } else {
+        return Err(Errno::EPERM);
+    }
+    Ok(0)
+}
+
+pub fn setresuid(r: u32, e: u32, s: u32) -> KResult<usize> {
+    let me = proc::current();
+    let mut c = me.cred.lock();
+    let root = c.euid == 0;
+    let allowed = |v: u32| v == KEEP || root || v == c.uid || v == c.euid || v == c.suid;
+    if !allowed(r) || !allowed(e) || !allowed(s) {
+        return Err(Errno::EPERM);
+    }
+    if r != KEEP {
+        c.uid = r;
+    }
+    if e != KEEP {
+        c.euid = e;
+    }
+    if s != KEEP {
+        c.suid = s;
+    }
+    Ok(0)
+}
+
+pub fn setresgid(r: u32, e: u32, s: u32) -> KResult<usize> {
+    let me = proc::current();
+    let mut c = me.cred.lock();
+    let root = c.euid == 0;
+    let allowed = |v: u32| v == KEEP || root || v == c.gid || v == c.egid || v == c.sgid;
+    if !allowed(r) || !allowed(e) || !allowed(s) {
+        return Err(Errno::EPERM);
+    }
+    if r != KEEP {
+        c.gid = r;
+    }
+    if e != KEEP {
+        c.egid = e;
+    }
+    if s != KEEP {
+        c.sgid = s;
+    }
+    Ok(0)
+}
+
+pub fn setreuid(ruid: u32, euid: u32) -> KResult<usize> {
+    let me = proc::current();
+    let mut c = me.cred.lock();
+    let root = c.euid == 0;
+    let allowed = |v: u32| v == KEEP || root || v == c.uid || v == c.euid || v == c.suid;
+    if !allowed(ruid) || !allowed(euid) {
+        return Err(Errno::EPERM);
+    }
+    let old_ruid = c.uid;
+    if ruid != KEEP {
+        c.uid = ruid;
+    }
+    if euid != KEEP {
+        c.euid = euid;
+    }
+    // If the real uid was set, or the effective uid moved to something other than
+    // the previous real uid, the saved uid tracks the new effective uid (Linux).
+    if ruid != KEEP || (euid != KEEP && euid != old_ruid) {
+        c.suid = c.euid;
+    }
+    Ok(0)
+}
+
+pub fn setregid(rgid: u32, egid: u32) -> KResult<usize> {
+    let me = proc::current();
+    let mut c = me.cred.lock();
+    let root = c.euid == 0;
+    let allowed = |v: u32| v == KEEP || root || v == c.gid || v == c.egid || v == c.sgid;
+    if !allowed(rgid) || !allowed(egid) {
+        return Err(Errno::EPERM);
+    }
+    let old_rgid = c.gid;
+    if rgid != KEEP {
+        c.gid = rgid;
+    }
+    if egid != KEEP {
+        c.egid = egid;
+    }
+    if rgid != KEEP || (egid != KEEP && egid != old_rgid) {
+        c.sgid = c.egid;
+    }
+    Ok(0)
+}
+
+/// `setgroups(size, list)`: replace the supplementary group list (root only).
+pub fn setgroups(size: usize, list: usize) -> KResult<usize> {
+    let me = proc::current();
+    if me.cred.lock().euid != 0 {
+        return Err(Errno::EPERM);
+    }
+    if size > 65536 {
+        return Err(Errno::EINVAL);
+    }
+    let mut groups = alloc::vec::Vec::with_capacity(size);
+    for i in 0..size {
+        let g: u32 = uaccess::read_obj(list + i * 4)?;
+        groups.push(g);
+    }
+    me.cred.lock().groups = groups;
     Ok(0)
 }
 

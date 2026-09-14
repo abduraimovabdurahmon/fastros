@@ -109,6 +109,12 @@ pub struct Task {
     /// `clear_child_tid` (set_tid_address / CLONE_CHILD_CLEARTID): on thread
     /// exit, zero this user word and futex-wake it, so `pthread_join` wakes.
     pub clear_child_tid: AtomicU64,
+    /// Alternate signal stack (`sigaltstack`), per thread. `sas_size == 0` means
+    /// none is installed. A handler with `SA_ONSTACK` runs on `[sas_sp,
+    /// sas_sp+sas_size)`. The Go runtime installs one per M and refuses to run
+    /// its async-preemption handler unless the signal arrives on it.
+    pub sas_sp: AtomicU64,
+    pub sas_size: AtomicU64,
 }
 
 // `saved_rsp` is only touched by the scheduler with interrupts disabled.
@@ -299,6 +305,8 @@ fn new_task(tid: Tid, name: &str, stack: Option<KernelStack>, stack_top: usize, 
         cr3: AtomicU64::new(0),
         fs_base: AtomicU64::new(0),
         clear_child_tid: AtomicU64::new(0),
+        sas_sp: AtomicU64::new(0),
+        sas_size: AtomicU64::new(0),
     })
 }
 
@@ -338,6 +346,25 @@ pub fn make_task(name: &str, f: impl FnOnce() + Send + 'static) -> Option<Arc<Ta
     let t = new_task(tid, name, Some(stack), top, rsp, Some(Box::new(f)));
     TASKS.lock().insert(tid, t.clone());
     Some(t)
+}
+
+/// Forcibly terminate another task (not the current one). Marks it exited so the
+/// scheduler discards it if it is ever picked, removes it from the ready queue
+/// and the task table, and wakes it if it was blocked (so a wait queue releases
+/// it and the scheduler drops it). Used by `execve`/process-exit to reap sibling
+/// threads before the address space they run in is replaced or freed. Safe on a
+/// single CPU because siblings are never running concurrently with the caller.
+pub fn kill_task(t: &Arc<Task>) {
+    t.exited.store(true, Ordering::Release);
+    {
+        let mut rq = RQ.lock();
+        rq.ready.retain(|x| !Arc::ptr_eq(x, t));
+    }
+    TASKS.lock().remove(&t.tid);
+    // If it was blocked in a wait queue, wake it: it returns to the ready queue
+    // and is then discarded by schedule() (has_exited), never touching user code.
+    wake(t);
+    t.exit_wq.wake_all();
 }
 
 /// Make a task created with [`make_task`] runnable.
@@ -512,9 +539,15 @@ pub fn schedule() {
                 rq.ready.push_back(prev.clone());
             }
         }
-        let next = match rq.ready.pop_front() {
-            Some(t) => t,
-            None => rq.idle.clone().expect("idle task"),
+        // Discard any task that has been terminated (e.g. a sibling thread
+        // reaped by execve's de_thread or by process exit): it must never run
+        // again, or it would execute in a freed/replaced address space.
+        let next = loop {
+            match rq.ready.pop_front() {
+                Some(t) if t.has_exited() => continue,
+                Some(t) => break t,
+                None => break rq.idle.clone().expect("idle task"),
+            }
         };
         next.set_state(TaskState::Running);
         rq.slice_start_ns = now;
