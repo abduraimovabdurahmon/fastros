@@ -473,22 +473,23 @@ fn command_line(ctx: &mut Ctx, term: &Term, ed: &mut Vim, cols: usize, rows: usi
         None => (cmd, ""),
     };
     match verb {
-        "w" | "write" => {
+        // One buffer, so the "-all" forms (qa/wqa/wa) behave like their singulars.
+        "w" | "write" | "wa" => {
             write_file(ctx, ed, arg);
         }
-        "q" | "quit" => {
+        "q" | "quit" | "qa" | "qall" => {
             if ed.buf.modified {
                 ed.status = String::from("E37: No write since last change (add ! to override)");
             } else {
                 ed.quit = true;
             }
         }
-        "q!" | "quit!" => ed.quit = true,
-        "wq" | "x" | "xit" => {
+        "q!" | "quit!" | "qa!" | "qall!" => ed.quit = true,
+        "wq" | "x" | "xit" | "wqa" | "xa" => {
             write_file(ctx, ed, arg);
             ed.quit = true;
         }
-        "wq!" => {
+        "wq!" | "wqa!" | "x!" => {
             write_file(ctx, ed, arg);
             ed.quit = true;
         }

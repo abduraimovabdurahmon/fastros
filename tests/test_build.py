@@ -142,6 +142,19 @@ def test_build_and_run(g, base_image):
     g.run("fastman rmi built:latest 2>/dev/null; true")
 
 
+def test_build_cache_reuse(g, base_image):
+    """Rebuilding an unchanged context reuses cached layers (docker build cache)."""
+    g.run("fastman rmi bc1 bc2 2>/dev/null; true")
+    b64 = base64.b64encode(_context_tar()).decode()
+    g.ok("base64 -d | fastman build -t bc1 -", stdin=b64, timeout=120)  # populate cache
+    out2 = g.ok("base64 -d | fastman build -t bc2 -", stdin=b64, timeout=120)
+    assert "Using cache" in out2, out2
+    # A cached rebuild still yields a correct image.
+    run = g.ok("fastman run bc2", timeout=60)
+    assert "built=made-by-run" in run and "copied=this-was-copied" in run, run
+    g.run("fastman rmi bc1 bc2 2>/dev/null; true")
+
+
 def test_build_run_failure(g, base_image):
     """A RUN step that exits non-zero fails the build."""
     # `cat` of a missing file makes our minimal /bin/sh exit non-zero.

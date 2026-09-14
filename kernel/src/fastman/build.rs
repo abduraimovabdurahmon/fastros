@@ -138,8 +138,27 @@ fn build_inner(ctx: &Ctx, opts: &BuildOpts, cdir: &str, insns: &[Insn], out: Opt
         }
     }
 
-    // 3. The overlay build environment: base rootfs (RO) + one persistent upper.
-    let lower = ctx.resolve(&image::rootfs_path(ctx, &base_id), true)?;
+    // 3. Build cache: hash each instruction cumulatively (COPY also folds in its
+    //    source files' contents), so an unchanged prefix of a previous build can
+    //    be reused. We resume from the deepest cached filesystem layer and only
+    //    execute the instructions after it — Docker's layer-cache behaviour.
+    let body = &insns[idx..];
+    let keys = cache_keys(ctx, cdir, &base_id, body);
+    let cache_root = format!("{}/buildcache", super::store::base(ctx));
+    let mut resume_idx: isize = -1;
+    let mut lower_path = image::rootfs_path(ctx, &base_id);
+    for (i, insn) in body.iter().enumerate() {
+        if is_fs_step(insn) {
+            let rp = format!("{cache_root}/{}/rootfs", keys[i]);
+            if ops::stat(ctx, &rp, true).is_ok() {
+                resume_idx = i as isize;
+                lower_path = rp;
+            }
+        }
+    }
+
+    // The overlay build environment: the (cached-or-base) rootfs (RO) + one upper.
+    let lower = ctx.resolve(&lower_path, true)?;
     let upper = crate::fs::tmpfs::TmpFs::new(0);
     let overlay = crate::fs::overlayfs::OverlayFs::new(lower.inode.clone(), upper);
 
@@ -165,9 +184,12 @@ fn build_inner(ctx: &Ctx, opts: &BuildOpts, cdir: &str, insns: &[Insn], out: Opt
         let _ = run_ns.mount(&p, crate::fs::tmpfs::TmpFs::new(0), "tmpfs", nodev);
     }
 
-    // 4. Execute each instruction in order.
+    // 4. Execute each instruction, skipping the cached prefix. Metadata is always
+    //    replayed (it only mutates the config); filesystem steps below the resume
+    //    point are already baked into the cached lower layer.
     let mut workdir = if cfg.workdir.is_empty() { String::from("/") } else { cfg.workdir.clone() };
-    for insn in &insns[idx..] {
+    for (i, insn) in body.iter().enumerate() {
+        let cached = (i as isize) <= resume_idx;
         match insn {
             Insn::From(_) => return Err(Errno::EINVAL), // multi-stage not supported
             Insn::Arg(k, dflt) => {
@@ -191,13 +213,24 @@ fn build_inner(ctx: &Ctx, opts: &BuildOpts, cdir: &str, insns: &[Insn], out: Opt
                 cfg.workdir = workdir.clone();
             }
             Insn::Copy { srcs, dest } => {
-                run_copy(ctx, &build_ctx, cdir, srcs, dest, &workdir, &vars)?;
+                if cached {
+                    note(&out, "COPY", true);
+                } else {
+                    note(&out, "COPY", false);
+                    run_copy(ctx, &build_ctx, cdir, srcs, dest, &workdir, &vars)?;
+                    snapshot_layer(ctx, &overlay, &format!("{cache_root}/{}", keys[i]))?;
+                }
             }
             Insn::Run(argv, shell) => {
-                let argv = build_run_argv(argv, *shell, &vars);
-                let code = run_step(&build_ctx, &argv, &cfg.env, &workdir, out.clone())?;
-                if code != 0 {
-                    return Err(Errno::EIO);
+                if cached {
+                    note(&out, &format!("RUN {}", argv.join(" ")), true);
+                } else {
+                    let argv2 = build_run_argv(argv, *shell, &vars);
+                    let code = run_step(&build_ctx, &argv2, &cfg.env, &workdir, out.clone())?;
+                    if code != 0 {
+                        return Err(Errno::EIO);
+                    }
+                    snapshot_layer(ctx, &overlay, &format!("{cache_root}/{}", keys[i]))?;
                 }
             }
             Insn::Cmd(v) => cfg.cmd = v.iter().map(|s| expand(s, &vars)).collect(),
@@ -230,6 +263,153 @@ fn build_inner(ctx: &Ctx, opts: &BuildOpts, cdir: &str, insns: &[Insn], out: Opt
     }
     let img = image::commit(ctx, &opts.tag, &new_id, bytes, &cfg)?;
     Ok(Built { image: img })
+}
+
+// ── build cache ──────────────────────────────────────────────────────────────
+
+/// A filesystem-changing instruction — the ones worth a cache snapshot.
+fn is_fs_step(insn: &Insn) -> bool {
+    matches!(insn, Insn::Run(..) | Insn::Copy { .. })
+}
+
+/// One cumulative cache key per body instruction:
+/// `key_i = sha256(key_{i-1} || canonical(insn_i))`. COPY folds in its source
+/// files' contents, so changing a copied file invalidates that step and every
+/// step after it — exactly Docker's cache-invalidation rule.
+fn cache_keys(ctx: &Ctx, cdir: &str, base_id: &str, body: &[Insn]) -> Vec<String> {
+    let mut acc = crate::crypto::sha256(base_id.as_bytes());
+    let mut out = Vec::with_capacity(body.len());
+    for insn in body {
+        let mut buf = acc.to_vec();
+        insn_canon(ctx, cdir, insn, &mut buf);
+        acc = crate::crypto::sha256(&buf);
+        out.push(hexstr(&acc));
+    }
+    out
+}
+
+/// Append a canonical, stable encoding of `insn` to `buf`.
+fn insn_canon(ctx: &Ctx, cdir: &str, insn: &Insn, buf: &mut Vec<u8>) {
+    match insn {
+        Insn::From(s) => push(buf, b"FROM", s.as_bytes()),
+        Insn::Run(argv, shell) => {
+            buf.extend_from_slice(b"RUN");
+            buf.push(*shell as u8);
+            for a in argv {
+                buf.push(0);
+                buf.extend_from_slice(a.as_bytes());
+            }
+        }
+        Insn::Copy { srcs, dest } => {
+            push(buf, b"COPY", dest.as_bytes());
+            for s in srcs {
+                buf.push(0);
+                buf.extend_from_slice(s.as_bytes());
+                hash_src(ctx, &format!("{cdir}/{}", s.trim_start_matches('/')), buf);
+            }
+        }
+        Insn::Env(pairs) => {
+            buf.extend_from_slice(b"ENV");
+            for (k, v) in pairs {
+                buf.push(0);
+                buf.extend_from_slice(k.as_bytes());
+                buf.push(b'=');
+                buf.extend_from_slice(v.as_bytes());
+            }
+        }
+        Insn::Workdir(w) => push(buf, b"WORKDIR", w.as_bytes()),
+        Insn::Arg(k, d) => {
+            push(buf, b"ARG", k.as_bytes());
+            if let Some(d) = d {
+                buf.push(b'=');
+                buf.extend_from_slice(d.as_bytes());
+            }
+        }
+        Insn::Cmd(v) => {
+            buf.extend_from_slice(b"CMD");
+            for a in v {
+                buf.push(0);
+                buf.extend_from_slice(a.as_bytes());
+            }
+        }
+        Insn::Entrypoint(v) => {
+            buf.extend_from_slice(b"ENTRYPOINT");
+            for a in v {
+                buf.push(0);
+                buf.extend_from_slice(a.as_bytes());
+            }
+        }
+        Insn::Health { cmd, interval, timeout, retries } => {
+            push(buf, b"HEALTHCHECK", cmd.as_bytes());
+            buf.extend_from_slice(&interval.to_le_bytes());
+            buf.extend_from_slice(&timeout.to_le_bytes());
+            buf.extend_from_slice(&retries.to_le_bytes());
+        }
+        Insn::User(u) => push(buf, b"USER", u.as_bytes()),
+        Insn::Noop => buf.extend_from_slice(b"NOOP"),
+    }
+}
+
+fn push(buf: &mut Vec<u8>, tag: &[u8], val: &[u8]) {
+    buf.extend_from_slice(tag);
+    buf.push(b' ');
+    buf.extend_from_slice(val);
+}
+
+/// Fold the content of a build-context path (file or directory tree) into `buf`,
+/// so a COPY's cache key reflects exactly what would be copied.
+fn hash_src(ctx: &Ctx, path: &str, buf: &mut Vec<u8>) {
+    match ops::stat(ctx, path, false) {
+        Ok(m) if m.kind == FileType::Directory => {
+            if let Ok(mut entries) = ops::list_dir(ctx, path) {
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                for e in entries {
+                    if e.name == "." || e.name == ".." {
+                        continue;
+                    }
+                    buf.push(0);
+                    buf.extend_from_slice(e.name.as_bytes());
+                    hash_src(ctx, &format!("{path}/{}", e.name), buf);
+                }
+            }
+        }
+        Ok(_) => {
+            if let Ok(d) = ops::read_file(ctx, path) {
+                buf.extend_from_slice(&crate::crypto::sha256(&d));
+            }
+        }
+        Err(_) => buf.extend_from_slice(b"MISSING"),
+    }
+}
+
+/// Snapshot the current merged overlay tree into a cache layer directory
+/// (`<dir>/rootfs`), so a later build can resume from it as a read-only lower.
+fn snapshot_layer(ctx: &Ctx, overlay: &Arc<crate::fs::overlayfs::OverlayFs>, dir: &str) -> KResult<()> {
+    let ns = MountNamespace::new(overlay.clone(), "overlay", MountFlags::RW);
+    let root = ns.root();
+    let src = Ctx { fs: FsContext { ns: ns.clone(), root: root.clone(), cwd: root.clone(), umask: 0 }, cred: ctx.cred.clone() };
+    let rootfs = format!("{dir}/rootfs");
+    let _ = ops::remove_tree(ctx, dir); // drop any stale/partial layer first
+    ops::mkdir_all(ctx, &rootfs, 0o700)?;
+    let mut bytes = 0u64;
+    copy_tree(&src, "/", ctx, &rootfs, 0, &mut bytes)
+}
+
+fn hexstr(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&alloc::format!("{x:02x}"));
+    }
+    s
+}
+
+/// Emit a per-step note to the build log (if attached), marking cache hits.
+fn note(out: &Option<Arc<dyn File>>, step: &str, cached: bool) {
+    if let Some(f) = out {
+        let short: String = step.chars().take(60).collect();
+        let tag = if cached { "  ---> Using cache" } else { "" };
+        let _ = f.write_all(alloc::format!("Step: {short}{tag}\n").as_bytes());
+    }
 }
 
 /// Run one `RUN` step: spawn the program inside the overlay and wait for it.

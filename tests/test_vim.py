@@ -42,3 +42,14 @@ def test_vim_search_and_quit_bang(term, g):
     term.pump(0.5)
     # :q! discards, file unchanged
     assert g.ok("cat /tmp/v3.txt").splitlines()[2] == "target here"
+
+
+def test_vim_qa_quits(term, g):
+    """`:qa` / `:wqa` (quit-all) work in the single-buffer editor."""
+    g.ok("printf 'x\\n' > /tmp/qa.txt")
+    term.send("vim /tmp/qa.txt\r")
+    term.wait_for("x")
+    term.send("ostuff\x1b")   # o -> insert 'stuff', ESC
+    term.send(":wqa\r")       # write-all + quit-all
+    term.pump(0.6)
+    assert g.ok("cat /tmp/qa.txt").splitlines() == ["x", "stuff"], g.ok("cat /tmp/qa.txt")
