@@ -303,16 +303,6 @@ pub fn fallocate(fd: i32, mode: i32, offset: u64, len: u64) -> KResult<usize> {
 /// `io_setup(2)`: hand back an AIO context id. We do not run real kernel AIO,
 /// but a server that only *initialises* an AIO context at startup (nginx with
 /// its default config, which serves via sendfile, not aio) must not fail here.
-pub fn io_setup(_nr_events: u32, _ctxp: usize) -> KResult<usize> {
-    // No kernel AIO: report it unavailable so nginx disables its aio path
-    // (non-fatal) rather than setting up an aio eventfd it then mishandles.
-    Err(Errno::ENOSYS)
-}
-
-pub fn io_destroy(_ctx: usize) -> KResult<usize> {
-    Ok(0)
-}
-
 /// `signalfd`/`signalfd4`: a descriptor that yields the process's pending
 /// signals (in `mask`) as data. `fd < 0` creates one; `fd >= 0` updates it.
 pub fn signalfd(fd: i32, mask_ptr: usize, sizemask: usize, flags: u32) -> KResult<usize> {

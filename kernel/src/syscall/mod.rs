@@ -6,6 +6,7 @@
 //! address space and descriptor table, and returns a value (or a negated
 //! errno) in `rax` — exactly as Linux does, so unmodified binaries run.
 
+mod aio;
 mod file;
 mod mem;
 mod net;
@@ -163,8 +164,11 @@ fn handle(nr: u64, a: [u64; 6], frame: &mut UserFrame) -> u64 {
         262 => ret(file::newfstatat(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as i32)),
         292 => ret(file::dup3(a[0] as i32, a[1] as i32, a[2] as u32)),
         293 => ret(file::pipe(a[0] as usize, a[1] as u32)),
-        206 => ret(file::io_setup(a[0] as u32, a[1] as usize)),
-        207 => ret(file::io_destroy(a[0] as usize)),
+        206 => ret(aio::io_setup(a[0] as u32, a[1] as usize)),
+        207 => ret(aio::io_destroy(a[0] as usize)),
+        208 => ret(aio::io_getevents(a[0] as usize, a[1] as i64, a[2] as i64, a[3] as usize, a[4] as usize)),
+        209 => ret(aio::io_submit(a[0] as usize, a[1] as i64, a[2] as usize)),
+        210 => ret(aio::io_cancel(a[0] as usize, a[1] as usize, a[2] as usize)),
         282 => ret(file::signalfd(a[0] as i32, a[1] as usize, a[2] as usize, 0)),
         289 => ret(file::signalfd(a[0] as i32, a[1] as usize, a[2] as usize, a[3] as u32)),
         284 => ret(file::eventfd(a[0] as u32, 0)),
