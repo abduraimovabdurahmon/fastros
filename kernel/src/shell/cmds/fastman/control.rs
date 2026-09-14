@@ -272,7 +272,16 @@ pub(super) fn kill(ctx: &mut Ctx, args: &[String]) -> i32 {
     let mut st = 0;
     for name in &names {
         match runtime::signal_container(&fc, name, sig) {
-            Ok(_) => outln!(ctx, "{name}"),
+            Ok(_) => {
+                // A manual kill suppresses the restart policy, like docker kill.
+                if let Ok(mut c) = container::find(&fc, name) {
+                    if !c.restart_policy.is_empty() && !c.stopped_by_user {
+                        c.stopped_by_user = true;
+                        let _ = c.save(&fc);
+                    }
+                }
+                outln!(ctx, "{name}");
+            }
             Err(e) => st = ctx.fail_errno(name, e),
         }
     }

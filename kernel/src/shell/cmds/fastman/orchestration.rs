@@ -171,10 +171,18 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
     let s = style_of(ctx);
     match sub.as_deref().unwrap_or("get") {
         "apply" => {
-            let Some(path) = file else { return ctx.fail("apply requires -f <manifest>") };
-            let src = match crate::fs::ops::read_file(&fc, &path) {
-                Ok(d) => String::from_utf8_lossy(&d).into_owned(),
-                Err(e) => return ctx.fail_errno(&path, e),
+            let Some(path) = file else { return ctx.fail("apply requires -f <manifest> (or -f - for stdin)") };
+            // `-f -` reads the manifest from stdin, like kubectl.
+            let src = if path == "-" {
+                match ctx.read_input("-") {
+                    Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                    Err(e) => return ctx.fail_errno("stdin", e),
+                }
+            } else {
+                match crate::fs::ops::read_file(&fc, &path) {
+                    Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                    Err(e) => return ctx.fail_errno(&path, e),
+                }
             };
             let m = crate::fastman::kube::parse(&src);
             if m.workloads.is_empty() && m.services.is_empty() && m.configs.is_empty() {
@@ -604,6 +612,7 @@ pub(super) fn clone_opts(o: &RunOpts) -> RunOpts {
         env: o.env.clone(),
         env_files: o.env_files.clone(),
         entrypoint: o.entrypoint.clone(),
+        restart_policy: o.restart_policy.clone(),
         workdir: o.workdir.clone(),
         ports: o.ports.clone(),
         volumes: o.volumes.clone(),

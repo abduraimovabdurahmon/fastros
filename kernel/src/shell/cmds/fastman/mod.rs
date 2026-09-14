@@ -190,6 +190,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "load" => load(ctx, &args[1..]),
         "commit" => commit(ctx, &args[1..]),
         "run" => run(ctx, &args[1..]),
+        "create" => create_cmd(ctx, &args[1..]),
         "ps" => ps(ctx, &args[1..]),
         "start" => start(ctx, &args[1..]),
         "stop" => stop(ctx, &args[1..]),
@@ -681,6 +682,17 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, bool, String, Vec<String>), St
                 i += 1;
                 o.entrypoint = Some(args.get(i).ok_or("--entrypoint needs a command")?.clone());
             }
+            "--restart" => {
+                i += 1;
+                let v = args.get(i).ok_or("--restart needs a policy")?;
+                // Accept `on-failure:N` (max retries) — we ignore the count.
+                let policy = v.split(':').next().unwrap_or(v);
+                match policy {
+                    "no" | "" => o.restart_policy = String::new(),
+                    "always" | "unless-stopped" | "on-failure" => o.restart_policy = policy.to_string(),
+                    _ => return Err(format!("--restart: unknown policy '{v}' (no|always|unless-stopped|on-failure)")),
+                }
+            }
             "-w" | "--workdir" => {
                 i += 1;
                 o.workdir = Some(args.get(i).ok_or("-w needs a directory")?.clone());
@@ -828,6 +840,70 @@ fn parse_volume(s: &str) -> Result<Volume, String> {
     }
 }
 
+/// Expand any `--env-file` paths into `opts.env`, prepending them so an explicit
+/// `-e` still wins. Returns `Err(exit_code)` if a file cannot be read.
+fn expand_env_files(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, opts: &mut runtime::RunOpts) -> Result<(), i32> {
+    if opts.env_files.is_empty() {
+        return Ok(());
+    }
+    let mut merged = Vec::new();
+    for path in &opts.env_files {
+        match crate::fs::ops::read_file(fc, path) {
+            Ok(data) => {
+                for line in String::from_utf8_lossy(&data).lines() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with('#') || !t.contains('=') {
+                        continue;
+                    }
+                    merged.push(t.to_string());
+                }
+            }
+            Err(e) => return Err(ctx.fail_errno(path, e)),
+        }
+    }
+    merged.extend(core::mem::take(&mut opts.env));
+    opts.env = merged;
+    Ok(())
+}
+
+/// `fastman create [opts] <image> [cmd]` — create a container without starting
+/// it (like `docker create`); prints the new container id. `start` runs it.
+fn create_cmd(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let (mut opts, _interactive, image_name, _cmd) = match parse_run(args) {
+        Ok(v) => v,
+        Err(e) => return ctx.fail(e),
+    };
+    let fc = fs_ctx(ctx);
+    if let Err(code) = expand_env_files(ctx, &fc, &mut opts) {
+        return code;
+    }
+    if let Some((u, g)) = opts.user {
+        if !fc.cred.is_root() && (u != fc.cred.uid || g != fc.cred.gid) {
+            return ctx.fail("--user: permission denied (only root may run as another identity)");
+        }
+    }
+    if image::resolve(&fc, &image_name).is_none() {
+        if let Err(code) = ensure_image(ctx, &image_name) {
+            return code;
+        }
+    }
+    let opts_name = opts.name.clone();
+    match runtime::create(&fc, &image_name, opts) {
+        Ok(c) => {
+            outln!(ctx, "{}", c.id);
+            0
+        }
+        Err(crate::errno::Errno::EEXIST) => {
+            let existing = crate::fastman::container::find(&fc, opts_name.as_deref().unwrap_or("")).ok();
+            match existing {
+                Some(c) => ctx.fail(format!("the container name \"{}\" is already in use by {}", c.name, short(&c.id))),
+                None => ctx.fail("a container with that name already exists (use a different --name)"),
+            }
+        }
+        Err(e) => ctx.fail_errno("create", e),
+    }
+}
+
 fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
     let (mut opts, interactive, image_name, _cmd) = match parse_run(args) {
         Ok(v) => v,
@@ -836,26 +912,8 @@ fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
     let detach = opts.detach;
     let rm = opts.rm;
     let fc = fs_ctx(ctx);
-    // Expand --env-file(s): read KEY=VALUE lines (skipping blanks and #comments)
-    // and prepend them so explicit -e still wins (later env entries override).
-    if !opts.env_files.is_empty() {
-        let mut merged = Vec::new();
-        for path in &opts.env_files {
-            match crate::fs::ops::read_file(&fc, path) {
-                Ok(data) => {
-                    for line in String::from_utf8_lossy(&data).lines() {
-                        let t = line.trim();
-                        if t.is_empty() || t.starts_with('#') || !t.contains('=') {
-                            continue;
-                        }
-                        merged.push(t.to_string());
-                    }
-                }
-                Err(e) => return ctx.fail_errno(path, e),
-            }
-        }
-        merged.extend(core::mem::take(&mut opts.env));
-        opts.env = merged;
+    if let Err(code) = expand_env_files(ctx, &fc, &mut opts) {
+        return code;
     }
     // Reject an unauthorized `--user` up front (before any auto-pull): a non-root
     // caller may only run as its own identity. runtime::create() enforces this

@@ -147,6 +147,15 @@ fn parse_map(lines: &[Line], i: &mut usize, base_indent: usize) -> Yaml {
             let child_indent = lines[*i].indent;
             let v = parse_block(lines, i, child_indent);
             map.push((key, v));
+        } else if *i < lines.len()
+            && lines[*i].indent == base_indent
+            && (lines[*i].text.trim_start().starts_with("- ") || lines[*i].text.trim() == "-")
+        {
+            // A block sequence may sit at the SAME indent as its key — valid YAML
+            // and common in Kubernetes manifests (`containers:` then `- name:`
+            // aligned beneath it). Without this the key parsed as an empty scalar.
+            let v = parse_list(lines, i, base_indent);
+            map.push((key, v));
         } else {
             map.push((key, Yaml::Scalar(String::new())));
         }

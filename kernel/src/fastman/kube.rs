@@ -261,6 +261,7 @@ pub fn clone_opts(o: &RunOpts, name: String) -> RunOpts {
         env: o.env.clone(),
         env_files: o.env_files.clone(),
         entrypoint: o.entrypoint.clone(),
+        restart_policy: o.restart_policy.clone(),
         workdir: o.workdir.clone(),
         ports: o.ports.iter().map(|p| Port { host: p.host, container: p.container, udp: p.udp }).collect(),
         volumes: o.volumes.iter().map(|v| Volume { host: v.host.clone(), container: v.container.clone(), read_only: v.read_only }).collect(),
@@ -290,6 +291,7 @@ pub fn opts_from_container(c: &super::container::Container, name: String) -> Run
         env: c.env.clone(),
         env_files: alloc::vec::Vec::new(),
         entrypoint: None,
+        restart_policy: c.restart_policy.clone(),
         workdir: if c.workdir.is_empty() { None } else { Some(c.workdir.clone()) },
         ports: c.ports.iter().map(|p| Port { host: p.host, container: p.container, udp: p.udp }).collect(),
         volumes: c.volumes.iter().map(|v| Volume { host: v.host.clone(), container: v.container.clone(), read_only: v.read_only }).collect(),
@@ -361,6 +363,29 @@ fn reconcile_once() {
                         Err(e) => crate::kwarn!("kube", "could not restart pod {}: {}", pod, e),
                     }
                 }
+            }
+        }
+    }
+    // Docker `--restart` policies: bring exited containers back per policy. The
+    // ~3s reconcile cadence is a natural backoff against a crash-looping image.
+    // A manually stopped/killed container (stopped_by_user) is left alone.
+    for c in super::container::list(&kctx) {
+        if c.restart_policy.is_empty() || c.stopped_by_user {
+            continue;
+        }
+        if c.live_state() != super::container::State::Exited {
+            continue;
+        }
+        let should = match c.restart_policy.as_str() {
+            "always" | "unless-stopped" => true,
+            "on-failure" => c.exit_code != 0,
+            _ => false,
+        };
+        if should {
+            let mut c = c;
+            match super::runtime::start(&kctx, &mut c, None, None) {
+                Ok(_) => crate::kdebug!("fastman", "restarted {} (restart={})", c.name, c.restart_policy),
+                Err(e) => crate::kwarn!("fastman", "restart {} failed: {}", c.name, e),
             }
         }
     }

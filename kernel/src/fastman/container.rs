@@ -89,6 +89,13 @@ pub struct Container {
     pub health_retries: u32,
     pub health_status: String,
     pub health_fails: u32,
+    /// Restart policy (`--restart`): "" (none/no), "always", "unless-stopped",
+    /// or "on-failure". The self-healing controller restarts an exited container
+    /// per this policy unless the user stopped it (`stopped_by_user`).
+    pub restart_policy: String,
+    /// Set when the user explicitly stops/kills the container, so a restart
+    /// policy does not immediately bring it back.
+    pub stopped_by_user: bool,
 }
 
 impl Container {
@@ -174,6 +181,12 @@ impl Container {
             s.push_str(&format!("health_status\t{}\n", self.health_status));
             s.push_str(&format!("health_fails\t{}\n", self.health_fails));
         }
+        if !self.restart_policy.is_empty() {
+            s.push_str(&format!("restart_policy\t{}\n", self.restart_policy));
+        }
+        if self.stopped_by_user {
+            s.push_str("stopped_by_user\t1\n");
+        }
         s
     }
 
@@ -207,6 +220,8 @@ impl Container {
             health_retries: 0,
             health_status: String::new(),
             health_fails: 0,
+            restart_policy: String::new(),
+            stopped_by_user: false,
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -255,6 +270,8 @@ impl Container {
                 "health_retries" => c.health_retries = v.parse().unwrap_or(0),
                 "health_status" => c.health_status = v.to_string(),
                 "health_fails" => c.health_fails = v.parse().unwrap_or(0),
+                "restart_policy" => c.restart_policy = v.to_string(),
+                "stopped_by_user" => c.stopped_by_user = v == "1",
                 _ => {}
             }
         }

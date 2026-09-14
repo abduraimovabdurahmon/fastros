@@ -40,6 +40,8 @@ pub struct RunOpts {
     pub env_files: Vec<String>,
     /// `--entrypoint`: override the image's ENTRYPOINT (the args become CMD).
     pub entrypoint: Option<String>,
+    /// `--restart` policy: "", "always", "unless-stopped", or "on-failure".
+    pub restart_policy: String,
     pub workdir: Option<String>,
     pub ports: Vec<Port>,
     pub volumes: Vec<Volume>,
@@ -180,6 +182,8 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         health_retries: if hc.3 != 0 { hc.3 } else { 3 },
         health_status: if hc.0.is_empty() { String::new() } else { String::from("starting") },
         health_fails: 0,
+        restart_policy: opts.restart_policy,
+        stopped_by_user: false,
     };
     c.save(ctx)?;
     if let Some((d, a)) = c.port_remap {
@@ -376,6 +380,8 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
 
     c.pid = pid;
     c.state = State::Running;
+    // Starting clears the manual-stop flag so the restart policy is active again.
+    c.stopped_by_user = false;
     // A fresh run's health starts as "starting" (until the first probe).
     if !c.health_cmd.is_empty() {
         c.health_status = String::from("starting");
@@ -511,6 +517,13 @@ pub fn stop(ctx: &Ctx, name: &str, sig: u32) -> KResult<Container> {
         }
     }
     let _ = ctx;
+    // A manual stop suppresses the restart policy (Docker does not restart a
+    // container stopped via `stop`/`kill`). Re-load so we don't clobber the
+    // reaper's Exited state.
+    if let Ok(mut c2) = super::container::find(ctx, name) {
+        c2.stopped_by_user = true;
+        let _ = c2.save(ctx);
+    }
     super::events::record("stop", &c.name);
     Ok(c)
 }
