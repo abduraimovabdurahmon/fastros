@@ -682,6 +682,16 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, bool, String, Vec<String>), St
                 i += 1;
                 o.entrypoint = Some(args.get(i).ok_or("--entrypoint needs a command")?.clone());
             }
+            "-h" | "--hostname" => {
+                i += 1;
+                o.hostname = Some(args.get(i).ok_or("--hostname needs a value")?.clone());
+            }
+            "-l" | "--label" => {
+                i += 1;
+                let kv = args.get(i).ok_or("--label needs KEY=VALUE")?;
+                let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+                o.labels.push((k.to_string(), v.to_string()));
+            }
             "--restart" => {
                 i += 1;
                 let v = args.get(i).ok_or("--restart needs a policy")?;

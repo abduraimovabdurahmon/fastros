@@ -351,39 +351,41 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
             0
         }
         "delete" => {
+            // `delete -f <manifest|->`: delete every resource named in the file.
+            if let Some(path) = &file {
+                let src = if path == "-" {
+                    match ctx.read_input("-") {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => return ctx.fail_errno("stdin", e),
+                    }
+                } else {
+                    match crate::fs::ops::read_file(&fc, path) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => return ctx.fail_errno(path, e),
+                    }
+                };
+                let m = crate::fastman::kube::parse(&src);
+                let mut names: Vec<String> = Vec::new();
+                names.extend(m.workloads.iter().map(|w| w.name.clone()));
+                names.extend(m.services.iter().map(|s| s.name.clone()));
+                names.extend(m.configs.iter().map(|c| c.name.clone()));
+                if names.is_empty() {
+                    return ctx.fail(format!("{path}: no resources found"));
+                }
+                for name in names {
+                    kube_delete_one(ctx, &fc, &wdir, &sdir, &name);
+                }
+                return 0;
+            }
             let Some(name) = rest.iter().find(|a| !a.contains('/')).cloned().or_else(|| rest.first().cloned()) else {
-                return ctx.fail("delete requires a name");
+                return ctx.fail("delete requires a name (or -f <manifest>)");
             };
-            // Delete a workload's pods + record, or a service.
-            let rec_path = format!("{wdir}/{name}");
-            if let Ok(d) = crate::fs::ops::read_file(&fc, &rec_path) {
-                let text = String::from_utf8_lossy(&d).into_owned();
-                let want: usize = text.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
-                // Remove the record FIRST so the controller stops reconciling
-                // these pods before we tear them down.
-                let _ = crate::fs::ops::unlink(&fc, &rec_path);
-                for n in 0..want {
-                    let pod = crate::fastman::kube::pod_name(&name, n);
-                    let _ = runtime::remove(&fc, &pod, true);
-                    crate::fastman::kube::forget_pod(&pod);
-                }
-                outln!(ctx, "deployment \"{name}\" deleted");
-                return 0;
+            if !kube_delete_one(ctx, &fc, &wdir, &sdir, &name) {
+                return ctx.fail(format!("{name}: not found"));
             }
-            if crate::fs::ops::unlink(&fc, &format!("{sdir}/{name}")).is_ok() {
-                outln!(ctx, "service \"{name}\" deleted");
-                return 0;
-            }
-            let base = crate::fastman::store::base(&fc);
-            for kind in ["configmap", "secret"] {
-                let p = format!("{}/{name}", crate::fastman::kube::configs_dir(&base, kind));
-                if crate::fs::ops::unlink(&fc, &p).is_ok() {
-                    outln!(ctx, "{kind} \"{name}\" deleted");
-                    return 0;
-                }
-            }
-            ctx.fail(format!("{name}: not found"))
+            0
         }
+        "wait" => kube_wait(ctx, &fc, &wdir, &rest),
         "create" => kube_create(ctx, &fc, &rest),
         "scale" => kube_scale(ctx, &fc, &wdir, &rest),
         "rollout" => kube_rollout(ctx, &fc, &wdir, &rest),
@@ -613,6 +615,8 @@ pub(super) fn clone_opts(o: &RunOpts) -> RunOpts {
         env_files: o.env_files.clone(),
         entrypoint: o.entrypoint.clone(),
         restart_policy: o.restart_policy.clone(),
+        hostname: o.hostname.clone(),
+        labels: o.labels.clone(),
         workdir: o.workdir.clone(),
         ports: o.ports.clone(),
         volumes: o.volumes.clone(),
@@ -869,4 +873,91 @@ fn kube_set(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[String]
     }
     outln!(ctx, "{} {name} image updated to {image}", s.green(&kind.to_lowercase()));
     0
+}
+
+/// Delete one named resource (workload+pods, service, or config). Returns true
+/// if something was deleted; prints the kubectl-style confirmation.
+fn kube_delete_one(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, sdir: &str, name: &str) -> bool {
+    let rec_path = format!("{wdir}/{name}");
+    if let Ok(d) = crate::fs::ops::read_file(fc, &rec_path) {
+        let text = String::from_utf8_lossy(&d).into_owned();
+        let want: usize = text.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+        // Remove the record first so the controller stops reconciling the pods.
+        let _ = crate::fs::ops::unlink(fc, &rec_path);
+        for n in 0..want {
+            let pod = crate::fastman::kube::pod_name(name, n);
+            let _ = runtime::remove(fc, &pod, true);
+            crate::fastman::kube::forget_pod(&pod);
+        }
+        outln!(ctx, "deployment \"{name}\" deleted");
+        return true;
+    }
+    if crate::fs::ops::unlink(fc, &format!("{sdir}/{name}")).is_ok() {
+        outln!(ctx, "service \"{name}\" deleted");
+        return true;
+    }
+    let base = crate::fastman::store::base(fc);
+    for kind in ["configmap", "secret"] {
+        let p = format!("{}/{name}", crate::fastman::kube::configs_dir(&base, kind));
+        if crate::fs::ops::unlink(fc, &p).is_ok() {
+            outln!(ctx, "{kind} \"{name}\" deleted");
+            return true;
+        }
+    }
+    false
+}
+
+/// `fastman kube wait [--for=condition=Ready] [--timeout=Ns] <resource>...` —
+/// poll until each named workload's pods are all Running (or timeout).
+fn kube_wait(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[String]) -> i32 {
+    let mut timeout_s = 30u64;
+    let mut names: Vec<String> = Vec::new();
+    for a in rest {
+        if let Some(v) = a.strip_prefix("--timeout=") {
+            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let n: u64 = digits.parse().unwrap_or(30);
+            timeout_s = if v.ends_with('m') { n * 60 } else { n };
+        } else if a.starts_with('-') {
+            // --for=condition=Ready is the only supported condition (Running).
+        } else {
+            names.push(bare_name(a));
+        }
+    }
+    if names.is_empty() {
+        return ctx.fail("wait requires a resource (e.g. deployment/web or pod/web-0)");
+    }
+    let deadline = crate::time::now_ns().saturating_add(timeout_s.saturating_mul(1_000_000_000));
+    for name in &names {
+        loop {
+            let pods = wait_pods(fc, wdir, name);
+            let ready = !pods.is_empty()
+                && pods.iter().all(|p| container::find(fc, p).map(|c| c.live_state() == State::Running).unwrap_or(false));
+            if ready {
+                outln!(ctx, "{name} condition met");
+                break;
+            }
+            if crate::time::now_ns() >= deadline {
+                return ctx.fail(format!("timed out waiting for {name}"));
+            }
+            if !crate::sched::sleep_ms(300) {
+                return ctx.fail("wait interrupted");
+            }
+        }
+    }
+    0
+}
+
+/// Pod names to wait on: a workload's replicas, or the name itself if it names a
+/// bare container.
+fn wait_pods(fc: &crate::fs::ops::Ctx, wdir: &str, name: &str) -> Vec<String> {
+    if let Ok(d) = crate::fs::ops::read_file(fc, &format!("{wdir}/{name}")) {
+        let text = String::from_utf8_lossy(&d).into_owned();
+        let want: usize = text.lines().nth(1).and_then(|x| x.parse().ok()).unwrap_or(1);
+        return (0..want).map(|n| crate::fastman::kube::pod_name(name, n)).collect();
+    }
+    if container::find(fc, name).is_ok() {
+        alloc::vec![name.to_string()]
+    } else {
+        Vec::new()
+    }
 }

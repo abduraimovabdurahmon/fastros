@@ -73,6 +73,13 @@ pub struct Uts {
     pub domainname: SpinLock<String>,
 }
 
+impl Uts {
+    /// A fresh UTS namespace with the given hostname (a container's `--hostname`).
+    pub fn new(hostname: &str) -> Arc<Uts> {
+        Arc::new(Uts { hostname: SpinLock::new(String::from(hostname)), domainname: SpinLock::new(String::from("(none)")) })
+    }
+}
+
 pub struct Process {
     pub pid: Pid,
     pub ppid: AtomicU32,

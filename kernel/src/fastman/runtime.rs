@@ -42,6 +42,10 @@ pub struct RunOpts {
     pub entrypoint: Option<String>,
     /// `--restart` policy: "", "always", "unless-stopped", or "on-failure".
     pub restart_policy: String,
+    /// `--hostname`/-h: the container's UTS hostname (None = inherit host).
+    pub hostname: Option<String>,
+    /// `--label`/-l metadata (key, value).
+    pub labels: Vec<(String, String)>,
     pub workdir: Option<String>,
     pub ports: Vec<Port>,
     pub volumes: Vec<Volume>,
@@ -184,6 +188,8 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         health_fails: 0,
         restart_policy: opts.restart_policy,
         stopped_by_user: false,
+        hostname: opts.hostname.unwrap_or_default(),
+        labels: opts.labels,
     };
     c.save(ctx)?;
     if let Some((d, a)) = c.port_remap {
@@ -356,7 +362,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
         // ^C reaches the container command via the terminal line discipline.
         new_session: !interactive,
         ctty: itty.and_then(|t| t.tty.clone()),
-        uts: crate::proc::kernel().uts.clone(),
+        uts: if c.hostname.is_empty() { crate::proc::kernel().uts.clone() } else { crate::proc::Uts::new(&c.hostname) },
         container: Some(c.id.clone()),
         aspace: None,
         ignored: 0,
@@ -693,7 +699,7 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         pgid: None,
         new_session: !interactive,
         ctty: itty.as_ref().and_then(|t| t.tty.clone()),
-        uts: crate::proc::kernel().uts.clone(),
+        uts: if c.hostname.is_empty() { crate::proc::kernel().uts.clone() } else { crate::proc::Uts::new(&c.hostname) },
         container: Some(c.id.clone()),
         aspace: None,
         ignored: 0,
@@ -762,7 +768,7 @@ fn health_probe(c: &Container, timeout_ms: u64, cred: &crate::fs::perm::Cred) ->
         pgid: None,
         new_session: true,
         ctty: None,
-        uts: crate::proc::kernel().uts.clone(),
+        uts: if c.hostname.is_empty() { crate::proc::kernel().uts.clone() } else { crate::proc::Uts::new(&c.hostname) },
         container: Some(c.id.clone()),
         aspace: None,
         ignored: 0,

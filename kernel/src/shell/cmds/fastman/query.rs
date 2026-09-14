@@ -178,7 +178,9 @@ pub(super) fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
                 "      \"Cmd\": {cmd},\n",
                 "      \"Env\": {env},\n",
                 "      \"WorkingDir\": {workdir},\n",
-                "      \"User\": {user}\n",
+                "      \"User\": {user},\n",
+                "      \"Hostname\": {hostname},\n",
+                "      \"Labels\": {labels}\n",
                 "    }},\n",
                 "    \"HostConfig\": {{\n",
                 "      \"NetworkMode\": {network},\n",
@@ -187,7 +189,8 @@ pub(super) fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
                 "      \"PortBindings\": {ports},\n",
                 "      \"Binds\": {binds},\n",
                 "      \"CapAdd\": {cap_add},\n",
-                "      \"CapDrop\": {cap_drop}\n",
+                "      \"CapDrop\": {cap_drop},\n",
+                "      \"RestartPolicy\": {{ \"Name\": {restart} }}\n",
                 "    }},\n",
                 "    \"NetworkSettings\": {{\n",
                 "      \"IPAddress\": {ip}\n",
@@ -216,6 +219,12 @@ pub(super) fn inspect(ctx: &mut Ctx, args: &[String]) -> i32 {
             cap_add = json_str_array(&cap_add),
             cap_drop = json_str_array(&cap_drop),
             ip = json_str(&ip),
+            hostname = json_str(&c.hostname),
+            labels = {
+                let items: Vec<String> = c.labels.iter().map(|(k, v)| format!("{}: {}", json_str(k), json_str(v))).collect();
+                if items.is_empty() { String::from("{}") } else { format!("{{ {} }}", items.join(", ")) }
+            },
+            restart = json_str(if c.restart_policy.is_empty() { "no" } else { &c.restart_policy }),
         );
         objs.push(obj);
     }

@@ -96,6 +96,10 @@ pub struct Container {
     /// Set when the user explicitly stops/kills the container, so a restart
     /// policy does not immediately bring it back.
     pub stopped_by_user: bool,
+    /// `--hostname`: the container's UTS hostname (empty = inherit the host's).
+    pub hostname: String,
+    /// `--label`/-l metadata (key, value), shown by `inspect`.
+    pub labels: Vec<(String, String)>,
 }
 
 impl Container {
@@ -187,6 +191,12 @@ impl Container {
         if self.stopped_by_user {
             s.push_str("stopped_by_user\t1\n");
         }
+        if !self.hostname.is_empty() {
+            s.push_str(&format!("hostname\t{}\n", self.hostname));
+        }
+        for (k, v) in &self.labels {
+            s.push_str(&format!("label\t{k}\t{v}\n"));
+        }
         s
     }
 
@@ -222,6 +232,8 @@ impl Container {
             health_fails: 0,
             restart_policy: String::new(),
             stopped_by_user: false,
+            hostname: String::new(),
+            labels: Vec::new(),
         };
         for line in text.lines() {
             let mut it = line.split('\t');
@@ -272,6 +284,12 @@ impl Container {
                 "health_fails" => c.health_fails = v.parse().unwrap_or(0),
                 "restart_policy" => c.restart_policy = v.to_string(),
                 "stopped_by_user" => c.stopped_by_user = v == "1",
+                "hostname" => c.hostname = v.to_string(),
+                "label" => {
+                    if let Some(val) = it.next() {
+                        c.labels.push((v.to_string(), val.to_string()));
+                    }
+                }
                 _ => {}
             }
         }
