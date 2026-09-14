@@ -467,7 +467,12 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
             return Err(Errno::EAGAIN);
         }
     }
-    let task = match sched::try_spawn(&s.name, move || {
+    // Create the task but DO NOT make it runnable yet: it must not be scheduled
+    // until its `owner` (and the process record) are set, or — with preemptive
+    // scheduling — it could run and reach exit_current() before `owner` is set,
+    // where current() would resolve to the kernel (pid 0). make_ready() below,
+    // after owner.store, closes that race.
+    let task = match sched::make_task(&s.name, move || {
         let code = entry();
         exit_current(ExitStatus::Exited(code));
     }) {
@@ -479,7 +484,6 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
             return Err(Errno::ENOMEM);
         }
     };
-    // The task cannot run before we yield, so registering now is race-free.
     let pid = task.tid;
     let pgid = if s.new_session { pid } else { s.pgid.unwrap_or(pid) };
     let sid = if s.new_session { pid } else { s.parent.sid.load(Ordering::Relaxed) };
@@ -526,6 +530,8 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
     PROCS.lock().insert(pid, p.clone());
     s.parent.children.lock().push(p.clone());
     task.owner.store(pid, Ordering::Release);
+    // Now safe to schedule: owner and the process record are in place.
+    sched::make_ready(&task);
     Ok(p)
 }
 
@@ -647,7 +653,16 @@ pub fn exit_thread(code: i32) -> ! {
 /// Terminate the current process. Never returns.
 pub fn exit_current(status: ExitStatus) -> ! {
     let me = current();
-    assert!(me.pid != 0, "kernel threads exit through sched::exit_current");
+    // A kernel-owned task (pid 0) must never reach the process-exit path — but if
+    // it somehow does, exit just this task rather than panicking the whole OS.
+    if me.pid == 0 {
+        crate::kwarn!("proc", "exit_current on the kernel process; exiting the task only");
+        let code = match status {
+            ExitStatus::Exited(c) => c,
+            ExitStatus::Signaled(s) => 128 + s as i32,
+        };
+        sched::exit_current(code);
+    }
     // Idempotent across threads: the first caller claims the teardown by setting
     // `exit`; a sibling woken by the SIGKILL below sees it set and just ends
     // itself. Claiming under the lock makes this race-free against preemption.
