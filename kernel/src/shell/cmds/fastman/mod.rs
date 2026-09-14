@@ -191,6 +191,7 @@ pub fn fastman(ctx: &mut Ctx) -> i32 {
         "commit" => commit(ctx, &args[1..]),
         "run" => run(ctx, &args[1..]),
         "ps" => ps(ctx, &args[1..]),
+        "start" => start(ctx, &args[1..]),
         "stop" => stop(ctx, &args[1..]),
         "rm" => rm(ctx, &args[1..]),
         "logs" => logs(ctx, &args[1..]),
@@ -672,6 +673,14 @@ fn parse_run(args: &[String]) -> Result<(RunOpts, bool, String, Vec<String>), St
                 i += 1;
                 o.env.push(args.get(i).ok_or("-e needs KEY=VALUE")?.clone());
             }
+            "--env-file" => {
+                i += 1;
+                o.env_files.push(args.get(i).ok_or("--env-file needs a path")?.clone());
+            }
+            "--entrypoint" => {
+                i += 1;
+                o.entrypoint = Some(args.get(i).ok_or("--entrypoint needs a command")?.clone());
+            }
             "-w" | "--workdir" => {
                 i += 1;
                 o.workdir = Some(args.get(i).ok_or("-w needs a directory")?.clone());
@@ -820,13 +829,34 @@ fn parse_volume(s: &str) -> Result<Volume, String> {
 }
 
 fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
-    let (opts, interactive, image_name, _cmd) = match parse_run(args) {
+    let (mut opts, interactive, image_name, _cmd) = match parse_run(args) {
         Ok(v) => v,
         Err(e) => return ctx.fail(e),
     };
     let detach = opts.detach;
     let rm = opts.rm;
     let fc = fs_ctx(ctx);
+    // Expand --env-file(s): read KEY=VALUE lines (skipping blanks and #comments)
+    // and prepend them so explicit -e still wins (later env entries override).
+    if !opts.env_files.is_empty() {
+        let mut merged = Vec::new();
+        for path in &opts.env_files {
+            match crate::fs::ops::read_file(&fc, path) {
+                Ok(data) => {
+                    for line in String::from_utf8_lossy(&data).lines() {
+                        let t = line.trim();
+                        if t.is_empty() || t.starts_with('#') || !t.contains('=') {
+                            continue;
+                        }
+                        merged.push(t.to_string());
+                    }
+                }
+                Err(e) => return ctx.fail_errno(path, e),
+            }
+        }
+        merged.extend(core::mem::take(&mut opts.env));
+        opts.env = merged;
+    }
     // Reject an unauthorized `--user` up front (before any auto-pull): a non-root
     // caller may only run as its own identity. runtime::create() enforces this
     // too; doing it here just fails fast with a clear message and no wasted pull.

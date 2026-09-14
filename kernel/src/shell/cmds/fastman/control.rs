@@ -8,6 +8,100 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// `fastman start [-a] [-i] <container>...`: (re)start stopped containers.
+/// Detached by default (prints each name, like `docker start`); with `-a`/`-i`
+/// on a single container, attach to it and wait.
+pub(super) fn start(ctx: &mut Ctx, args: &[String]) -> i32 {
+    let mut attach = false;
+    let mut interactive = false;
+    let mut names: Vec<&String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-a" | "--attach" => attach = true,
+            "-i" | "--interactive" => interactive = true,
+            "-ai" | "-ia" => {
+                attach = true;
+                interactive = true;
+            }
+            s if s.starts_with('-') => {}
+            _ => names.push(a),
+        }
+    }
+    if names.is_empty() {
+        return ctx.fail("start requires a container");
+    }
+    let fc = fs_ctx(ctx);
+    // Attach/interactive only makes sense for a single container.
+    let want_attach = (attach || interactive) && names.len() == 1;
+    let mut st = 0;
+    for name in &names {
+        let mut c = match container::find(&fc, name) {
+            Ok(c) => c,
+            Err(e) => {
+                st = ctx.fail_errno(name, e);
+                continue;
+            }
+        };
+        // Already running: `docker start` is a no-op that still prints the name.
+        if c.live_state() == container::State::Running {
+            outln!(ctx, "{}", c.name);
+            continue;
+        }
+        if want_attach {
+            let itty = if interactive { interactive_tty(ctx) } else { None };
+            let tee = if interactive { None } else { runtime::caller_stdout(&ctx.proc) };
+            ctx.flush();
+            match runtime::start(&fc, &mut c, tee, itty.as_ref()) {
+                Ok((pid, _)) => return wait_attached(ctx, &fc, &c, pid, itty.as_ref()),
+                Err(e) => return ctx.fail_errno(name, e),
+            }
+        }
+        match runtime::start(&fc, &mut c, None, None) {
+            Ok(_) => outln!(ctx, "{}", c.name),
+            Err(e) => st = ctx.fail_errno(name, e),
+        }
+    }
+    st
+}
+
+/// Build an interactive TTY handle from the caller's stdio (shared with `run`).
+fn interactive_tty(ctx: &mut Ctx) -> Option<runtime::ExecTty> {
+    let fds = ctx.proc.fds.lock();
+    match (fds.get(0), fds.get(1), fds.get(2)) {
+        (Ok(stdin), Ok(stdout), Ok(stderr)) => {
+            drop(fds);
+            Some(runtime::ExecTty {
+                stdin,
+                stdout,
+                stderr,
+                tty: ctx.proc.ctty.lock().clone(),
+                pgid: ctx.proc.pgid.load(core::sync::atomic::Ordering::Relaxed),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Wait for an attached container's init to finish, returning its exit code.
+fn wait_attached(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, c: &container::Container, pid: u32, itty: Option<&runtime::ExecTty>) -> i32 {
+    let Some(p) = crate::proc::find(pid) else {
+        return container::load(fc, &c.id).map(|c| c.exit_code).unwrap_or(0);
+    };
+    if let Some(t) = itty {
+        if let Some(tty) = &t.tty {
+            tty.set_fg_pgrp(pid);
+        }
+    }
+    let code = p.tasks().into_iter().next().map(|task| task.join()).unwrap_or(0);
+    if let Some(t) = itty {
+        if let Some(tty) = &t.tty {
+            tty.set_fg_pgrp(t.pgid);
+        }
+    }
+    let _ = ctx;
+    code
+}
+
 /// `fastman restart <container>...`: stop (SIGTERM, escalating to SIGKILL) then
 /// start each container again — the same lifecycle Docker's `restart` runs.
 pub(super) fn restart(ctx: &mut Ctx, args: &[String]) -> i32 {

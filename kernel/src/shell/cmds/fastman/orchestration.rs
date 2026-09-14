@@ -586,6 +586,8 @@ pub(super) fn clone_opts(o: &RunOpts) -> RunOpts {
         name: o.name.clone(),
         cmd: o.cmd.clone(),
         env: o.env.clone(),
+        env_files: o.env_files.clone(),
+        entrypoint: o.entrypoint.clone(),
         workdir: o.workdir.clone(),
         ports: o.ports.clone(),
         volumes: o.volumes.clone(),

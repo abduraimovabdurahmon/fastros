@@ -35,6 +35,11 @@ pub struct RunOpts {
     pub name: Option<String>,
     pub cmd: Vec<String>,
     pub env: Vec<String>,
+    /// `--env-file` paths, read and merged into `env` before create (the shell
+    /// `run`/`create` command expands these, as it has the caller's filesystem).
+    pub env_files: Vec<String>,
+    /// `--entrypoint`: override the image's ENTRYPOINT (the args become CMD).
+    pub entrypoint: Option<String>,
     pub workdir: Option<String>,
     pub ports: Vec<Port>,
     pub volumes: Vec<Volume>,
@@ -140,7 +145,16 @@ pub fn create(ctx: &Ctx, image_name: &str, opts: RunOpts) -> KResult<Container> 
         name,
         image_key: key,
         image_id,
-        cmd: cfg.argv(&opts.cmd),
+        // `--entrypoint` overrides the image's ENTRYPOINT; the positional args
+        // then form the command. Otherwise use the image's entrypoint + cmd.
+        cmd: match &opts.entrypoint {
+            Some(ep) => {
+                let mut v = alloc::vec![ep.clone()];
+                v.extend_from_slice(&opts.cmd);
+                v
+            }
+            None => cfg.argv(&opts.cmd),
+        },
         env,
         workdir: opts.workdir.unwrap_or(cfg.workdir),
         state: State::Created,
