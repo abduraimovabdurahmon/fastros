@@ -376,7 +376,13 @@ impl Inode for PInode {
                 Ok(match *what {
                     "cwd" => fs.cwd.path(),
                     "root" => fs.root.path(),
-                    _ => format!("/bin/{}", p.comm()),
+                    _ => {
+                        // "exe": the resolved executable path. Fall back to a
+                        // best guess only when it is not yet known.
+                        drop(fs);
+                        let exe = p.exe();
+                        if exe.is_empty() { format!("/bin/{}", p.comm()) } else { exe }
+                    }
                 })
             }
             Node::FdLink(pid, fd) => {

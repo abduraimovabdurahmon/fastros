@@ -355,6 +355,7 @@ pub fn start(ctx: &Ctx, c: &mut Container, tee: Option<Arc<dyn File>>, itty: Opt
         init_fs_base: 0,
     };
     let child = proc::start_user(spawn, space, frame)?;
+    child.set_exe(&real); // /proc/self/exe for the container's init
     let pid = child.pid;
     // Interactive: no logger (output goes straight to the terminal).
     let logger = logger_read.map(|r| spawn_logger(c.id.clone(), ctx.cred.uid, ctx.cred.gid, r, tee));
@@ -681,6 +682,7 @@ pub fn exec(ctx: &Ctx, name: &str, argv: Vec<String>, tee: Option<Arc<dyn File>>
         init_fs_base: 0,
     };
     let child = proc::start_user(spawn, space, frame)?;
+    child.set_exe(&real); // /proc/self/exe for `fastman exec`
     let code = if let Some(t) = &itty {
         // Hand the terminal to the interactive command, then take it back.
         if let Some(tty) = &t.tty {

@@ -262,8 +262,6 @@ static RQ: SpinLock<RunQueue> = SpinLock::new(RunQueue {
 
 /// Raw pointer to the running task (kept alive by `RQ.current`).
 static CURRENT: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
-/// The CR3 currently loaded (0 until the first user task runs).
-static LOADED_CR3: AtomicU64 = AtomicU64::new(0);
 static TASKS: SpinLock<BTreeMap<Tid, Arc<Task>>> = SpinLock::new(BTreeMap::new());
 static NEXT_TID: AtomicU32 = AtomicU32::new(1);
 static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
@@ -544,9 +542,15 @@ pub fn schedule() {
         // Switch address spaces when the next task lives in a different one.
         // 0 means "the kernel's own tables"; kernel mappings are global, so a
         // reload keeps them in the TLB.
+        //
+        // Compare against THIS CPU's actual cr3 register, not a cached value:
+        // cr3 is per-CPU state, so a global "last loaded" cache is wrong under
+        // SMP — CPU B would see CPU A's load and skip its own write_cr3, then
+        // run a user task under the kernel page tables and fault on its first
+        // instruction. Reading cr3 is cheap and inherently per-CPU correct.
         let want = next.cr3.load(Ordering::Relaxed);
         let want = if want != 0 { want } else { crate::mm::kspace::pml4() };
-        if want != LOADED_CR3.swap(want, Ordering::Relaxed) {
+        if want != cpu::read_cr3() {
             unsafe { cpu::write_cr3(want) };
         }
         if next.cr3.load(Ordering::Relaxed) != 0 {

@@ -410,6 +410,15 @@ pub fn execve(path: usize, argv: usize, envp: usize, frame: &mut UserFrame) -> K
     }
     *me.aspace.lock() = Some(new_space.clone());
     me.set_comm(path.rsplit('/').next().unwrap_or(&path));
+    // Record the absolute executable path for /proc/<pid>/exe. gosu and the Go
+    // runtime read this symlink at startup and abort if it does not resolve.
+    let exe_path = if path.starts_with('/') {
+        path.clone()
+    } else {
+        let cwd = me.fs.lock().cwd.path();
+        if cwd.ends_with('/') { alloc::format!("{cwd}{path}") } else { alloc::format!("{cwd}/{path}") }
+    };
+    me.set_exe(&exe_path);
     me.set_cmdline(argv);
     proc::set_current_cr3(new_space.pml4());
     proc::set_current_fs_base(0);
@@ -480,17 +489,24 @@ pub fn tkill(tid: i32, sig: u32) -> KResult<usize> {
     if tid <= 0 || sig > 64 {
         return Err(Errno::EINVAL);
     }
-    let p = proc::find(tid as u32).ok_or(Errno::ESRCH)?;
+    // `tid` is a THREAD id, not a process id: look up the task, then its owning
+    // process. The previous `proc::find(tid)` treated the tid as a pid, so a
+    // multi-threaded program (any Go binary — gosu in the postgres image) could
+    // not signal its own threads. That broke Go's async preemption (SIGURG to a
+    // specific M) and thread stack dumps, wedging the runtime with one M holding
+    // the only P forever.
+    let task = crate::sched::find(tid as u32).ok_or(Errno::ESRCH)?;
+    let owner = proc::find(task.owner.load(core::sync::atomic::Ordering::Relaxed)).ok_or(Errno::ESRCH)?;
     if sig != 0 {
         // Same permission rule as kill(2): only root or a matching uid may
         // signal a process. Without this, any user could tkill (e.g. SIGKILL)
         // another user's process — tkill must not be a hole around kill().
         let cred = proc::current().cred();
-        let tc = p.cred();
+        let tc = owner.cred();
         if !cred.is_root() && cred.euid != tc.uid && cred.uid != tc.uid {
             return Err(Errno::EPERM);
         }
-        p.signal(sig);
+        owner.signal_task(&task, sig);
     }
     Ok(0)
 }
@@ -569,8 +585,21 @@ pub fn gettimeofday(tv: usize, _tz: usize) -> KResult<usize> {
 pub fn nanosleep(req: usize, rem: usize) -> KResult<usize> {
     let sec: i64 = uaccess::read_obj(req)?;
     let nsec: i64 = uaccess::read_obj(req + 8)?;
-    let ms = (sec as u64).saturating_mul(1000) + (nsec as u64) / 1_000_000;
-    if crate::sched::sleep_ms(ms) {
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    // Keep NANOSECOND precision. Rounding to whole milliseconds turned a Go
+    // runtime `usleep(20µs)` into sleep_ms(0) — a no-op — so gosu (postgres
+    // image) busy-spun on nanosleep forever instead of yielding to the thread
+    // it was waiting for. sleep_ns blocks the task until the deadline.
+    let ns = (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64);
+    sleep_ns_intr(ns, rem)
+}
+
+/// Sleep `ns` nanoseconds; on interruption write the (approximate) remaining
+/// time to `rem` if non-NULL and return EINTR, matching `nanosleep(2)`.
+fn sleep_ns_intr(ns: u64, rem: usize) -> KResult<usize> {
+    if crate::sched::sleep_ns(ns) {
         Ok(0)
     } else {
         if rem != 0 {
@@ -582,8 +611,29 @@ pub fn nanosleep(req: usize, rem: usize) -> KResult<usize> {
 
 /// `clock_nanosleep(clockid, flags, req, rem)`. TIMER_ABSTIME is treated as a
 /// relative sleep of the given duration (close enough for libc `sleep`).
-pub fn clock_nanosleep(_clk: u32, _flags: i32, req: usize, rem: usize) -> KResult<usize> {
-    nanosleep(req, rem)
+pub fn clock_nanosleep(clk: u32, flags: i32, req: usize, rem: usize) -> KResult<usize> {
+    const TIMER_ABSTIME: i32 = 1;
+    let sec: i64 = uaccess::read_obj(req)?;
+    let nsec: i64 = uaccess::read_obj(req + 8)?;
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    let target = (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64);
+    if flags & TIMER_ABSTIME != 0 {
+        // Absolute deadline in clock `clk`: sleep until it, i.e. for
+        // (target - now). CLOCK_REALTIME(0) uses wall time, everything else
+        // the monotonic uptime — matching clock_gettime above.
+        let now = if clk == 0 {
+            let (s, ns) = crate::time::wall_clock();
+            (s as u64).saturating_mul(1_000_000_000).saturating_add(ns as u64)
+        } else {
+            crate::time::now_ns()
+        };
+        // ABSTIME reports no remaining time on interruption.
+        sleep_ns_intr(target.saturating_sub(now), 0)
+    } else {
+        sleep_ns_intr(target, rem)
+    }
 }
 
 /// `getresuid`/`getresgid`: report real=effective=saved = the current id.
@@ -789,12 +839,19 @@ pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, _uaddr2: usize, _v
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let key = space.phys_translate(uaddr)?;
+            // Snapshot the generation BEFORE reading the futex word. If a
+            // concurrent FUTEX_WAKE lands between the value read and this load,
+            // the bump would already be folded into `g` and we would then sleep
+            // waiting for the *next* bump that never comes — a lost wakeup that
+            // strands, e.g., the Go runtime's main thread. With `g` taken first:
+            // a wake after it makes `generation != g` true (wait returns at
+            // once), and a wake before it changed the word (cur != val → EAGAIN).
+            let b = futex_bucket(key);
+            let g = b.generation.load(Ordering::Acquire);
             let cur: u32 = uaccess::read_obj(uaddr)?;
             if cur != val {
                 return Err(Errno::EAGAIN);
             }
-            let b = futex_bucket(key);
-            let g = b.generation.load(Ordering::Acquire);
             let deadline = futex_deadline(timeout, cmd == FUTEX_WAIT_BITSET)?;
             match b.wq.wait_until_interruptible(|| (b.generation.load(Ordering::Acquire) != g).then_some(()), deadline) {
                 Ok(()) => Ok(0),

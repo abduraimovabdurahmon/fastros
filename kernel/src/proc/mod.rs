@@ -80,6 +80,10 @@ pub struct Process {
     pub sid: AtomicU32,
     comm: SpinLock<String>,
     cmdline: SpinLock<Vec<String>>,
+    /// Resolved path of the running executable, for `/proc/<pid>/exe`. Empty for
+    /// kernel tasks and until the first execve. Programs (gosu, the Go runtime's
+    /// os.Executable) require this symlink to resolve to a real file.
+    exe: SpinLock<String>,
     pub cred: SpinLock<Cred>,
     pub fs: SpinLock<FsContext>,
     pub fds: SpinLock<FdTable>,
@@ -159,6 +163,13 @@ impl Process {
     pub fn set_cmdline(&self, args: Vec<String>) {
         *self.cmdline.lock() = args;
     }
+    /// The resolved executable path (`/proc/<pid>/exe`), empty if unknown.
+    pub fn exe(&self) -> String {
+        self.exe.lock().clone()
+    }
+    pub fn set_exe(&self, path: &str) {
+        *self.exe.lock() = String::from(path);
+    }
     pub fn cred(&self) -> Cred {
         self.cred.lock().clone()
     }
@@ -201,34 +212,53 @@ impl Process {
         if !(1..=64).contains(&sig) {
             return;
         }
-        let bit = 1u64 << (sig - 1);
+        let ignored = self.sig_ignored(sig);
+        let tasks: Vec<Arc<Task>> = self.tasks.lock().iter().cloned().collect();
+        for t in &tasks {
+            self.deliver_to_task(t, sig, ignored);
+        }
+    }
+
+    /// Send `sig` to ONE specific task (thread) of this process — the semantics
+    /// `tgkill`/`tkill` need. Go's scheduler preempts a specific M and dumps a
+    /// specific thread's stack this way, so the signal must land on that thread,
+    /// not the process as a whole.
+    pub fn signal_task(&self, t: &Arc<Task>, sig: u32) {
+        if !(1..=64).contains(&sig) {
+            return;
+        }
+        self.deliver_to_task(t, sig, self.sig_ignored(sig));
+    }
+
+    /// Whether `sig`'s effective disposition is "ignore" (see [`Process::signal`]).
+    fn sig_ignored(&self, sig: u32) -> bool {
         // SIGCONT is "ignored by default" as a *delivery* action, but it must
         // still reach the task: send_signal() is what clears the stopped flag
         // and wakes a stopped task. Never skip it (nor SIGKILL/SIGSTOP).
-        let ignored = if sig != signal::SIGKILL && sig != signal::SIGSTOP && sig != signal::SIGCONT {
-            let act = self.sigactions.lock()[sig as usize];
-            let disp_ignored = act.handler == signal::SIG_IGN
-                || (act.handler == signal::SIG_DFL && signal::ignored_by_default(sig));
-            // The `ignored` bitmask is a process-level ignore set directly (nohup
-            // ignores SIGHUP this way, without an rt_sigaction call).
-            let masked = self.ignored.load(Ordering::Relaxed) & bit != 0;
-            disp_ignored || masked
-        } else {
-            false
-        };
-        for t in self.tasks.lock().iter() {
-            // A signal that is *blocked* must always be made pending, even when
-            // its disposition is "ignore": the ignore is applied only at
-            // delivery, which a blocked signal never reaches until unblocked.
-            // This is what lets `signalfd`/`sigwait` observe it — the mechanism
-            // postgres' latch uses (it blocks SIGURG and drains it via a
-            // signalfd in epoll). Dropping it here wedged every latch wait.
-            let blocked = t.blocked() & bit != 0;
-            if ignored && !blocked {
-                continue;
-            }
-            t.send_signal(sig);
+        if sig == signal::SIGKILL || sig == signal::SIGSTOP || sig == signal::SIGCONT {
+            return false;
         }
+        let act = self.sigactions.lock()[sig as usize];
+        let disp_ignored = act.handler == signal::SIG_IGN
+            || (act.handler == signal::SIG_DFL && signal::ignored_by_default(sig));
+        // The `ignored` bitmask is a process-level ignore set directly (nohup
+        // ignores SIGHUP this way, without an rt_sigaction call).
+        let masked = self.ignored.load(Ordering::Relaxed) & (1u64 << (sig - 1)) != 0;
+        disp_ignored || masked
+    }
+
+    fn deliver_to_task(&self, t: &Arc<Task>, sig: u32, ignored: bool) {
+        // A signal that is *blocked* must always be made pending, even when its
+        // disposition is "ignore": the ignore is applied only at delivery, which
+        // a blocked signal never reaches until unblocked. This is what lets
+        // signalfd/sigwait observe it — the mechanism postgres' latch uses (it
+        // blocks SIGURG and drains it via a signalfd in epoll). Dropping it here
+        // wedged every latch wait.
+        let blocked = t.blocked() & (1u64 << (sig - 1)) != 0;
+        if ignored && !blocked {
+            return;
+        }
+        t.send_signal(sig);
     }
 }
 
@@ -255,6 +285,7 @@ pub fn init(ns: Arc<MountNamespace>) {
             sid: AtomicU32::new(0),
             comm: SpinLock::new(String::from("kernel")),
             cmdline: SpinLock::new(Vec::new()),
+            exe: SpinLock::new(String::new()),
             cred: SpinLock::new(Cred::root()),
             fs: SpinLock::new(FsContext { ns, root: root.clone(), cwd: root, umask: 0o022 }),
             fds: SpinLock::new(FdTable::new()),
@@ -508,6 +539,8 @@ pub fn spawn(s: Spawn, entry: impl FnOnce() -> i32 + Send + 'static) -> KResult<
         sid: AtomicU32::new(sid),
         comm: SpinLock::new(comm),
         cmdline: SpinLock::new(s.args),
+        // Inherit the parent's exe across fork; execve overwrites it.
+        exe: SpinLock::new(s.parent.exe()),
         cred: SpinLock::new(s.cred),
         fs: SpinLock::new(s.fs),
         fds: SpinLock::new(s.fds),
