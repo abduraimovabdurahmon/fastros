@@ -279,8 +279,19 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
                 t.render(ctx, &s);
                 return 0;
             }
+            if matches!(what, "namespaces" | "namespace" | "ns") {
+                let mut t = Table::new(&["NAME", "STATUS", "AGE"]);
+                t.row(alloc::vec!["default".to_string(), s.green("Active"), "-".to_string()]);
+                t.render(ctx, &s);
+                return 0;
+            }
+            if matches!(what, "events" | "event" | "ev") {
+                outln!(ctx, "No resources found in default namespace.");
+                return 0;
+            }
             let pods = what == "pods" || what == "po" || what == "all";
-            let deps = what == "deployments" || what == "deploy" || what == "all";
+            // ReplicaSets map onto Deployments in our model (no separate RS layer).
+            let deps = what == "deployments" || what == "deploy" || what == "replicasets" || what == "rs" || what == "all";
             let svcs = what == "services" || what == "svc" || what == "all";
             let workloads = crate::fs::ops::list_dir(&fc, &wdir).unwrap_or_default();
             if deps {
@@ -422,7 +433,12 @@ pub(super) fn kube(ctx: &mut Ctx, args: &[String]) -> i32 {
         }
         "describe" => kube_describe(ctx, &fc, &wdir, &sdir, &rest),
         "port-forward" => kube_port_forward(ctx, &fc, &rest),
-        other => ctx.fail(format!("unknown kube command '{other}' (apply|create|get|delete|scale|rollout|logs|exec|describe|port-forward)")),
+        "run" => kube_run(ctx, &fc, &wdir, &rest),
+        "expose" => kube_expose(ctx, &fc, &wdir, &sdir, &rest),
+        "set" => kube_set(ctx, &fc, &wdir, &rest),
+        other => ctx.fail(format!(
+            "unknown kube command '{other}' (apply|create|run|expose|set|get|delete|scale|rollout|logs|exec|describe|port-forward)"
+        )),
     }
 }
 
@@ -677,4 +693,171 @@ fn kube_create(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, rest: &[String]) -> i32 
         }
         Err(e) => ctx.fail_errno(&name, e),
     }
+}
+
+/// `fastman kube run NAME --image=IMG [--replicas=N] [--port=P] [--env K=V]...
+/// [-- cmd...]` — imperatively create a Pod (or Deployment if replicas>1).
+fn kube_run(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[String]) -> i32 {
+    let mut name = None;
+    let mut image = None;
+    let mut replicas = 1usize;
+    let mut port: Option<u16> = None;
+    let mut env: Vec<String> = Vec::new();
+    let mut cmd: Vec<String> = Vec::new();
+    let mut after = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = &rest[i];
+        if after {
+            cmd.push(a.clone());
+        } else if a == "--" {
+            after = true;
+        } else if let Some(v) = a.strip_prefix("--image=") {
+            image = Some(v.to_string());
+        } else if a == "--image" {
+            i += 1;
+            image = rest.get(i).cloned();
+        } else if let Some(v) = a.strip_prefix("--replicas=") {
+            replicas = v.parse().unwrap_or(1);
+        } else if let Some(v) = a.strip_prefix("--port=") {
+            port = v.parse().ok();
+        } else if let Some(v) = a.strip_prefix("--env=") {
+            env.push(v.to_string());
+        } else if a == "--env" || a == "-e" {
+            i += 1;
+            if let Some(v) = rest.get(i) {
+                env.push(v.clone());
+            }
+        } else if a.starts_with("--restart") {
+            // accepted, ignored (we always keep the record; no restart policy yet)
+        } else if !a.starts_with('-') && name.is_none() {
+            name = Some(a.clone());
+        }
+        i += 1;
+    }
+    let (Some(name), Some(image)) = (name, image) else {
+        return ctx.fail("usage: kube run NAME --image=IMG [--replicas=N] [--port=P] [-- cmd...]");
+    };
+    if replicas == 0 {
+        replicas = 1;
+    }
+    if image::resolve(fc, &image).is_none() {
+        return ctx.fail(format!("image '{image}' not found (pull it first)"));
+    }
+    let kind = if replicas > 1 { "Deployment" } else { "Pod" };
+    let s = style_of(ctx);
+    let rec = format!("{kind}\n{replicas}\n{image}\n");
+    let _ = crate::fs::ops::mkdir_all(fc, wdir, 0o700);
+    let _ = crate::fs::ops::write_file(fc, &format!("{wdir}/{name}"), rec.as_bytes(), 0o600);
+    for n in 0..replicas {
+        let pod = crate::fastman::kube::pod_name(&name, n);
+        let _ = runtime::remove(fc, &pod, true);
+        let mut opts = runtime::RunOpts {
+            name: Some(pod.clone()),
+            detach: true,
+            env: env.clone(),
+            cmd: cmd.clone(),
+            ..Default::default()
+        };
+        if let Some(p) = port {
+            opts.port_remap = Some((p, crate::fastman::kube::alloc_pod_port()));
+        }
+        ctx.flush();
+        match runtime::run(fc, &image, opts, None, None) {
+            Ok(_) => outln!(ctx, "{} {name}/{pod} created", s.green(&kind.to_lowercase())),
+            Err(e) => {
+                ctx.fail_errno(&pod, e);
+            }
+        }
+    }
+    0
+}
+
+/// `fastman kube expose <deployment|pod>/NAME --port=P [--target-port=T]
+/// [--name=SVC]` — create a ClusterIP-style Service in front of a workload.
+fn kube_expose(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, sdir: &str, rest: &[String]) -> i32 {
+    let mut workload = None;
+    let mut svc = None;
+    let mut port: Option<u16> = None;
+    let mut target: Option<u16> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = &rest[i];
+        if let Some(v) = a.strip_prefix("--port=") {
+            port = v.parse().ok();
+        } else if a == "--port" {
+            i += 1;
+            port = rest.get(i).and_then(|v| v.parse().ok());
+        } else if let Some(v) = a.strip_prefix("--target-port=") {
+            target = v.parse().ok();
+        } else if let Some(v) = a.strip_prefix("--name=") {
+            svc = Some(v.to_string());
+        } else if !a.starts_with('-') && workload.is_none() {
+            workload = Some(bare_name(a));
+        }
+        i += 1;
+    }
+    let (Some(workload), Some(port)) = (workload, port) else {
+        return ctx.fail("usage: kube expose <workload> --port=P [--target-port=T] [--name=SVC]");
+    };
+    // The workload must exist.
+    if crate::fs::ops::stat(fc, &format!("{wdir}/{workload}"), true).is_err() {
+        return ctx.fail(format!("{workload}: no such deployment/pod"));
+    }
+    let target = target.unwrap_or(port);
+    let svc = svc.unwrap_or_else(|| workload.clone());
+    let _ = crate::fs::ops::mkdir_all(fc, sdir, 0o700);
+    let rec = format!("{port}\n{target}\n{workload}\n{workload}\n");
+    let _ = crate::fs::ops::write_file(fc, &format!("{sdir}/{svc}"), rec.as_bytes(), 0o600);
+    crate::fastman::kube::start_service_proxy(svc.clone(), port, target, workload);
+    outln!(ctx, "{} {svc} exposed (:{port} → {target})", style_of(ctx).green("service"));
+    0
+}
+
+/// `fastman kube set image <deployment|pod>/NAME [container=]IMG` — change a
+/// workload's image and re-create its pods (a rolling replace).
+fn kube_set(ctx: &mut Ctx, fc: &crate::fs::ops::Ctx, wdir: &str, rest: &[String]) -> i32 {
+    if rest.first().map(|s| s.as_str()) != Some("image") {
+        return ctx.fail("usage: kube set image <workload> [container=]IMG");
+    }
+    let args: Vec<&String> = rest[1..].iter().filter(|s| !s.starts_with('-')).collect();
+    if args.len() < 2 {
+        return ctx.fail("usage: kube set image <workload> [container=]IMG");
+    }
+    let name = bare_name(args[0]);
+    // The image spec may be `container=IMG` or just `IMG`.
+    let image = args[1].rsplit('=').next().unwrap_or(args[1]).to_string();
+    let rec_path = format!("{wdir}/{name}");
+    let Ok(d) = crate::fs::ops::read_file(fc, &rec_path) else {
+        return ctx.fail(format!("{name}: no such deployment"));
+    };
+    let text = String::from_utf8_lossy(&d).into_owned();
+    let mut lines = text.lines();
+    let kind = lines.next().unwrap_or("Deployment").to_string();
+    let replicas: usize = lines.next().and_then(|x| x.parse().ok()).unwrap_or(1);
+    if image::resolve(fc, &image).is_none() {
+        return ctx.fail(format!("image '{image}' not found (pull it first)"));
+    }
+    // Persist the new image, then re-create each pod on it.
+    let rec = format!("{kind}\n{replicas}\n{image}\n");
+    let _ = crate::fs::ops::write_file(fc, &rec_path, rec.as_bytes(), 0o600);
+    let s = style_of(ctx);
+    for n in 0..replicas {
+        let pod = crate::fastman::kube::pod_name(&name, n);
+        // Preserve the pod's config (env/ports/…) but swap the image.
+        let opts = match container::find(fc, &pod) {
+            Ok(c) => crate::fastman::kube::opts_from_container(&c, pod.clone()),
+            Err(_) => runtime::RunOpts { name: Some(pod.clone()), detach: true, ..Default::default() },
+        };
+        let _ = runtime::remove(fc, &pod, true);
+        ctx.flush();
+        match runtime::run(fc, &image, opts, None, None) {
+            Ok(_) => outln!(ctx, "pod {pod} updated → {image}"),
+            Err(e) => {
+                ctx.fail_errno(&pod, e);
+            }
+        }
+    }
+    outln!(ctx, "{} {name} image updated to {image}", s.green(&kind.to_lowercase()));
+    0
 }
