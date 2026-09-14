@@ -115,6 +115,15 @@ def test_run_auto_pulls_missing_image(g):
     assert st == 0, (out, err)
 
 
+def test_run_name_conflict_message(g, image):
+    """A --name collision reports a clear, actionable error (not raw EEXIST)."""
+    g.run("fastman rm -f fmt_dup 2>/dev/null; true")
+    assert g.run(f"fastman run -d --name fmt_dup {image} /bin/sleeper")[2] == 0
+    out, err, st = g.run(f"fastman run -d --name fmt_dup {image} /bin/sleeper")
+    assert st != 0 and "already in use" in (out + err), (out, err)
+    g.run("fastman rm -f fmt_dup")
+
+
 def test_run_rm_removes_container(g, image):
     """`fastman run --rm` discards the container after it exits (like Docker)."""
     out = g.ok(f"fastman run --rm --name fmt_rm {image} /bin/hello")

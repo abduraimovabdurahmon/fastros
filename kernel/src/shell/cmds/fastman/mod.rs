@@ -864,6 +864,7 @@ fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
     };
     let tee = if detach || interactive { None } else { runtime::caller_stdout(&ctx.proc) };
     ctx.flush();
+    let opts_name = opts.name.clone();
     match runtime::run(&fc, &image_name, opts, tee, itty) {
         Ok((c, code)) => {
             if detach {
@@ -878,6 +879,19 @@ fn run(ctx: &mut Ctx, args: &[String]) -> i32 {
             }
         }
         Err(crate::errno::Errno::ENOENT) => ctx.fail(format!("exec: command not found in image (cmd resolves to no executable)")),
+        Err(crate::errno::Errno::EEXIST) => {
+            // A `--name` collision (Docker: "name already in use").
+            let existing = crate::fastman::container::find(&fc, opts_name.as_deref().unwrap_or("")).ok();
+            match existing {
+                Some(c) => ctx.fail(format!(
+                    "the container name \"{}\" is already in use by {} — remove it (fastman rm {}) or use a different --name",
+                    c.name,
+                    short(&c.id),
+                    c.name
+                )),
+                None => ctx.fail("a container with that name already exists (use a different --name)"),
+            }
+        }
         Err(e) => ctx.fail_errno("run", e),
     }
 }
